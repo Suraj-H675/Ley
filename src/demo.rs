@@ -199,7 +199,9 @@ fn render_output(
             }
         }
     }
-    output.push_str("Limit: local fixture only; no public crawling or persistent storage.\n");
+    output.push_str(
+        "Demo limit: local fixture only; this path uses an in-memory index and does not exercise PersistentIndex.\n",
+    );
     output
 }
 
@@ -374,7 +376,7 @@ mod tests {
                 document_count: 1,
                 average_title_length: 1.0,
                 average_body_length: 2.0,
-                statistics_source: "current in-memory document view",
+                statistics_source: crate::index::StatisticsSource::CurrentInMemoryDocumentView,
                 terms: vec![crate::index::TermScoreExplanation {
                     term: "rust".to_owned(),
                     title: FieldScoreExplanation {

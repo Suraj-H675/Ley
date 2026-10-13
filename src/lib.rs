@@ -4,6 +4,7 @@ mod demo;
 pub mod html;
 pub mod index;
 mod query;
+pub mod storage;
 pub mod url_key;
 
 #[cfg(test)]

@@ -55,13 +55,30 @@ pub enum MatchEvidence {
     Or(Vec<MatchEvidence>),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StatisticsSource {
+    CurrentInMemoryDocumentView,
+    PersistentGeneration(u64),
+}
+
+impl std::fmt::Display for StatisticsSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CurrentInMemoryDocumentView => f.write_str("current in-memory document view"),
+            Self::PersistentGeneration(generation_id) => {
+                write!(f, "persistent generation {generation_id}")
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScoreExplanation {
     pub normalized_terms: Vec<String>,
     pub document_count: usize,
     pub average_title_length: f64,
     pub average_body_length: f64,
-    pub statistics_source: &'static str,
+    pub statistics_source: StatisticsSource,
     pub terms: Vec<TermScoreExplanation>,
     pub total_score: f64,
 }
@@ -109,6 +126,28 @@ impl InMemoryIndex {
 
     pub fn postings(&self) -> &BTreeMap<String, BTreeMap<String, Posting>> {
         &self.postings
+    }
+
+    pub(crate) fn install_validated_postings(
+        &mut self,
+        postings: BTreeMap<String, BTreeMap<String, Posting>>,
+    ) -> Result<(), QueryError> {
+        let mut rebuilt = Self::new();
+        for document in self.documents.values() {
+            rebuilt.add_document(analyze_document(
+                document.id.clone(),
+                document.effective_url.clone(),
+                document.title.clone(),
+                document.body.clone(),
+            )?);
+        }
+        if rebuilt.postings != postings || rebuilt.documents != self.documents {
+            return Err(QueryError::InvalidTerm(
+                "persisted index records do not match analyzed documents".to_owned(),
+            ));
+        }
+        self.postings = postings;
+        Ok(())
     }
 
     pub fn insert(&mut self, document: ExtractedDocument) -> Result<(), QueryError> {
@@ -403,7 +442,7 @@ impl InMemoryIndex {
             document_count: statistics.document_count,
             average_title_length: statistics.average_title_length,
             average_body_length: statistics.average_body_length,
-            statistics_source: "current in-memory document view",
+            statistics_source: StatisticsSource::CurrentInMemoryDocumentView,
             terms,
             total_score,
         })
