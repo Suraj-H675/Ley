@@ -1,0 +1,6 @@
+The synthetic data in reference-v1.json is dedicated to the public domain
+under CC0 1.0 Universal. The CC0 legal code is available at:
+https://creativecommons.org/publicdomain/zero/1.0/legalcode
+
+This dedication covers the fixture data only. It does not license Ley source
+code, documentation, or the verification script.

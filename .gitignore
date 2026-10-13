@@ -8,6 +8,10 @@
 /docs/engineering/
 /docs/development/
 
+# Local decision trails and private source-pack archives stay on this machine.
+/.audit/
+/.private-backups/
+
 # Ordinary local development outputs; refine based on actual toolchain.
 /target/
 /node_modules/

@@ -1,0 +1,1458 @@
+{
+  "schema": "ley-reference-corpus/v1",
+  "license": "CC0-1.0",
+  "contract": {
+    "extractor_id": "ley-html-v1",
+    "analyzer_id": "ley-text-v1",
+    "unicode_version": "17.0.0",
+    "limits": {
+      "url_key_bytes": 2048,
+      "redirect_hops": 10,
+      "compressed_response_bytes": 2097152,
+      "decoded_response_bytes": 8388608,
+      "html_parser_events": 250000,
+      "html_nesting_depth": 256,
+      "title_bytes": 4096,
+      "combined_fields_bytes": 1048576,
+      "document_tokens": 100000,
+      "token_codepoints": 64,
+      "phrase_tokens": 16,
+      "query_bytes": 4096,
+      "query_token_occurrences": 64,
+      "links_per_document": 5000
+    }
+  },
+  "limit_vectors": [
+    {"limit": "url_key_bytes", "at": 2048, "at_outcome": "accept_key", "over": 2049, "over_outcome": "reject_url"},
+    {"limit": "redirect_hops", "at": 10, "at_outcome": "continue_chain", "over": 11, "over_outcome": "reject_chain_retain_previous"},
+    {"limit": "compressed_response_bytes", "at": 2097152, "at_outcome": "accept_body", "over": 2097153, "over_outcome": "reject_response_retain_previous"},
+    {"limit": "decoded_response_bytes", "at": 8388608, "at_outcome": "accept_body", "over": 8388609, "over_outcome": "reject_response_retain_previous"},
+    {"limit": "html_parser_events", "at": 250000, "at_outcome": "continue_parse", "over": 250001, "over_outcome": "reject_document_retain_previous"},
+    {"limit": "html_nesting_depth", "at": 256, "at_outcome": "continue_parse", "over": 257, "over_outcome": "reject_document_retain_previous"},
+    {"limit": "title_bytes", "at": 4096, "at_outcome": "accept_field", "over": 4097, "over_outcome": "reject_document_retain_previous"},
+    {"limit": "combined_fields_bytes", "at": 1048576, "at_outcome": "accept_fields", "over": 1048577, "over_outcome": "reject_document_retain_previous"},
+    {"limit": "document_tokens", "at": 100000, "at_outcome": "accept_document", "over": 100001, "over_outcome": "reject_document_retain_previous"},
+    {"limit": "token_codepoints", "at": 64, "at_outcome": "accept_token", "over": 65, "over_outcome": "TokenTooLong"},
+    {"limit": "phrase_tokens", "at": 16, "at_outcome": "accept_phrase", "over": 17, "over_outcome": "PhraseTooLong"},
+    {"limit": "query_bytes", "at": 4096, "at_outcome": "pass_byte_limit", "over": 4097, "over_outcome": "QueryTooLong"},
+    {"limit": "query_token_occurrences", "at": 64, "at_outcome": "accept_query", "over": 65, "over_outcome": "TooManyTerms"},
+    {"limit": "links_per_document", "at": 5000, "at_outcome": "accept_links", "over": 5001, "over_outcome": "keep_first_5000"}
+  ],
+  "url_vectors": [
+    {
+      "input": "HTTP://Example.TEST:80/catalog/./manual/../search?tag=x&tag=y#chapter",
+      "expected": "http://example.test/catalog/search?tag=x&tag=y",
+      "reason": "scheme, host, default port, dot segments, and fragment"
+    },
+    {
+      "input": "https://example.test/%2e%2e/a/%7euser",
+      "expected": "https://example.test/a/~user",
+      "reason": "encoded dot segment and unreserved escape"
+    },
+    {
+      "input": "https://BÜCHER.example/Über?x=1#top",
+      "expected": "https://xn--bcher-kva.example/%C3%9Cber?x=1",
+      "reason": "IDNA host, UTF-8 path encoding, and fragment"
+    },
+    {
+      "input": "https://example.test/a%2fb",
+      "expected": "https://example.test/a%2Fb",
+      "reason": "reserved slash remains encoded and escape hex is uppercase"
+    },
+    {
+      "input": "https://example.test/a/b",
+      "expected": "https://example.test/a/b",
+      "reason": "literal path separator remains distinct from encoded slash"
+    },
+    {
+      "input": "https://example.test/search?a=1&a=2&x=",
+      "expected": "https://example.test/search?a=1&a=2&x=",
+      "reason": "repeated query keys, order, and empty value are preserved"
+    },
+    {
+      "input": "https://example.test/search?b=2&a=1",
+      "expected": "https://example.test/search?b=2&a=1",
+      "reason": "query parameter order remains significant"
+    },
+    {
+      "input": "https://example.test/search?",
+      "expected": "https://example.test/search?",
+      "reason": "empty query marker is preserved"
+    },
+    {
+      "input": "https://example.test/search?q=ley#section",
+      "expected": "https://example.test/search?q=ley",
+      "reason": "fragment does not participate in identity"
+    },
+    {
+      "input": "https://example.test/search?q=ley",
+      "expected": "https://example.test/search?q=ley",
+      "reason": "same query without a fragment has the same URL key"
+    },
+    {
+      "input": "https://example.test/path/",
+      "expected": "https://example.test/path/",
+      "reason": "trailing slash is significant"
+    },
+    {
+      "input": "https://example.test/path",
+      "expected": "https://example.test/path",
+      "reason": "missing trailing slash is distinct"
+    },
+    {
+      "input": "https://example.test:443/path",
+      "expected": "https://example.test/path",
+      "reason": "HTTPS default port is removed"
+    },
+    {
+      "input": "http://example.test/path",
+      "expected": "http://example.test/path",
+      "reason": "HTTP remains distinct from HTTPS"
+    },
+    {
+      "input": "https://www.example.test/path",
+      "expected": "https://www.example.test/path",
+      "reason": "www host prefix is preserved"
+    },
+    {
+      "input": "https://example.test/Case",
+      "expected": "https://example.test/Case",
+      "reason": "path case is preserved"
+    },
+    {
+      "input": "https://example.test/case",
+      "expected": "https://example.test/case",
+      "reason": "path case remains distinct"
+    },
+    {
+      "input": "https://example.test/path?utm_source=local",
+      "expected": "https://example.test/path?utm_source=local",
+      "reason": "unknown tracking parameters are preserved"
+    },
+    {
+      "input": "https://example.test/?q=%7e",
+      "expected": "https://example.test/?q=~",
+      "reason": "unreserved escapes are decoded in query values too"
+    },
+    {
+      "input": "https://example.test/caf%c3%a9",
+      "expected": "https://example.test/caf%C3%A9",
+      "reason": "reserved/non-ASCII escapes use uppercase hex"
+    },
+    {
+      "input": " https://example.test/trim ",
+      "expected": "https://example.test/trim",
+      "reason": "WHATWG parser trims surrounding ASCII spaces from URL input"
+    },
+    {
+      "input": "https://example.test/%zz",
+      "error": "malformed_percent_escape",
+      "reason": "malformed percent escapes are rejected"
+    },
+    {
+      "input": "https://@example.test/private",
+      "error": "userinfo",
+      "reason": "even empty userinfo syntax is rejected"
+    },
+    {
+      "input": "ftp://example.test/file",
+      "error": "unsupported_scheme",
+      "reason": "only HTTP and HTTPS are accepted"
+    }
+  ],
+  "identity_vectors": [
+    {
+      "kind": "redirect",
+      "requested_url": "https://example.test/start",
+      "effective_url": "https://example.test/final",
+      "canonical_hint": "https://example.test/preferred",
+      "expected_document_id": "https://example.test/start",
+      "expected_effective_url": "https://example.test/final"
+    },
+    {
+      "kind": "conflicting_canonical_hints",
+      "document_ids": ["https://example.test/left", "https://example.test/right"],
+      "canonical_hints": ["https://example.test/right", "https://example.test/left"],
+      "expected_document_ids": ["https://example.test/left", "https://example.test/right"]
+    },
+    {
+      "kind": "same_content_distinct_urls",
+      "document_ids": ["https://example.test/tie-a", "https://example.test/tie-z"],
+      "expected_same_content_fingerprint": true,
+      "expected_distinct_document_ids": true
+    }
+  ],
+  "redirect_vectors": [
+    {
+      "id": "relative_permanent_redirect",
+      "requested_url": "https://example.test/start",
+      "hops": [{"status": 301, "location": "/final"}],
+      "terminal_url": "https://example.test/final",
+      "expected_document_id": "https://example.test/start",
+      "expected_effective_url": "https://example.test/final",
+      "expected_outcome": "publish"
+    },
+    {
+      "id": "redirect_to_unadmitted_origin",
+      "requested_url": "https://example.test/start",
+      "hops": [{"status": 302, "location": "https://outside.test/final"}],
+      "expected_document_id": "https://example.test/start",
+      "expected_outcome": "deny_target_retain_previous"
+    },
+    {
+      "id": "redirect_loop",
+      "requested_url": "https://example.test/a",
+      "hops": [{"status": 302, "location": "/b"}, {"status": 301, "location": "/a"}],
+      "expected_document_id": "https://example.test/a",
+      "expected_outcome": "reject_loop_retain_previous"
+    },
+    {
+      "id": "redirect_hop_limit",
+      "requested_url": "https://example.test/r0",
+      "hops": [
+        {"status": 302, "location": "/r1"},
+        {"status": 302, "location": "/r2"},
+        {"status": 302, "location": "/r3"},
+        {"status": 302, "location": "/r4"},
+        {"status": 302, "location": "/r5"},
+        {"status": 302, "location": "/r6"},
+        {"status": 302, "location": "/r7"},
+        {"status": 302, "location": "/r8"},
+        {"status": 302, "location": "/r9"},
+        {"status": 302, "location": "/r10"},
+        {"status": 302, "location": "/r11"}
+      ],
+      "expected_document_id": "https://example.test/r0",
+      "expected_outcome": "reject_over_limit_retain_previous"
+    }
+  ],
+  "admission_vectors": [
+    {"source": "authored_local_fixture", "policy": "project_owned_cc0", "public_fetch": false, "robots": "allow", "expected": "allow_fixture_only"},
+    {"source": "external_origin", "policy": null, "public_fetch": false, "robots": "allow", "expected": "deny_missing_policy"},
+    {"source": "external_origin", "policy": "documented_allowlist", "public_fetch": false, "robots": "allow", "expected": "deny_public_fetch_disabled"},
+    {"source": "redirect_target", "policy": "not_in_scope", "public_fetch": true, "robots": "allow", "expected": "deny_target"}
+  ],
+  "removal_vectors": [
+    {
+      "id": "http_header_noindex",
+      "prior_version": "v1",
+      "headers": [
+        {
+          "name": "X-Robots-Tag",
+          "value": "noindex"
+        }
+      ],
+      "expected_visible": null
+    },
+    {
+      "id": "leybot_header_noindex_case_insensitive",
+      "prior_version": "v1",
+      "headers": [
+        {
+          "name": "X-Robots-Tag",
+          "value": "LeyBot: NoIndex"
+        }
+      ],
+      "expected_visible": null
+    },
+    {
+      "id": "html_meta_noindex",
+      "prior_version": "v1",
+      "meta": {
+        "name": "robots",
+        "content": "noindex"
+      },
+      "expected_visible": null
+    },
+    {
+      "id": "html_meta_leybot_noindex",
+      "prior_version": "v1",
+      "meta": {
+        "name": "LeyBot",
+        "content": "NOINDEX"
+      },
+      "expected_visible": null
+    },
+    {
+      "id": "combined_noindex_nofollow",
+      "prior_version": "v1",
+      "headers": [
+        {
+          "name": "X-Robots-Tag",
+          "value": "LeyBot: noindex, nofollow"
+        }
+      ],
+      "expected_visible": null,
+      "expected_enqueue_links": false
+    },
+    {
+      "id": "nofollow",
+      "prior_version": "v1",
+      "headers": [
+        {
+          "name": "X-Robots-Tag",
+          "value": "LeyBot: nofollow"
+        }
+      ],
+      "expected_visible": "v1",
+      "expected_enqueue_links": false
+    },
+    {
+      "id": "other_bot_combined_header_ignored",
+      "prior_version": "v1",
+      "headers": [
+        {
+          "name": "X-Robots-Tag",
+          "value": "OtherBot: noindex, nofollow"
+        }
+      ],
+      "expected_visible": "v1",
+      "expected_enqueue_links": true
+    },
+    {
+      "id": "repeated_other_bot_fields_keep_scope",
+      "prior_version": "v1",
+      "headers": [
+        {
+          "name": "X-Robots-Tag",
+          "value": "OtherBot: noindex"
+        },
+        {
+          "name": "X-Robots-Tag",
+          "value": "OtherBot: nofollow"
+        }
+      ],
+      "expected_visible": "v1",
+      "expected_enqueue_links": true
+    },
+    {
+      "id": "repeated_fields_have_independent_scope",
+      "prior_version": "v1",
+      "headers": [
+        {
+          "name": "X-Robots-Tag",
+          "value": "OtherBot: noindex"
+        },
+        {
+          "name": "X-Robots-Tag",
+          "value": "LeyBot: nofollow"
+        }
+      ],
+      "expected_visible": "v1",
+      "expected_enqueue_links": false
+    },
+    {
+      "id": "generic_directive_survives_other_agent_field",
+      "prior_version": "v1",
+      "headers": [
+        {
+          "name": "X-Robots-Tag",
+          "value": "OtherBot: noindex"
+        },
+        {
+          "name": "X-Robots-Tag",
+          "value": "nofollow"
+        }
+      ],
+      "expected_visible": "v1",
+      "expected_enqueue_links": false
+    },
+    {
+      "id": "generic_none_means_noindex_nofollow",
+      "prior_version": "v1",
+      "headers": [
+        {
+          "name": "X-Robots-Tag",
+          "value": "NONE"
+        }
+      ],
+      "expected_visible": null,
+      "expected_enqueue_links": false
+    },
+    {
+      "id": "leybot_none_means_noindex_nofollow",
+      "prior_version": "v1",
+      "headers": [
+        {
+          "name": "X-Robots-Tag",
+          "value": "LeyBot: NoNe"
+        }
+      ],
+      "expected_visible": null,
+      "expected_enqueue_links": false
+    },
+    {
+      "id": "embedded_agent_prefix_is_not_new_scope",
+      "prior_version": "v1",
+      "headers": [
+        {
+          "name": "X-Robots-Tag",
+          "value": "LeyBot: noindex, OtherBot: nofollow"
+        }
+      ],
+      "expected_visible": null,
+      "expected_enqueue_links": true
+    },
+    {
+      "id": "generic_noindex_before_unavailable_after",
+      "prior_version": "v1",
+      "headers": [
+        {
+          "name": "X-Robots-Tag",
+          "value": "noindex, unavailable_after: 25 Jun 2030 15:00:00 PST"
+        }
+      ],
+      "expected_visible": null,
+      "expected_enqueue_links": true
+    },
+    {
+      "id": "generic_none_before_max_snippet",
+      "prior_version": "v1",
+      "headers": [
+        {
+          "name": "X-Robots-Tag",
+          "value": "none, max-snippet:0"
+        }
+      ],
+      "expected_visible": null,
+      "expected_enqueue_links": false
+    },
+    {
+      "id": "generic_noindex_before_embedded_other_agent_prefix",
+      "prior_version": "v1",
+      "headers": [
+        {
+          "name": "X-Robots-Tag",
+          "value": "noindex, OtherBot: nofollow"
+        }
+      ],
+      "expected_visible": null,
+      "expected_enqueue_links": true
+    },
+    {
+      "id": "generic_unavailable_after_before_noindex",
+      "prior_version": "v1",
+      "headers": [
+        {
+          "name": "X-Robots-Tag",
+          "value": "unavailable_after: 25 Jun 2030 15:00:00 PST, noindex"
+        }
+      ],
+      "expected_visible": null,
+      "expected_enqueue_links": true
+    },
+    {
+      "id": "generic_max_snippet_before_none",
+      "prior_version": "v1",
+      "headers": [
+        {
+          "name": "X-Robots-Tag",
+          "value": "max-snippet:0, none"
+        }
+      ],
+      "expected_visible": null,
+      "expected_enqueue_links": false
+    },
+    {
+      "id": "generic_max_image_preview_value_none_before_noindex",
+      "prior_version": "v1",
+      "headers": [
+        {
+          "name": "X-Robots-Tag",
+          "value": "max-image-preview: none, noindex"
+        }
+      ],
+      "expected_visible": null,
+      "expected_enqueue_links": true
+    },
+    {
+      "id": "generic_noindex_before_max_image_preview_value_none",
+      "prior_version": "v1",
+      "headers": [
+        {
+          "name": "X-Robots-Tag",
+          "value": "noindex, max-image-preview: none"
+        }
+      ],
+      "expected_visible": null,
+      "expected_enqueue_links": true
+    },
+    {
+      "id": "generic_max_video_preview_before_none",
+      "prior_version": "v1",
+      "headers": [
+        {
+          "name": "X-Robots-Tag",
+          "value": "max-video-preview:0, none"
+        }
+      ],
+      "expected_visible": null,
+      "expected_enqueue_links": false
+    },
+    {
+      "id": "generic_none_before_max_video_preview",
+      "prior_version": "v1",
+      "headers": [
+        {
+          "name": "X-Robots-Tag",
+          "value": "none, max-video-preview:0"
+        }
+      ],
+      "expected_visible": null,
+      "expected_enqueue_links": false
+    },
+    {
+      "id": "repeated_generic_noindex_then_unavailable_after",
+      "prior_version": "v1",
+      "headers": [
+        {"name": "X-Robots-Tag", "value": "noindex"},
+        {"name": "X-Robots-Tag", "value": "unavailable_after: 25 Jun 2030 15:00:00 PST"}
+      ],
+      "expected_visible": null,
+      "expected_enqueue_links": true
+    },
+    {
+      "id": "repeated_unavailable_after_then_generic_noindex",
+      "prior_version": "v1",
+      "headers": [
+        {"name": "X-Robots-Tag", "value": "unavailable_after: 25 Jun 2030 15:00:00 PST"},
+        {"name": "X-Robots-Tag", "value": "noindex"}
+      ],
+      "expected_visible": null,
+      "expected_enqueue_links": true
+    },
+    {
+      "id": "repeated_generic_none_then_max_snippet",
+      "prior_version": "v1",
+      "headers": [
+        {"name": "X-Robots-Tag", "value": "none"},
+        {"name": "X-Robots-Tag", "value": "max-snippet:0"}
+      ],
+      "expected_visible": null,
+      "expected_enqueue_links": false
+    },
+    {
+      "id": "repeated_max_snippet_then_generic_none",
+      "prior_version": "v1",
+      "headers": [
+        {"name": "X-Robots-Tag", "value": "max-snippet:0"},
+        {"name": "X-Robots-Tag", "value": "none"}
+      ],
+      "expected_visible": null,
+      "expected_enqueue_links": false
+    },
+    {
+      "id": "leybot_scope_survives_max_snippet_item",
+      "prior_version": "v1",
+      "headers": [
+        {"name": "X-Robots-Tag", "value": "LeyBot: max-snippet:0, noindex, nofollow"}
+      ],
+      "expected_visible": null,
+      "expected_enqueue_links": false
+    },
+    {
+      "id": "leybot_scope_survives_unavailable_after_item",
+      "prior_version": "v1",
+      "headers": [
+        {"name": "X-Robots-Tag", "value": "LeyBot: noindex, unavailable_after: 25 Jun 2030 15:00:00 PST, nofollow"}
+      ],
+      "expected_visible": null,
+      "expected_enqueue_links": false
+    },
+    {
+      "id": "otherbot_scope_isolated_with_colon_directive",
+      "prior_version": "v1",
+      "headers": [
+        {"name": "X-Robots-Tag", "value": "OtherBot: max-snippet:0, noindex, nofollow"}
+      ],
+      "expected_visible": "v1",
+      "expected_enqueue_links": true
+    },
+    {
+      "id": "generic_noindex_and_otherbot_nofollow",
+      "prior_version": "v1",
+      "headers": [
+        {"name": "X-Robots-Tag", "value": "noindex"},
+        {"name": "X-Robots-Tag", "value": "OtherBot: nofollow"}
+      ],
+      "expected_visible": null,
+      "expected_enqueue_links": true
+    },
+    {
+      "id": "otherbot_nofollow_and_generic_noindex",
+      "prior_version": "v1",
+      "headers": [
+        {"name": "X-Robots-Tag", "value": "OtherBot: nofollow"},
+        {"name": "X-Robots-Tag", "value": "noindex"}
+      ],
+      "expected_visible": null,
+      "expected_enqueue_links": true
+    },
+    {
+      "id": "malformed_leading_agent_text_preserves_suffix_and_later_rule",
+      "prior_version": "v1",
+      "headers": [
+        {"name": "X-Robots-Tag", "value": "Bad Agent: noindex, nofollow"}
+      ],
+      "expected_visible": null,
+      "expected_enqueue_links": false
+    },
+    {
+      "id": "malformed_empty_scope_preserves_suffix_and_later_none",
+      "prior_version": "v1",
+      "headers": [
+        {"name": "X-Robots-Tag", "value": ": noindex, none"}
+      ],
+      "expected_visible": null,
+      "expected_enqueue_links": false
+    },
+    {
+      "id": "malformed_later_item_preserves_valid_items",
+      "prior_version": "v1",
+      "headers": [
+        {"name": "X-Robots-Tag", "value": "noindex, malformed item: nofollow, none"}
+      ],
+      "expected_visible": null,
+      "expected_enqueue_links": false
+    },
+    {
+      "id": "malformed_supported_directive_colon_keeps_later_nofollow",
+      "prior_version": "v1",
+      "headers": [
+        {"name": "X-Robots-Tag", "value": "noindex: malformed, nofollow"}
+      ],
+      "expected_visible": "v1",
+      "expected_enqueue_links": false
+    },
+    {
+      "id": "malformed_leading_text_preserves_suffix_and_later_noindex",
+      "prior_version": "v1",
+      "headers": [
+        {"name": "X-Robots-Tag", "value": "Bad Agent: nofollow, noindex"}
+      ],
+      "expected_visible": null,
+      "expected_enqueue_links": false
+    },
+    {
+      "id": "other_bot_none_ignored",
+      "prior_version": "v1",
+      "headers": [
+        {
+          "name": "X-Robots-Tag",
+          "value": "OtherBot: none"
+        }
+      ],
+      "expected_visible": "v1",
+      "expected_enqueue_links": true
+    },
+    {
+      "id": "unknown_unrelated_directive_ignored",
+      "prior_version": "v1",
+      "headers": [
+        {
+          "name": "X-Robots-Tag",
+          "value": "archive"
+        }
+      ],
+      "expected_visible": "v1",
+      "expected_enqueue_links": true
+    },
+    {
+      "id": "robots_disallow",
+      "prior_version": "v1",
+      "fetch_performed": false,
+      "robots_allowed": false,
+      "expected_visible": "v1"
+    },
+    {
+      "id": "explicit_removal",
+      "prior_version": "v1",
+      "request": "source_owner_removal",
+      "expected_visible": null
+    },
+    {
+      "id": "retention_expiry",
+      "prior_version": "v1",
+      "request": "policy_retention_deadline",
+      "expected_visible": null
+    },
+    {
+      "id": "source_policy_revoked",
+      "prior_version": "v1",
+      "request": "policy_revocation",
+      "expected_visible": null
+    },
+    {
+      "id": "http_410",
+      "prior_version": "v1",
+      "status": 410,
+      "expected_visible": null
+    },
+    {
+      "id": "http_404_once",
+      "prior_version": "v1",
+      "fetches": [
+        {
+          "attempts": [
+            404,
+            404
+          ]
+        }
+      ],
+      "expected_visible": "v1",
+      "expected_404_count": 1
+    },
+    {
+      "id": "http_404_retry_timeout_not_terminal",
+      "prior_version": "v1",
+      "fetches": [
+        {
+          "attempts": [
+            404,
+            "timeout"
+          ]
+        }
+      ],
+      "expected_visible": "v1",
+      "expected_404_count": 0
+    },
+    {
+      "id": "http_404_twice_with_timeout",
+      "prior_version": "v1",
+      "fetches": [
+        {
+          "attempts": [
+            404,
+            404
+          ]
+        },
+        {
+          "attempts": [
+            "timeout"
+          ]
+        },
+        {
+          "attempts": [
+            404
+          ]
+        }
+      ],
+      "expected_visible": null,
+      "expected_404_count": 2
+    },
+    {
+      "id": "http_404_reset_by_200",
+      "prior_version": "v1",
+      "fetches": [
+        {
+          "attempts": [
+            404
+          ]
+        },
+        {
+          "attempts": [
+            200
+          ]
+        },
+        {
+          "attempts": [
+            404
+          ]
+        }
+      ],
+      "expected_visible": "v1",
+      "expected_404_count": 1
+    },
+    {
+      "id": "http_404_reset_by_304",
+      "prior_version": "v1",
+      "fetches": [
+        {
+          "attempts": [
+            404
+          ]
+        },
+        {
+          "attempts": [
+            304
+          ]
+        },
+        {
+          "attempts": [
+            404
+          ]
+        }
+      ],
+      "expected_visible": "v1",
+      "expected_404_count": 1
+    },
+    {
+      "id": "http_5xx",
+      "prior_version": "v1",
+      "fetches": [
+        {
+          "attempts": [
+            503
+          ]
+        }
+      ],
+      "expected_visible": "v1",
+      "expected_404_count": 0
+    },
+    {
+      "id": "oversized_response",
+      "prior_version": "v1",
+      "decoded_bytes": 8388609,
+      "expected_visible": "v1"
+    }
+  ],
+  "analyzer_vectors": [
+    {
+      "input": "Straße",
+      "normalized": "strasse",
+      "tokens": ["strasse"]
+    },
+    {
+      "input": "café",
+      "normalized": "café",
+      "tokens": ["café"]
+    },
+    {
+      "input": "café",
+      "normalized": "café",
+      "tokens": ["café"]
+    },
+    {
+      "input": "ＦＯＯ",
+      "normalized": "foo",
+      "tokens": ["foo"]
+    },
+    {
+      "input": "alpha-beta",
+      "normalized": "alpha-beta",
+      "tokens": ["alpha", "beta"]
+    },
+    {
+      "input": "2001:db8",
+      "normalized": "2001:db8",
+      "tokens": ["2001", "db8"]
+    }
+  ],
+  "extraction_vectors": [
+    {
+      "id": "html5-fields-and-link-base",
+      "effective_url": "https://example.test/dir/page",
+      "html": "<!doctype html><html><head><base href=\"../guide/\"><base href=\"/ignored/\"><title>  Stone &amp;  SKY </title><title>Second title</title></head><body><p>Alpha <b>Beta</b>.</p><div>Gamma <style>.bad{display:none}</style>Hidden <noscript>Wrong</noscript>Delta</div><script>Injected words</script><template>Template words</template><!-- comment words --><p><a href=\"child#section\">Go</a></p></body></html>",
+      "title": "Stone & SKY",
+      "body": "Alpha Beta. Gamma Hidden Delta Go",
+      "links": ["https://example.test/guide/child"]
+    },
+    {
+      "id": "javascript-base_falls_back_without_later_repair",
+      "effective_url": "https://example.test/dir/page",
+      "html": "<html><head><base href=\"javascript:alert(1)\"><base href=\"/later/\"><title>Base fallback</title></head><body><a href=\"child\">Next</a></body></html>",
+      "title": "Base fallback",
+      "body": "Next",
+      "links": ["https://example.test/dir/child"]
+    }
+  ],
+  "documents": [
+    {
+      "id": "https://example.test/a",
+      "title": "Alpha",
+      "body": "Alpha beta",
+      "title_tokens": ["alpha"],
+      "body_tokens": ["alpha", "beta"],
+      "content_sha256": "4482859ffd43104cbd8d5ace6870f62ed72c632e159750f106b055ccbca63de8",
+      "version_sha256": "cb2b7808b1018bc9b86bc22849501392755d4afc620f0e71f824dbe7fa73fae2"
+    },
+    {
+      "id": "https://example.test/b",
+      "title": "Beta Gamma",
+      "body": "Alpha gamma",
+      "title_tokens": ["beta", "gamma"],
+      "body_tokens": ["alpha", "gamma"],
+      "content_sha256": "919c55fde2864a956d194e515e97836f136c90786026520738b07f1a9cb8fc35",
+      "version_sha256": "6dc5b4194c57acd704fe1eccdeaed4233b7d89aa932e8a128ec004a001a10361"
+    },
+    {
+      "id": "https://example.test/c",
+      "title": "",
+      "body": "Alpha gamma gamma",
+      "title_tokens": [],
+      "body_tokens": ["alpha", "gamma", "gamma"],
+      "content_sha256": "dc2b42aeeea18ca8a26c5297df3ac1634e79bec858da270161899af6343e1e34",
+      "version_sha256": "4c234b842c712cb45eeed2a4d49616f6f52ac2dd8522a7b865b786f59746c6d4"
+    },
+    {
+      "id": "https://example.test/d",
+      "title": "Gamma",
+      "body": "Beta",
+      "title_tokens": ["gamma"],
+      "body_tokens": ["beta"],
+      "content_sha256": "21697fc69e3c99574b66a96fded53b8c43fc33027c75fbd01d79db924ec07188",
+      "version_sha256": "4079bffc68438cc480502f3d9b0defdf78852a0d3c8878c16b44250dda133f61"
+    },
+    {
+      "id": "https://example.test/empty",
+      "title": "",
+      "body": "",
+      "title_tokens": [],
+      "body_tokens": [],
+      "content_sha256": "af5570f5a1810b7af78caf4bc70a660f0df51e42baf91d4de5b2328de0e83dfc",
+      "version_sha256": "a41c79bc1021db748360d379b5d02deee389a6e19e4d48a48ad4def87541fa2b"
+    },
+    {
+      "id": "https://example.test/tie-z",
+      "title": "Shared",
+      "body": "Twin",
+      "title_tokens": ["shared"],
+      "body_tokens": ["twin"],
+      "content_sha256": "f66255bd538de4c84d103099cad83f3778ce436905cb624397e4149b57f7378d",
+      "version_sha256": "595d5f5f4a303ec9acdc15e31287dc23b13790ffc6154bfa1e06b62a66110b1c"
+    },
+    {
+      "id": "https://example.test/tie-a",
+      "title": "Shared",
+      "body": "Twin",
+      "title_tokens": ["shared"],
+      "body_tokens": ["twin"],
+      "content_sha256": "f66255bd538de4c84d103099cad83f3778ce436905cb624397e4149b57f7378d",
+      "version_sha256": "595d5f5f4a303ec9acdc15e31287dc23b13790ffc6154bfa1e06b62a66110b1c"
+    },
+    {
+      "id": "https://example.test/split",
+      "title": "Field",
+      "body": "Separation",
+      "title_tokens": ["field"],
+      "body_tokens": ["separation"],
+      "content_sha256": "adbba0a9e15a4f4bdfca87645fcd172677aac572f85ae0db105afd0a48eee976",
+      "version_sha256": "1d630d538da33a8539664ac0b2b9f2f79abf82775803502e35c61b2a326b8eff"
+    },
+    {
+      "id": "https://example.test/phrase",
+      "title": "",
+      "body": "Field separation",
+      "title_tokens": [],
+      "body_tokens": ["field", "separation"],
+      "content_sha256": "f6d850163f271a8934631956994cd23e2da0fa311accf6e367e7acb7dd7bfd9f",
+      "version_sha256": "3f007354e9862b7f5a0dcd5702ff8f26201f5f0d75aaa206714873c20fbd9caa"
+    },
+    {
+      "id": "https://example.test/unicode",
+      "title": "Straße",
+      "body": "café",
+      "title_tokens": ["strasse"],
+      "body_tokens": ["café"],
+      "content_sha256": "f042aeb2d460ddc38a9be55ba3162451bcc61de5ecd701d7bb101f5570cd56e8",
+      "version_sha256": "7ea8a2bd13dd4681fc0982ff72f51ace3801f88392231aa6689a2bf70b3e175b"
+    }
+  ],
+  "queries": [
+    {
+      "id": "alpha_term",
+      "expression": "alpha",
+      "ast": {"term": "alpha"},
+      "match_case": "term_alpha",
+      "expected_matches": ["https://example.test/a", "https://example.test/b", "https://example.test/c"]
+    },
+    {
+      "id": "operator_precedence",
+      "expression": "alpha OR beta AND gamma",
+      "ast": {"or": [{"term": "alpha"}, {"and": [{"term": "beta"}, {"term": "gamma"}]}]},
+      "match_case": "alpha_or_beta_and_gamma",
+      "expected_matches": ["https://example.test/a", "https://example.test/b", "https://example.test/c", "https://example.test/d"]
+    },
+    {
+      "id": "cross_field_and",
+      "expression": "beta AND gamma",
+      "ast": {"and": [{"term": "beta"}, {"term": "gamma"}]},
+      "match_case": "beta_and_gamma",
+      "expected_matches": ["https://example.test/b", "https://example.test/d"]
+    },
+    {
+      "id": "phrase_same_field",
+      "expression": "\"field separation\"",
+      "ast": {"phrase": ["field", "separation"]},
+      "match_case": "phrase_field_separation",
+      "expected_matches": ["https://example.test/phrase"]
+    },
+    {
+      "id": "duplicate_terms",
+      "expression": "alpha alpha",
+      "ast": {"and": [{"term": "alpha"}, {"term": "alpha"}]},
+      "match_case": "term_alpha",
+      "expected_matches": ["https://example.test/a", "https://example.test/b", "https://example.test/c"],
+      "score_terms": ["alpha"]
+    },
+    {
+      "id": "lowercase_operator_word",
+      "expression": "and",
+      "ast": {"term": "and"},
+      "match_case": "term_and",
+      "expected_matches": []
+    },
+    {
+      "id": "unicode_full_case_fold",
+      "expression": "STRASSE",
+      "ast": {"term": "strasse"},
+      "match_case": "term_strasse",
+      "expected_matches": ["https://example.test/unicode"]
+    },
+    {
+      "id": "unicode_composed_query",
+      "expression": "café",
+      "ast": {"term": "café"},
+      "match_case": "term_cafe_accent",
+      "expected_matches": ["https://example.test/unicode"]
+    },
+    {
+      "id": "unicode_decomposed_query",
+      "expression": "café",
+      "ast": {"term": "café"},
+      "match_case": "term_cafe_accent",
+      "expected_matches": ["https://example.test/unicode"]
+    },
+    {
+      "id": "accent_preserved",
+      "expression": "cafe",
+      "ast": {"term": "cafe"},
+      "match_case": "term_cafe_unaccented",
+      "expected_matches": []
+    },
+    {
+      "id": "unicode_single_token_phrase",
+      "expression": "\"café\"",
+      "ast": {"phrase": ["café"]},
+      "match_case": "phrase_cafe_accent",
+      "expected_matches": ["https://example.test/unicode"]
+    },
+    {
+      "id": "shared_exact_tie",
+      "expression": "shared",
+      "ast": {"term": "shared"},
+      "match_case": "term_shared",
+      "expected_matches": ["https://example.test/tie-a", "https://example.test/tie-z"]
+    }
+  ],
+  "query_errors": [
+    {"expression": "", "error": "EmptyQuery"},
+    {"expression": "   ", "error": "EmptyQuery"},
+    {"expression": "!!!", "error": "NoSearchTerms"},
+    {"expression": "alpha OR", "error": "MissingOperand"},
+    {"expression": "OR alpha", "error": "MissingOperand"},
+    {"expression": "NOT alpha", "error": "UnsupportedSyntax"},
+    {"expression": "(alpha)", "error": "UnsupportedSyntax"},
+    {"expression": "title:alpha", "error": "UnsupportedSyntax"},
+    {"expression": "alpha*", "error": "UnsupportedSyntax"},
+    {"expression": "\"\"", "error": "EmptyPhrase"},
+    {"expression": "\"field", "error": "UnterminatedPhrase"},
+    {"expression": "\"field\\q\"", "error": "InvalidEscape"},
+    {"expression": "\"!!!\"", "error": "EmptyPhrase"}
+  ],
+  "ranking_vectors": [
+    {
+      "query_id": "alpha_term",
+      "terms": ["alpha"],
+      "expected_stats": {
+        "N": 10,
+        "title": {"avg_length": 0.8, "df": {"alpha": 1}},
+        "body": {"avg_length": 1.4, "df": {"alpha": 3}}
+      },
+      "expected_scores": {
+        "https://example.test/a": 4.589442483798455,
+        "https://example.test/b": 0.9743114633296266,
+        "https://example.test/c": 0.7803113931976212
+      },
+      "expected_order": ["https://example.test/a", "https://example.test/b", "https://example.test/c"]
+    },
+    {
+      "query_id": "shared_exact_tie",
+      "terms": ["shared"],
+      "expected_stats": {
+        "N": 10,
+        "title": {"avg_length": 0.8, "df": {"shared": 2}},
+        "body": {"avg_length": 1.4, "df": {"shared": 0}}
+      },
+      "expected_scores": {
+        "https://example.test/tie-a": 2.688272156728474,
+        "https://example.test/tie-z": 2.688272156728474
+      },
+      "expected_order": ["https://example.test/tie-a", "https://example.test/tie-z"]
+    },
+    {
+      "query_id": "operator_precedence",
+      "terms": ["alpha", "beta", "gamma"],
+      "expected_stats": {
+        "N": 10,
+        "title": {"avg_length": 0.8, "df": {"alpha": 1, "beta": 1, "gamma": 2}},
+        "body": {"avg_length": 1.4, "df": {"alpha": 3, "beta": 2, "gamma": 2}}
+      },
+      "expected_scores": {
+        "https://example.test/a": 5.850034192651103,
+        "https://example.test/b": 6.540749004493108,
+        "https://example.test/c": 2.321980983078224,
+        "https://example.test/d": 4.365971416304424
+      },
+      "expected_components": {
+        "https://example.test/a": {
+          "alpha": {"title": 3.6151310204688283, "body": 0.9743114633296266},
+          "beta": {"title": 0.0, "body": 1.2605917088526477},
+          "gamma": {"title": 0.0, "body": 0.0}
+        }
+      },
+      "expected_order": ["https://example.test/b", "https://example.test/a", "https://example.test/d", "https://example.test/c"]
+    }
+  ],
+  "lifecycle": {
+    "events": [
+      {
+        "operation_id": "lease-mutable-1",
+        "kind": "lease",
+        "document_id": "https://example.test/mutable",
+        "fence": 1,
+        "expected_outcome": "lease_issued"
+      },
+      {
+        "operation_id": "upsert-mutable-v1",
+        "kind": "upsert",
+        "document_id": "https://example.test/mutable",
+        "version": "v1",
+        "fence": 1,
+        "title_tokens": [
+          "alpha"
+        ],
+        "body_tokens": [
+          "alpha"
+        ],
+        "expected_outcome": "published"
+      },
+      {
+        "operation_id": "lease-other-1",
+        "kind": "lease",
+        "document_id": "https://example.test/other",
+        "fence": 1,
+        "expected_outcome": "lease_issued"
+      },
+      {
+        "operation_id": "upsert-other-v1",
+        "kind": "upsert",
+        "document_id": "https://example.test/other",
+        "version": "v1",
+        "fence": 1,
+        "title_tokens": [
+          "beta"
+        ],
+        "body_tokens": [
+          "beta"
+        ],
+        "expected_outcome": "published"
+      },
+      {
+        "operation_id": "lease-mutable-2",
+        "kind": "lease",
+        "document_id": "https://example.test/mutable",
+        "fence": 2,
+        "expected_outcome": "lease_issued"
+      },
+      {
+        "operation_id": "upsert-mutable-old",
+        "kind": "upsert",
+        "document_id": "https://example.test/mutable",
+        "version": "old",
+        "fence": 1,
+        "title_tokens": [
+          "alpha"
+        ],
+        "body_tokens": [],
+        "expected_outcome": "stale_fence_rejected_unacknowledged",
+        "review_case": "stale_upsert_is_not_acknowledged_publication"
+      },
+      {
+        "operation_id": "upsert-mutable-v2",
+        "kind": "upsert",
+        "document_id": "https://example.test/mutable",
+        "version": "v2",
+        "fence": 2,
+        "title_tokens": [
+          "gamma"
+        ],
+        "body_tokens": [],
+        "expected_outcome": "published"
+      },
+      {
+        "operation_id": "upsert-mutable-v2",
+        "kind": "upsert",
+        "document_id": "https://example.test/mutable",
+        "version": "v2",
+        "fence": 2,
+        "title_tokens": [
+          "gamma"
+        ],
+        "body_tokens": [],
+        "expected_outcome": "idempotent_replay_noop"
+      },
+      {
+        "operation_id": "lease-other-2",
+        "kind": "lease",
+        "document_id": "https://example.test/other",
+        "fence": 2,
+        "expected_outcome": "lease_issued"
+      },
+      {
+        "operation_id": "delete-other",
+        "kind": "delete",
+        "document_id": "https://example.test/other",
+        "version": null,
+        "fence": 2,
+        "title_tokens": [],
+        "body_tokens": [],
+        "expected_outcome": "tombstone_published",
+        "cause": "policy_revocation"
+      },
+      {
+        "operation_id": "delete-other",
+        "kind": "delete",
+        "document_id": "https://example.test/other",
+        "version": null,
+        "fence": 2,
+        "title_tokens": [],
+        "body_tokens": [],
+        "expected_outcome": "idempotent_replay_noop",
+        "cause": "policy_revocation"
+      },
+      {
+        "operation_id": "replay-other-v1-after-tombstone",
+        "kind": "upsert",
+        "document_id": "https://example.test/other",
+        "version": "v1",
+        "fence": 1,
+        "title_tokens": [
+          "beta"
+        ],
+        "body_tokens": [
+          "beta"
+        ],
+        "expected_outcome": "idempotent_replay_noop",
+        "review_case": "exact_old_upsert_replay_after_newer_tombstone"
+      },
+      {
+        "operation_id": "same-fence-other-v2-after-tombstone",
+        "kind": "upsert",
+        "document_id": "https://example.test/other",
+        "version": "v2",
+        "fence": 2,
+        "title_tokens": [
+          "gamma"
+        ],
+        "body_tokens": [],
+        "expected_outcome": "same_fence_conflict_rejected",
+        "review_case": "same_fence_upsert_conflicts_with_tombstone"
+      },
+      {
+        "operation_id": "automatic-refetch-lease-after-revocation",
+        "kind": "lease",
+        "document_id": "https://example.test/other",
+        "fence": 3,
+        "purpose": "automatic_refetch",
+        "expected_outcome": "revoked_policy_lease_rejected",
+        "review_case": "revocation_blocks_automatic_recovery_lease"
+      },
+      {
+        "operation_id": "automatic-refetch-upsert-after-revocation",
+        "kind": "upsert",
+        "document_id": "https://example.test/other",
+        "version": "v-auto",
+        "fence": 3,
+        "purpose": "automatic_refetch",
+        "title_tokens": [
+          "beta"
+        ],
+        "body_tokens": [],
+        "expected_outcome": "revoked_policy_upsert_rejected",
+        "review_case": "revocation_blocks_automatic_recovery_upsert"
+      },
+      {
+        "operation_id": "lease-tombstone-first-1",
+        "kind": "lease",
+        "document_id": "https://example.test/tombstone-first",
+        "fence": 1,
+        "expected_outcome": "lease_issued"
+      },
+      {
+        "operation_id": "tombstone-first-at-fence-1",
+        "kind": "delete",
+        "document_id": "https://example.test/tombstone-first",
+        "version": null,
+        "fence": 1,
+        "title_tokens": [],
+        "body_tokens": [],
+        "cause": "source_owner_removal",
+        "expected_outcome": "tombstone_published"
+      },
+      {
+        "operation_id": "upsert-conflicts-with-first-tombstone",
+        "kind": "upsert",
+        "document_id": "https://example.test/tombstone-first",
+        "version": "v1",
+        "fence": 1,
+        "title_tokens": [
+          "gamma"
+        ],
+        "body_tokens": [],
+        "expected_outcome": "same_fence_conflict_rejected",
+        "review_case": "first_tombstone_blocks_same_fence_upsert"
+      }
+    ],
+    "expected_live_after_each": [
+      {},
+      {
+        "https://example.test/mutable": "v1"
+      },
+      {
+        "https://example.test/mutable": "v1"
+      },
+      {
+        "https://example.test/mutable": "v1",
+        "https://example.test/other": "v1"
+      },
+      {
+        "https://example.test/mutable": "v1",
+        "https://example.test/other": "v1"
+      },
+      {
+        "https://example.test/mutable": "v1",
+        "https://example.test/other": "v1"
+      },
+      {
+        "https://example.test/mutable": "v2",
+        "https://example.test/other": "v1"
+      },
+      {
+        "https://example.test/mutable": "v2",
+        "https://example.test/other": "v1"
+      },
+      {
+        "https://example.test/mutable": "v2",
+        "https://example.test/other": "v1"
+      },
+      {
+        "https://example.test/mutable": "v2"
+      },
+      {
+        "https://example.test/mutable": "v2"
+      },
+      {
+        "https://example.test/mutable": "v2"
+      },
+      {
+        "https://example.test/mutable": "v2"
+      },
+      {
+        "https://example.test/mutable": "v2"
+      },
+      {
+        "https://example.test/mutable": "v2"
+      },
+      {
+        "https://example.test/mutable": "v2"
+      },
+      {
+        "https://example.test/mutable": "v2"
+      },
+      {
+        "https://example.test/mutable": "v2"
+      }
+    ],
+    "expected_statistics_after_event": {
+      "7": {
+        "N": 2,
+        "title": {
+          "avg_length": 1.0,
+          "df": {
+            "alpha": 0,
+            "beta": 1,
+            "gamma": 1
+          }
+        },
+        "body": {
+          "avg_length": 0.5,
+          "df": {
+            "alpha": 0,
+            "beta": 1,
+            "gamma": 0
+          }
+        }
+      },
+      "10": {
+        "N": 1,
+        "title": {
+          "avg_length": 1.0,
+          "df": {
+            "alpha": 0,
+            "beta": 0,
+            "gamma": 1
+          }
+        },
+        "body": {
+          "avg_length": 0.0,
+          "df": {
+            "alpha": 0,
+            "beta": 0,
+            "gamma": 0
+          }
+        }
+      }
+    },
+    "expected_fence_high_water": {
+      "https://example.test/other": 2,
+      "https://example.test/mutable": 2,
+      "https://example.test/tombstone-first": 1
+    },
+    "recovery_windows": [
+      {
+        "name": "before_intent",
+        "manifest": {
+          "mutable": "v1"
+        },
+        "outbox_pending": false,
+        "recovery": "refetch",
+        "expected_manifest": {
+          "mutable": "v1"
+        }
+      },
+      {
+        "name": "intent_before_publish",
+        "manifest": {
+          "mutable": "v1"
+        },
+        "outbox_pending": true,
+        "recovery": "replay",
+        "replay_version": "v2",
+        "expected_manifest": {
+          "mutable": "v2"
+        }
+      },
+      {
+        "name": "publish_before_ack",
+        "manifest": {
+          "mutable": "v2"
+        },
+        "outbox_pending": true,
+        "recovery": "ack_noop",
+        "replay_version": "v2",
+        "expected_manifest": {
+          "mutable": "v2"
+        }
+      },
+      {
+        "name": "tombstone_before_ack",
+        "manifest": {},
+        "outbox_pending": true,
+        "recovery": "ack_noop",
+        "replay_version": null,
+        "expected_manifest": {}
+      }
+    ]
+  }
+}
