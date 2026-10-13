@@ -1,0 +1,17 @@
+# Private AI/Work/Codex development source pack. NEVER commit these files.
+# This file is safe to version, and its patterns apply after the authorized
+# one-time import into /home/suraj/projects/Ley.
+/AGENTS.md
+/docs/README.md
+/docs/project-pack-manifest.md
+/docs/core/
+/docs/engineering/
+/docs/development/
+
+# Ordinary local development outputs; refine based on actual toolchain.
+/target/
+/node_modules/
+/.env
+/.env.*
+!/.env.example
+*.log
