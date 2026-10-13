@@ -1,0 +1,22 @@
+[package]
+name = "ley"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A controlled local demo of Ley's search pipeline"
+
+[dependencies]
+encoding_rs = "=0.8.42"
+ego-tree = "=0.11.0"
+html5ever = "=0.39.0"
+icu_casemap = "=2.3.0"
+icu_normalizer = "=2.3.0"
+icu_properties = "=2.3.0"
+mime = "=0.3.17"
+reqwest = { version = "=0.13.5", default-features = false, features = ["blocking", "rustls"] }
+scraper = "=0.27.0"
+unicode-segmentation = "=1.13.3"
+url = "=2.5.8"
+
+[dev-dependencies]
+serde_json = "=1.0.145"

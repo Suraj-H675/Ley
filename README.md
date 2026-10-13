@@ -1,6 +1,6 @@
 # Ley: A Search Engine from Scratch
 
-**Status: Gate 0 Domain Contracts and Corpus have been independently accepted by Work. Gate 1 has not begun; no Rust search-engine runtime has been implemented.** This README separates verified project artifacts from planned runtime behavior.
+**Status: Gate 0 Domain Contracts and Corpus and Gate 1 Demo 0.1 have been independently accepted by Work. Gate 2 has not begun.**
 
 Ley is an independently implemented, single-machine web search engine intended to demonstrate practical systems engineering. Its planned Rust core includes a policy-aware web crawler, text extraction, positional inverted index, document updates/deletions, an incremental segmented disk format, Boolean and phrase queries, and BM25-based ranking. A command-line interface, local API, and focused React/TypeScript UI will make the engine usable and inspectable.
 
@@ -9,7 +9,7 @@ The project will write its **own** search-specific components rather than relyin
 ## Planned progression
 
 0. Gate 0 freezes URL/document identity, extraction, Unicode analysis, query grammar, BM25, lifecycle, visibility, handoff, allowed infrastructure boundaries, and a small reference corpus.
-1. Build the local fixture path, in-memory index, and CLI against those contracts.
+1. Gate 1 implements a controlled local fixture path, an in-memory index, and a CLI against those contracts. The local fixture-to-query demonstration has passed independent review.
 2. Validate positional search and ranking against an independent reference.
 3. Add durable, versioned index generations with restart behavior.
 4. Add a bounded crawler with robots and network-safety controls.
@@ -31,9 +31,39 @@ python3 tools/verify_reference_corpus.py
 
 The verifier uses only the Python standard library and needs no network access. It checks fixture integrity, representative URL and extraction goldens, selected Unicode examples, field tokens and version hashes, finite query matches, BM25 statistics and per-field scores, tie order, removal decisions, scheduled 404s, and update/delete/fence replay. It does not implement the WHATWG URL or HTML parser, query parser, crawler, or index.
 
-The analyzer contract targets Unicode 17.0.0. Verification ran with Python's Unicode 16.0.0 database. Official Unicode 16 and 17 data agree for the 42 code points used by the current analyzer, document, and query examples. Their UnicodeData records, default full case-fold mappings, and word-break properties are unchanged. This supports the finite examples only. The verifier's regular-expression tokenizer is not a general UAX #29 implementation, and full Unicode 17 analyzer conformance remains unverified. The Rust analyzer must demonstrate the pinned Unicode 17 behavior before runtime claims are made.
+The finite Python verifier uses Python's Unicode 16.0.0 database. Official Unicode 16 and 17 data agree for the 42 code points used by its current examples; that supports those finite examples only. The Rust implementation uses ICU4X 2.3.0 Unicode data for NFKC, full default case folding, and Unicode properties, with `unicode-segmentation` 1.13.3 for Unicode 17 word boundaries. Rust tests include Unicode 17 code points absent from Unicode 16. The verifier remains unchanged and does not claim general Unicode 17 conformance.
 
-No Rust source implementation, crawler, search runtime, CLI, build command, or engine test suite is claimed yet. Public crawling remains disabled. The target architecture is one Rust library plus CLI, using Ley-owned crawl policy, analyzer, positional index, query executor, and BM25 behind permitted infrastructure libraries. Once the first working slice exists, this README will add verified setup commands, runtime architecture, and demonstrated limits.
+### Run the local demo
+
+From the repository root, with Rust and Cargo installed:
+
+```sh
+cargo run --locked -- demo --query Rust
+```
+
+The command starts an in-process HTTP fixture bound to `127.0.0.1` on an ephemeral port, fetches `/robots.txt` and two HTML pages over HTTP, extracts title/body text and links, creates Ley-owned positional postings in memory, and runs a real query through the CLI. The process checks its fixture request log and exits with an error if the repeated fragment link is fetched twice or the disallowed private page is requested. The fixture listener is joined before the command returns.
+
+The accepted query subset is one unfielded analyzed term. Multi-term, Boolean, phrase, wildcard, and field syntax return an explicit unsupported-syntax error. Scores are computed from the index with separate title and body BM25 contributions (`k1=1.2`, `b=0.75`, title weight 2, body weight 1); this is single-term weighted-field BM25, not BM25F. Ties sort by UTF-8 URL key bytes.
+
+The raw query is limited to 4,096 UTF-8 bytes before trimming or analysis. An over-limit query is rejected before the local fixture starts, with an error that reports its byte count and asks the caller to shorten it.
+
+### Gate 1 boundaries
+
+- Fetching is restricted to the one exact loopback fixture origin, including its port. The HTTP client disables ambient proxies and automatic redirects; every seed, link, and redirect is checked before a request. The demo uses bounded request count, redirect hops, body bytes, parser events, tree depth, field sizes, token count, outgoing links, per-request timeouts, and an overall deadline.
+- The fixture's `robots.txt` exercise is a deliberately simple `LeyBot` disallow-prefix simulation. It is not an RFC 9309 implementation.
+- HTTP content encodings other than `identity` are rejected. HTML bytes use BOM, HTTP charset, the WHATWG first-1024-byte prescan (including its XML fallback), then a deterministic Windows-1252 default; HTML5 parsing runs with scripting disabled.
+- The index and postings exist only in memory. There is no public crawler, source admission, persistent frontier, disk index, recovery, API, or UI. Full Boolean and phrase query behavior is not implemented.
+
+Run the focused Rust suite, formatter and lint checks, plus the finite published-corpus verifier with:
+
+```sh
+cargo test --locked
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets -- -D warnings
+python3 tools/verify_reference_corpus.py
+```
+
+The Python verifier remains a finite Gate 0 check; it is not the Rust parser, crawler, analyzer, or runtime.
 
 ## Development principles
 
