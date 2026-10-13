@@ -1,10 +1,15 @@
 use std::collections::BTreeMap;
-use std::fmt;
 
-use crate::analyzer::{AnalyzeError, Analyzer};
-use crate::html::ExtractedDocument;
+use sha2::{Digest, Sha256};
 
-pub const MAX_QUERY_BYTES: usize = 4096;
+use crate::analyzer::{ANALYZER_ID, AnalyzeError, Analyzer};
+use crate::html::{
+    ExtractedDocument, HTML_SCHEMA_ID, MAX_DOCUMENT_TOKENS, MAX_FIELDS_BYTES, MAX_TITLE_BYTES,
+};
+pub use crate::query::QueryError;
+use crate::query::{Expr, ParsedQuery, parse_query};
+
+pub const MAX_QUERY_BYTES: usize = crate::query::MAX_QUERY_BYTES;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Posting {
@@ -20,47 +25,63 @@ pub struct IndexedDocument {
     pub body: String,
     pub title_terms: Vec<String>,
     pub body_terms: Vec<String>,
+    pub version_id: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SearchResult {
     pub id: String,
+    pub version_id: String,
     pub title: String,
+    pub snippet: String,
     pub score: f64,
+    pub matched: MatchEvidence,
+    pub explanation: ScoreExplanation,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum QueryError {
-    EmptyQuery,
-    QueryTooLong { bytes: usize },
-    UnsupportedSyntax,
-    InvalidTerm(String),
+#[derive(Clone, Debug, PartialEq)]
+pub enum MatchEvidence {
+    Term {
+        term: String,
+        title_positions: Vec<u32>,
+        body_positions: Vec<u32>,
+    },
+    Phrase {
+        terms: Vec<String>,
+        title_starts: Vec<u32>,
+        body_starts: Vec<u32>,
+    },
+    And(Vec<MatchEvidence>),
+    Or(Vec<MatchEvidence>),
 }
 
-impl fmt::Display for QueryError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::EmptyQuery => f.write_str("query has no searchable term"),
-            Self::QueryTooLong { bytes } => write!(
-                f,
-                "query is {bytes} UTF-8 bytes; limit is {MAX_QUERY_BYTES}. Shorten the query and retry."
-            ),
-            Self::UnsupportedSyntax => f.write_str(
-                "Demo 0.1 accepts one unfielded search term; Boolean, phrase, wildcard, and multi-term syntax are unsupported",
-            ),
-            Self::InvalidTerm(message) => write!(f, "query term is invalid: {message}"),
-        }
-    }
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScoreExplanation {
+    pub normalized_terms: Vec<String>,
+    pub document_count: usize,
+    pub average_title_length: f64,
+    pub average_body_length: f64,
+    pub statistics_source: &'static str,
+    pub terms: Vec<TermScoreExplanation>,
+    pub total_score: f64,
 }
 
-impl std::error::Error for QueryError {}
+#[derive(Clone, Debug, PartialEq)]
+pub struct TermScoreExplanation {
+    pub term: String,
+    pub title: FieldScoreExplanation,
+    pub body: FieldScoreExplanation,
+}
 
-pub(crate) fn validate_query_length(expression: &str) -> Result<(), QueryError> {
-    let bytes = expression.len();
-    if bytes > MAX_QUERY_BYTES {
-        return Err(QueryError::QueryTooLong { bytes });
-    }
-    Ok(())
+#[derive(Clone, Debug, PartialEq)]
+pub struct FieldScoreExplanation {
+    pub term_frequency: usize,
+    pub document_frequency: usize,
+    pub document_length: usize,
+    pub average_length: f64,
+    pub idf: f64,
+    pub weight: f64,
+    pub contribution: f64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -111,113 +132,74 @@ impl InMemoryIndex {
                 "duplicate document URL key {id}"
             )));
         }
-        let analyzer = Analyzer;
-        let title_terms = analyzer.analyze(&title).map_err(map_analyzer_error)?;
-        let body_terms = analyzer.analyze(&body).map_err(map_analyzer_error)?;
-        let record = IndexedDocument {
-            id: id.clone(),
-            effective_url,
-            title,
-            body,
-            title_terms: title_terms.clone(),
-            body_terms: body_terms.clone(),
-        };
-        add_positions(&mut self.postings, &id, &title_terms, true);
-        add_positions(&mut self.postings, &id, &body_terms, false);
-        self.documents.insert(id, record);
+        let record = analyze_document(id, effective_url, title, body)?;
+        self.add_document(record);
         Ok(())
     }
 
-    pub fn query(&self, expression: &str) -> Result<Vec<SearchResult>, QueryError> {
-        validate_query_length(expression)?;
-        let query = expression.trim();
-        if query.is_empty() {
-            return Err(QueryError::EmptyQuery);
-        }
-        if query.split_whitespace().count() != 1
-            || query.chars().any(|ch| {
-                matches!(
-                    ch,
-                    '"' | '*'
-                        | '?'
-                        | '+'
-                        | '-'
-                        | '!'
-                        | '|'
-                        | '&'
-                        | '('
-                        | ')'
-                        | '['
-                        | ']'
-                        | '{'
-                        | '}'
-                        | ':'
-                        | '\\'
-                        | '^'
-                        | '~'
-                )
-            })
-            || matches!(query, "AND" | "OR" | "NOT")
+    /// Replace the current in-memory document for this URL key.
+    pub fn upsert_fields(
+        &mut self,
+        id: String,
+        effective_url: String,
+        title: String,
+        body: String,
+    ) -> Result<(), QueryError> {
+        let record = analyze_document(id.clone(), effective_url, title, body)?;
+        self.remove_document(&id);
+        self.add_document(record);
+        Ok(())
+    }
+
+    /// Remove a URL key from the current in-memory search view.
+    pub fn remove_document(&mut self, id: &str) -> bool {
+        let Some(document) = self.documents.remove(id) else {
+            return false;
+        };
+        for term in document
+            .title_terms
+            .iter()
+            .chain(document.body_terms.iter())
         {
-            return Err(QueryError::UnsupportedSyntax);
+            let is_empty = self.postings.get_mut(term).is_some_and(|postings| {
+                postings.remove(id);
+                postings.is_empty()
+            });
+            if is_empty {
+                self.postings.remove(term);
+            }
         }
-        let terms = Analyzer.analyze(query).map_err(map_analyzer_error)?;
-        let Some(term) = terms.first() else {
-            return Err(QueryError::EmptyQuery);
-        };
-        if terms.len() != 1 {
-            return Err(QueryError::UnsupportedSyntax);
-        }
-        let Some(posting_by_document) = self.postings.get(term) else {
+        true
+    }
+
+    pub fn query(&self, expression: &str) -> Result<Vec<SearchResult>, QueryError> {
+        let query = parse_query(expression)?;
+        self.query_parsed(&query)
+    }
+
+    pub(crate) fn query_parsed(
+        &self,
+        query: &ParsedQuery,
+    ) -> Result<Vec<SearchResult>, QueryError> {
+        if self.documents.is_empty() {
             return Ok(Vec::new());
-        };
-        let count = self.documents.len() as f64;
-        if count == 0.0 {
-            return Ok(Vec::new());
         }
-        let avg_title_len = self
-            .documents
-            .values()
-            .map(|document| document.title_terms.len() as f64)
-            .sum::<f64>()
-            / count;
-        let avg_body_len = self
-            .documents
-            .values()
-            .map(|document| document.body_terms.len() as f64)
-            .sum::<f64>()
-            / count;
-        let df_title = posting_by_document
-            .values()
-            .filter(|posting| !posting.title_positions.is_empty())
-            .count() as f64;
-        let df_body = posting_by_document
-            .values()
-            .filter(|posting| !posting.body_positions.is_empty())
-            .count() as f64;
-        let idf_title = bm25_idf(count, df_title);
-        let idf_body = bm25_idf(count, df_body);
-        let mut results = Vec::new();
-        for (document_id, posting) in posting_by_document {
-            let Some(document) = self.documents.get(document_id) else {
+        let matches = self.evaluate(&query.root);
+        let statistics = self.statistics(&query.score_terms);
+        let mut results = Vec::with_capacity(matches.len());
+        for (document_id, matched) in matches {
+            let Some(document) = self.documents.get(&document_id) else {
                 continue;
             };
-            let title_score = bm25_field_score(
-                posting.title_positions.len(),
-                document.title_terms.len(),
-                avg_title_len,
-                idf_title,
-            ) * 2.0;
-            let body_score = bm25_field_score(
-                posting.body_positions.len(),
-                document.body_terms.len(),
-                avg_body_len,
-                idf_body,
-            );
+            let explanation = self.explain_score(document, query, &statistics)?;
             results.push(SearchResult {
                 id: document.id.clone(),
+                version_id: document.version_id.clone(),
                 title: document.title.clone(),
-                score: title_score + body_score,
+                snippet: make_snippet(&document.body),
+                score: explanation.total_score,
+                matched,
+                explanation,
             });
         }
         results.sort_by(|left, right| {
@@ -227,6 +209,302 @@ impl InMemoryIndex {
                 .then_with(|| left.id.as_bytes().cmp(right.id.as_bytes()))
         });
         Ok(results)
+    }
+
+    fn add_document(&mut self, document: IndexedDocument) {
+        add_positions(
+            &mut self.postings,
+            &document.id,
+            &document.title_terms,
+            true,
+        );
+        add_positions(
+            &mut self.postings,
+            &document.id,
+            &document.body_terms,
+            false,
+        );
+        self.documents.insert(document.id.clone(), document);
+    }
+
+    fn evaluate(&self, expression: &Expr) -> BTreeMap<String, MatchEvidence> {
+        match expression {
+            Expr::Term(term) => self.term_matches(term),
+            Expr::Phrase(terms) => self.phrase_matches(terms),
+            Expr::And(children) => {
+                let mut child_matches = children.iter().map(|child| self.evaluate(child));
+                let Some(mut intersection) = child_matches.next() else {
+                    return BTreeMap::new();
+                };
+                for next in child_matches {
+                    intersection = intersect_match_sets(intersection, next);
+                }
+                intersection
+            }
+            Expr::Or(children) => {
+                let mut children = children.iter().map(|child| self.evaluate(child));
+                let Some(mut union) = children.next() else {
+                    return BTreeMap::new();
+                };
+                for next in children {
+                    union = union_match_sets(union, next);
+                }
+                union
+            }
+        }
+    }
+
+    fn term_matches(&self, term: &str) -> BTreeMap<String, MatchEvidence> {
+        self.postings
+            .get(term)
+            .into_iter()
+            .flat_map(|by_document| by_document.iter())
+            .map(|(id, posting)| {
+                (
+                    id.clone(),
+                    MatchEvidence::Term {
+                        term: term.to_owned(),
+                        title_positions: posting.title_positions.clone(),
+                        body_positions: posting.body_positions.clone(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn phrase_matches(&self, terms: &[String]) -> BTreeMap<String, MatchEvidence> {
+        let Some(first) = terms.first() else {
+            return BTreeMap::new();
+        };
+        let Some(candidates) = self.postings.get(first) else {
+            return BTreeMap::new();
+        };
+        let mut matches = BTreeMap::new();
+        for id in candidates.keys() {
+            let title_starts = phrase_starts(&self.postings, id, terms, true);
+            let body_starts = phrase_starts(&self.postings, id, terms, false);
+            if !title_starts.is_empty() || !body_starts.is_empty() {
+                matches.insert(
+                    id.clone(),
+                    MatchEvidence::Phrase {
+                        terms: terms.to_vec(),
+                        title_starts,
+                        body_starts,
+                    },
+                );
+            }
+        }
+        matches
+    }
+
+    fn statistics(&self, terms: &[String]) -> SearchStatistics {
+        let document_count = self.documents.len();
+        let divisor = document_count as f64;
+        let average_title_length = self
+            .documents
+            .values()
+            .map(|document| document.title_terms.len() as f64)
+            .sum::<f64>()
+            / divisor;
+        let average_body_length = self
+            .documents
+            .values()
+            .map(|document| document.body_terms.len() as f64)
+            .sum::<f64>()
+            / divisor;
+        let term_statistics = terms
+            .iter()
+            .map(|term| {
+                let title_df = self
+                    .postings
+                    .get(term)
+                    .map(|by_document| {
+                        by_document
+                            .values()
+                            .filter(|posting| !posting.title_positions.is_empty())
+                            .count()
+                    })
+                    .unwrap_or(0);
+                let body_df = self
+                    .postings
+                    .get(term)
+                    .map(|by_document| {
+                        by_document
+                            .values()
+                            .filter(|posting| !posting.body_positions.is_empty())
+                            .count()
+                    })
+                    .unwrap_or(0);
+                (
+                    term.clone(),
+                    TermStatistics {
+                        title_df,
+                        body_df,
+                        title_idf: bm25_idf(document_count as f64, title_df as f64),
+                        body_idf: bm25_idf(document_count as f64, body_df as f64),
+                    },
+                )
+            })
+            .collect();
+        SearchStatistics {
+            document_count,
+            average_title_length,
+            average_body_length,
+            terms: term_statistics,
+        }
+    }
+
+    fn explain_score(
+        &self,
+        document: &IndexedDocument,
+        query: &ParsedQuery,
+        statistics: &SearchStatistics,
+    ) -> Result<ScoreExplanation, QueryError> {
+        let mut total_score = 0.0;
+        let mut terms = Vec::with_capacity(query.score_terms.len());
+        for term in &query.score_terms {
+            let posting = self
+                .postings
+                .get(term)
+                .and_then(|by_document| by_document.get(&document.id));
+            let term_statistics = statistics
+                .terms
+                .get(term)
+                .expect("query terms have statistics");
+            let title = field_score(
+                posting.map_or(0, |value| value.title_positions.len()),
+                term_statistics.title_df,
+                document.title_terms.len(),
+                statistics.average_title_length,
+                term_statistics.title_idf,
+                2.0,
+            );
+            let body = field_score(
+                posting.map_or(0, |value| value.body_positions.len()),
+                term_statistics.body_df,
+                document.body_terms.len(),
+                statistics.average_body_length,
+                term_statistics.body_idf,
+                1.0,
+            );
+            total_score += title.contribution;
+            total_score += body.contribution;
+            terms.push(TermScoreExplanation {
+                term: term.clone(),
+                title,
+                body,
+            });
+        }
+        if !total_score.is_finite() {
+            return Err(QueryError::NonFiniteScore);
+        }
+        Ok(ScoreExplanation {
+            normalized_terms: query.score_terms.clone(),
+            document_count: statistics.document_count,
+            average_title_length: statistics.average_title_length,
+            average_body_length: statistics.average_body_length,
+            statistics_source: "current in-memory document view",
+            terms,
+            total_score,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SearchStatistics {
+    document_count: usize,
+    average_title_length: f64,
+    average_body_length: f64,
+    terms: BTreeMap<String, TermStatistics>,
+}
+
+#[derive(Clone, Debug)]
+struct TermStatistics {
+    title_df: usize,
+    body_df: usize,
+    title_idf: f64,
+    body_idf: f64,
+}
+
+fn analyze_document(
+    id: String,
+    effective_url: String,
+    title: String,
+    body: String,
+) -> Result<IndexedDocument, QueryError> {
+    if title.len() > MAX_TITLE_BYTES {
+        return Err(QueryError::TitleTooLong { bytes: title.len() });
+    }
+    let field_bytes = title.len().saturating_add(body.len());
+    if field_bytes > MAX_FIELDS_BYTES {
+        return Err(QueryError::FieldsTooLong { bytes: field_bytes });
+    }
+    let title_terms = Analyzer
+        .analyze(&title)
+        .map_err(map_document_analysis_error)?;
+    let body_terms = Analyzer
+        .analyze(&body)
+        .map_err(map_document_analysis_error)?;
+    let token_count = title_terms.len().saturating_add(body_terms.len());
+    if token_count > MAX_DOCUMENT_TOKENS {
+        return Err(QueryError::TooManyDocumentTokens {
+            tokens: token_count,
+        });
+    }
+    let version_id = document_version(&title, &body);
+    Ok(IndexedDocument {
+        id,
+        effective_url,
+        title,
+        body,
+        title_terms,
+        body_terms,
+        version_id,
+    })
+}
+
+fn map_document_analysis_error(error: AnalyzeError) -> QueryError {
+    match error {
+        AnalyzeError::TermTooLong { scalars } => QueryError::DocumentTermTooLong { scalars },
+    }
+}
+
+fn document_version(title: &str, body: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"ley-document-version-v1\0");
+    digest.update(HTML_SCHEMA_ID.as_bytes());
+    digest.update([0]);
+    digest.update(ANALYZER_ID.as_bytes());
+    digest.update([0]);
+    update_field(&mut digest, title);
+    update_field(&mut digest, body);
+    hex_lowercase(&digest.finalize())
+}
+
+fn update_field(digest: &mut Sha256, value: &str) {
+    let bytes = value.as_bytes();
+    let length = u32::try_from(bytes.len()).expect("Gate 1 field limits fit a u32 length");
+    digest.update(length.to_be_bytes());
+    digest.update(bytes);
+}
+
+fn hex_lowercase(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(char::from(HEX[(byte >> 4) as usize]));
+        encoded.push(char::from(HEX[(byte & 0x0f) as usize]));
+    }
+    encoded
+}
+
+fn make_snippet(body: &str) -> String {
+    let mut characters = body.chars();
+    let snippet: String = characters.by_ref().take(160).collect();
+    if characters.next().is_some() {
+        format!("{snippet}…")
+    } else {
+        snippet
     }
 }
 
@@ -250,133 +528,167 @@ fn add_positions(
         } else {
             &mut posting.body_positions
         };
-        positions.push(position as u32);
+        positions.push(u32::try_from(position).expect("document token limit fits u32"));
     }
+}
+
+fn phrase_starts(
+    postings: &BTreeMap<String, BTreeMap<String, Posting>>,
+    document_id: &str,
+    terms: &[String],
+    title: bool,
+) -> Vec<u32> {
+    let Some(first) = terms.first() else {
+        return Vec::new();
+    };
+    let Some(first_posting) = postings
+        .get(first)
+        .and_then(|by_document| by_document.get(document_id))
+    else {
+        return Vec::new();
+    };
+    let first_positions = if title {
+        &first_posting.title_positions
+    } else {
+        &first_posting.body_positions
+    };
+    first_positions
+        .iter()
+        .copied()
+        .filter(|start| {
+            terms.iter().enumerate().skip(1).all(|(offset, term)| {
+                let Some(posting) = postings
+                    .get(term)
+                    .and_then(|by_document| by_document.get(document_id))
+                else {
+                    return false;
+                };
+                let positions = if title {
+                    &posting.title_positions
+                } else {
+                    &posting.body_positions
+                };
+                start
+                    .checked_add(u32::try_from(offset).expect("phrase limit fits u32"))
+                    .is_some_and(|expected| positions.binary_search(&expected).is_ok())
+            })
+        })
+        .collect()
+}
+
+fn combine_and(left: MatchEvidence, right: MatchEvidence) -> MatchEvidence {
+    match left {
+        MatchEvidence::And(mut children) => {
+            children.push(right);
+            MatchEvidence::And(children)
+        }
+        other => MatchEvidence::And(vec![other, right]),
+    }
+}
+
+fn combine_or(left: MatchEvidence, right: MatchEvidence) -> MatchEvidence {
+    match left {
+        MatchEvidence::Or(mut children) => {
+            children.push(right);
+            MatchEvidence::Or(children)
+        }
+        other => MatchEvidence::Or(vec![other, right]),
+    }
+}
+
+fn intersect_match_sets(
+    left: BTreeMap<String, MatchEvidence>,
+    right: BTreeMap<String, MatchEvidence>,
+) -> BTreeMap<String, MatchEvidence> {
+    let mut left = left.into_iter().peekable();
+    let mut right = right.into_iter().peekable();
+    let mut intersection = BTreeMap::new();
+    while let (Some((left_id, _)), Some((right_id, _))) = (left.peek(), right.peek()) {
+        match left_id.as_bytes().cmp(right_id.as_bytes()) {
+            std::cmp::Ordering::Less => {
+                left.next();
+            }
+            std::cmp::Ordering::Greater => {
+                right.next();
+            }
+            std::cmp::Ordering::Equal => {
+                let (id, left_evidence) = left.next().expect("peeked left match");
+                let (_, right_evidence) = right.next().expect("peeked right match");
+                intersection.insert(id, combine_and(left_evidence, right_evidence));
+            }
+        }
+    }
+    intersection
+}
+
+fn union_match_sets(
+    left: BTreeMap<String, MatchEvidence>,
+    right: BTreeMap<String, MatchEvidence>,
+) -> BTreeMap<String, MatchEvidence> {
+    let mut left = left.into_iter().peekable();
+    let mut right = right.into_iter().peekable();
+    let mut union = BTreeMap::new();
+    loop {
+        match (left.peek(), right.peek()) {
+            (Some((left_id, _)), Some((right_id, _))) => {
+                match left_id.as_bytes().cmp(right_id.as_bytes()) {
+                    std::cmp::Ordering::Less => {
+                        let (id, evidence) = left.next().expect("peeked left match");
+                        union.insert(id, evidence);
+                    }
+                    std::cmp::Ordering::Greater => {
+                        let (id, evidence) = right.next().expect("peeked right match");
+                        union.insert(id, evidence);
+                    }
+                    std::cmp::Ordering::Equal => {
+                        let (id, left_evidence) = left.next().expect("peeked left match");
+                        let (_, right_evidence) = right.next().expect("peeked right match");
+                        union.insert(id, combine_or(left_evidence, right_evidence));
+                    }
+                }
+            }
+            (Some(_), None) => {
+                union.extend(left);
+                break;
+            }
+            (None, Some(_)) => {
+                union.extend(right);
+                break;
+            }
+            (None, None) => break,
+        }
+    }
+    union
 }
 
 fn bm25_idf(document_count: f64, document_frequency: f64) -> f64 {
     (1.0 + (document_count - document_frequency + 0.5) / (document_frequency + 0.5)).ln()
 }
 
-fn bm25_field_score(
+fn field_score(
     term_frequency: usize,
-    field_length: usize,
+    document_frequency: usize,
+    document_length: usize,
     average_length: f64,
     idf: f64,
-) -> f64 {
-    if term_frequency == 0 || average_length == 0.0 {
-        return 0.0;
-    }
-    let k1 = 1.2;
-    let b = 0.75;
-    let frequency = term_frequency as f64;
-    let length_norm = 1.0 - b + b * field_length as f64 / average_length;
-    idf * (frequency * (k1 + 1.0)) / (frequency + k1 * length_norm)
-}
-
-fn map_analyzer_error(error: AnalyzeError) -> QueryError {
-    QueryError::InvalidTerm(error.to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::Value;
-
-    fn reference_index() -> InMemoryIndex {
-        let fixture: Value = serde_json::from_str(include_str!("../fixtures/reference-v1.json"))
-            .expect("published reference fixture is valid JSON");
-        let mut index = InMemoryIndex::new();
-        for document in fixture["documents"].as_array().expect("documents") {
-            index
-                .insert_fields(
-                    document["id"].as_str().unwrap().to_owned(),
-                    document["id"].as_str().unwrap().to_owned(),
-                    document["title"].as_str().unwrap().to_owned(),
-                    document["body"].as_str().unwrap().to_owned(),
-                )
-                .unwrap();
-        }
-        index
-    }
-
-    #[test]
-    fn builds_positional_field_postings_and_matches_published_bm25_golden() {
-        let index = reference_index();
-        assert_eq!(index.len(), 10);
-        assert_eq!(
-            index.postings()["alpha"]["https://example.test/a"].title_positions,
-            [0]
-        );
-        assert_eq!(
-            index.postings()["alpha"]["https://example.test/a"].body_positions,
-            [0]
-        );
-
-        let fixture: Value = serde_json::from_str(include_str!("../fixtures/reference-v1.json"))
-            .expect("published reference fixture is valid JSON");
-        let golden = &fixture["ranking_vectors"][0];
-        let results = index.query("alpha").unwrap();
-        let expected_order: Vec<&str> = golden["expected_order"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|id| id.as_str().unwrap())
-            .collect();
-        let actual_order: Vec<&str> = results.iter().map(|result| result.id.as_str()).collect();
-        assert_eq!(actual_order, expected_order);
-        for result in &results {
-            let expected = golden["expected_scores"][&result.id].as_f64().unwrap();
-            assert!((result.score - expected).abs() < 1e-12, "{}", result.id);
-        }
-    }
-
-    #[test]
-    fn explicitly_rejects_unimplemented_query_syntax() {
-        let index = reference_index();
-        for expression in [
-            "alpha beta",
-            "\"alpha beta\"",
-            "alpha OR beta",
-            "title:alpha",
-            "alp*",
-            "+alpha",
-        ] {
-            assert_eq!(index.query(expression), Err(QueryError::UnsupportedSyntax));
-        }
-        assert_eq!(index.query("   "), Err(QueryError::EmptyQuery));
-        assert!(index.query("missing").unwrap().is_empty());
-    }
-
-    #[test]
-    fn checks_raw_query_utf8_bytes_before_trimming_or_analysis() {
-        const QUERY_LIMIT: usize = 4096;
-        let index = reference_index();
-        let at_limit = format!("{}Rust", " ".repeat(QUERY_LIMIT - "Rust".len()));
-        assert_eq!(at_limit.len(), QUERY_LIMIT);
-        assert_eq!(
-            index.query(&at_limit).unwrap(),
-            index.query("Rust").unwrap()
-        );
-
-        let over_limit = format!("{}Rust", " ".repeat(QUERY_LIMIT - "Rust".len() + 1));
-        assert_eq!(over_limit.len(), QUERY_LIMIT + 1);
-        assert_eq!(
-            index.query(&over_limit).unwrap_err().to_string(),
-            "query is 4097 UTF-8 bytes; limit is 4096. Shorten the query and retry."
-        );
-
-        let multibyte_at_limit = "é".repeat(QUERY_LIMIT / "é".len());
-        assert_eq!(multibyte_at_limit.len(), QUERY_LIMIT);
-        assert!(matches!(
-            index.query(&multibyte_at_limit),
-            Err(QueryError::InvalidTerm(_))
-        ));
-        let multibyte_over_limit = "é".repeat(QUERY_LIMIT / "é".len() + 1);
-        assert_eq!(multibyte_over_limit.len(), QUERY_LIMIT + "é".len());
-        assert_eq!(
-            index.query(&multibyte_over_limit).unwrap_err().to_string(),
-            "query is 4098 UTF-8 bytes; limit is 4096. Shorten the query and retry."
-        );
+    weight: f64,
+) -> FieldScoreExplanation {
+    let contribution = if term_frequency == 0 || average_length == 0.0 {
+        0.0
+    } else {
+        let k1 = 1.2;
+        let b = 0.75;
+        let frequency = term_frequency as f64;
+        let length_normalization = 1.0 - b + b * document_length as f64 / average_length;
+        weight * idf * frequency * (k1 + 1.0) / (frequency + k1 * length_normalization)
+    };
+    FieldScoreExplanation {
+        term_frequency,
+        document_frequency,
+        document_length,
+        average_length,
+        idf,
+        weight,
+        contribution,
     }
 }

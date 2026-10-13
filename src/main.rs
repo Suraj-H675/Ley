@@ -18,21 +18,26 @@ fn main() -> ExitCode {
     }
 
     let mut query = "Rust".to_owned();
+    let mut explain = false;
     while let Some(argument) = args.next() {
-        if argument == "--query" {
-            let Some(value) = args.next() else {
-                eprintln!("--query requires a value");
+        match argument.as_str() {
+            "--query" => {
+                let Some(value) = args.next() else {
+                    eprintln!("--query requires a value");
+                    return ExitCode::from(2);
+                };
+                query = value;
+            }
+            "--explain" => explain = true,
+            _ => {
+                eprintln!("unknown demo argument: {argument:?}");
+                print_usage();
                 return ExitCode::from(2);
-            };
-            query = value;
-        } else {
-            eprintln!("unknown demo argument: {argument:?}");
-            print_usage();
-            return ExitCode::from(2);
+            }
         }
     }
 
-    match ley::run_demo(&query) {
+    match ley::run_demo_with_options(&query, explain) {
         Ok(result) => {
             print!("{}", result.stdout);
             ExitCode::SUCCESS
@@ -46,6 +51,6 @@ fn main() -> ExitCode {
 
 fn print_usage() {
     println!(
-        "Ley Gate 1 Demo 0.1\n\nUsage:\n  cargo run --locked -- demo [--query TERM]\n\nDemo 0.1 accepts one unfielded search term."
+        "Ley Gate 2 Search Core 0.2\n\nUsage:\n  cargo run --locked -- demo [--query EXPR] [--explain]\n\nQueries support terms, phrases, AND, OR, and implicit AND."
     );
 }

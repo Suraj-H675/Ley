@@ -15,6 +15,7 @@ icu_properties = "=2.3.0"
 mime = "=0.3.17"
 reqwest = { version = "=0.13.5", default-features = false, features = ["blocking", "rustls"] }
 scraper = "=0.27.0"
+sha2 = "=0.10.9"
 unicode-segmentation = "=1.13.3"
 url = "=2.5.8"
 

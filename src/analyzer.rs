@@ -76,6 +76,11 @@ mod tests {
         let analyzer = Analyzer;
         assert_eq!(analyzer.analyze("\u{A7CE}").unwrap(), ["\u{A7CF}"]);
         assert_eq!(analyzer.analyze("\u{088F}").unwrap(), ["\u{088F}"]);
+        assert_eq!(analyzer.analyze("\u{A7F1}").unwrap(), ["s"]);
+        assert_eq!(analyzer.analyze("\u{10940}").unwrap(), ["\u{10940}"]);
+        assert_eq!(analyzer.analyze("a\u{10940}b").unwrap(), ["a\u{10940}b"]);
+        assert_eq!(analyzer.analyze("\u{11DE0}").unwrap(), ["\u{11DE0}"]);
+        assert_eq!(unicode_segmentation::UNICODE_VERSION, (17, 0, 0));
     }
 
     #[test]
