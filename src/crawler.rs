@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -16,10 +16,13 @@ use url::Url;
 
 use crate::html::{MAX_COMPRESSED_RESPONSE_BYTES, extract_html};
 use crate::index::{InMemoryIndex, QueryError};
+use crate::safe_fetch::FixtureCapability;
 use crate::url_key::{UrlKey, UrlKeyError};
 
 const CRAWLER_AGENT: &str = "LeyBot";
 const FIXTURE_HOST: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
+
+type CapturedHeaders = Vec<Vec<(String, String)>>;
 
 #[derive(Clone, Debug)]
 pub(super) struct FixtureResponse {
@@ -63,11 +66,26 @@ impl FixtureResponse {
             delay: Duration::ZERO,
         }
     }
+
+    #[cfg(test)]
+    pub(super) fn with_header(mut self, name: &str, value: &str) -> Self {
+        self.headers.push((name.to_owned(), value.to_owned()));
+        self
+    }
 }
 
 pub(super) struct LocalFixture {
     origin: FixtureOrigin,
+    capability: FixtureCapability,
+    #[cfg(test)]
+    routes: Arc<Mutex<BTreeMap<String, FixtureResponse>>>,
     requests: Arc<Mutex<Vec<String>>>,
+    #[cfg(test)]
+    request_header_log: Arc<Mutex<CapturedHeaders>>,
+    accepted_connections: Arc<AtomicUsize>,
+    #[cfg(test)]
+    conditional_requests: Arc<AtomicUsize>,
+    fixture_alive: Arc<AtomicBool>,
     stopping: Arc<AtomicBool>,
     server_thread: Option<JoinHandle<()>>,
 }
@@ -92,12 +110,23 @@ impl LocalFixture {
             .local_addr()
             .map_err(|error| CrawlError::Fixture(error.to_string()))?;
         let origin = FixtureOrigin::from_listener(address)?;
-        let routes: Arc<BTreeMap<String, FixtureResponse>> =
-            Arc::new(routes(origin).into_iter().collect());
+        let fixture_alive = Arc::new(AtomicBool::new(true));
+        let capability =
+            FixtureCapability::from_owned_listener("127.0.0.1", &listener, &fixture_alive)
+                .ok_or_else(|| {
+                    CrawlError::Fixture("could not bind listener capability".to_owned())
+                })?;
+        let routes = Arc::new(Mutex::new(routes(origin).into_iter().collect()));
         let requests = Arc::new(Mutex::new(Vec::new()));
+        let request_header_log = Arc::new(Mutex::new(Vec::new()));
+        let accepted_connections = Arc::new(AtomicUsize::new(0));
+        let conditional_requests = Arc::new(AtomicUsize::new(0));
         let stopping = Arc::new(AtomicBool::new(false));
         let thread_routes = Arc::clone(&routes);
         let thread_requests = Arc::clone(&requests);
+        let thread_header_log = Arc::clone(&request_header_log);
+        let thread_accepts = Arc::clone(&accepted_connections);
+        let thread_conditionals = Arc::clone(&conditional_requests);
         let thread_stopping = Arc::clone(&stopping);
         let server_thread = thread::Builder::new()
             .name("ley-local-fixture".to_owned())
@@ -105,7 +134,14 @@ impl LocalFixture {
                 while !thread_stopping.load(Ordering::Relaxed) {
                     match listener.accept() {
                         Ok((stream, _)) => {
-                            serve_one(stream, &thread_routes, &thread_requests);
+                            thread_accepts.fetch_add(1, Ordering::SeqCst);
+                            serve_one(
+                                stream,
+                                &thread_routes,
+                                &thread_requests,
+                                &thread_header_log,
+                                &thread_conditionals,
+                            );
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                             thread::sleep(Duration::from_millis(2));
@@ -117,7 +153,16 @@ impl LocalFixture {
             .map_err(|error| CrawlError::Fixture(error.to_string()))?;
         Ok(Self {
             origin,
+            capability,
+            #[cfg(test)]
+            routes,
             requests,
+            #[cfg(test)]
+            request_header_log,
+            accepted_connections,
+            #[cfg(test)]
+            conditional_requests,
+            fixture_alive,
             stopping,
             server_thread: Some(server_thread),
         })
@@ -125,6 +170,10 @@ impl LocalFixture {
 
     pub(super) fn origin(&self) -> FixtureOrigin {
         self.origin
+    }
+
+    pub(super) fn capability(&self) -> FixtureCapability {
+        self.capability.clone()
     }
 
     pub(super) fn base_url(&self) -> Url {
@@ -138,10 +187,36 @@ impl LocalFixture {
             .expect("fixture request log poisoned")
             .clone()
     }
+
+    #[cfg(test)]
+    pub(super) fn request_header_log(&self) -> CapturedHeaders {
+        self.request_header_log
+            .lock()
+            .expect("fixture request headers poisoned")
+            .clone()
+    }
+
+    pub(super) fn accepted_connections(&self) -> usize {
+        self.accepted_connections.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(super) fn conditional_requests(&self) -> usize {
+        self.conditional_requests.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(super) fn replace_response(&self, path: &str, response: FixtureResponse) {
+        self.routes
+            .lock()
+            .expect("fixture routes poisoned")
+            .insert(path.to_owned(), response);
+    }
 }
 
 impl Drop for LocalFixture {
     fn drop(&mut self) {
+        self.fixture_alive.store(false, Ordering::SeqCst);
         self.stopping.store(true, Ordering::Relaxed);
         if let Some(server_thread) = self.server_thread.take() {
             let _ = server_thread.join();
@@ -151,8 +226,10 @@ impl Drop for LocalFixture {
 
 fn serve_one(
     mut stream: TcpStream,
-    routes: &BTreeMap<String, FixtureResponse>,
+    routes: &Mutex<BTreeMap<String, FixtureResponse>>,
     requests: &Mutex<Vec<String>>,
+    request_header_log: &Mutex<CapturedHeaders>,
+    conditional_requests: &AtomicUsize,
 ) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
     let Ok(reader_stream) = stream.try_clone() else {
@@ -168,11 +245,28 @@ fn serve_one(
         .nth(1)
         .unwrap_or("/")
         .to_owned();
+    let mut conditional = false;
+    let mut observed_headers = Vec::new();
     loop {
         let mut header = String::new();
         if reader.read_line(&mut header).is_err() || header == "\r\n" || header == "\n" {
             break;
         }
+        if let Some((name, value)) = header.split_once(':') {
+            let name = name.trim().to_ascii_lowercase();
+            let value = value.trim().to_owned();
+            if matches!(name.as_str(), "if-none-match" | "if-modified-since") {
+                conditional = true;
+            }
+            observed_headers.push((name, value));
+        }
+    }
+    request_header_log
+        .lock()
+        .expect("fixture request headers poisoned")
+        .push(observed_headers);
+    if conditional {
+        conditional_requests.fetch_add(1, Ordering::SeqCst);
     }
     if !target.starts_with('/') {
         target = "/".to_owned();
@@ -183,11 +277,23 @@ fn serve_one(
         .expect("fixture request log poisoned")
         .push(target);
     let fallback = FixtureResponse::new(404, "text/plain", b"not found");
-    let response = routes.get(&route).unwrap_or(&fallback);
+    let response = routes
+        .lock()
+        .expect("fixture routes poisoned")
+        .get(&route)
+        .cloned()
+        .unwrap_or(fallback);
+    let (status, body) = if response.status == 304 && !conditional {
+        (200, response.body.as_slice())
+    } else if response.status == 304 {
+        (304, &[][..])
+    } else {
+        (response.status, response.body.as_slice())
+    };
     if !response.delay.is_zero() {
         thread::sleep(response.delay);
     }
-    let reason = match response.status {
+    let reason = match status {
         200 => "OK",
         301 => "Moved Permanently",
         302 => "Found",
@@ -199,10 +305,10 @@ fn serve_one(
     };
     let mut headers = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
-        response.status,
+        status,
         reason,
         response.content_type,
-        response.body.len()
+        body.len()
     );
     for (name, value) in &response.headers {
         headers.push_str(name);
@@ -212,7 +318,7 @@ fn serve_one(
     }
     headers.push_str("\r\n");
     if stream.write_all(headers.as_bytes()).is_ok() {
-        let _ = stream.write_all(&response.body);
+        let _ = stream.write_all(body);
         let _ = stream.flush();
     }
 }

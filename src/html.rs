@@ -11,6 +11,7 @@ use scraper::{Html, HtmlTreeSink, Node, Selector};
 use url::Url;
 
 use crate::analyzer::Analyzer;
+use crate::page_policy::{PageRestrictions, parse_meta_restrictions};
 use crate::url_key::UrlKey;
 
 pub const HTML_SCHEMA_ID: &str = "ley-html-v1";
@@ -31,6 +32,7 @@ pub struct ExtractedDocument {
     pub body: String,
     pub links: Vec<UrlKey>,
     pub duplicate_links: usize,
+    pub restrictions: PageRestrictions,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -140,6 +142,7 @@ pub fn extract_html(
     let effective = Url::parse(effective_url).map_err(|_| HtmlError::InvalidEffectiveUrl)?;
     let base = find_base(&document, &effective);
     let (links, duplicate_links) = extract_links(&document, &base);
+    let restrictions = extract_meta_restrictions(&document);
 
     Ok(ExtractedDocument {
         requested_url,
@@ -148,7 +151,25 @@ pub fn extract_html(
         body,
         links,
         duplicate_links,
+        restrictions,
     })
+}
+
+fn extract_meta_restrictions(document: &Html) -> PageRestrictions {
+    let Ok(selector) = Selector::parse("meta[name][content]") else {
+        return PageRestrictions::default();
+    };
+    let mut restrictions = PageRestrictions::default();
+    for element in document.select(&selector) {
+        let Some(name) = element.value().attr("name") else {
+            continue;
+        };
+        let Some(content) = element.value().attr("content") else {
+            continue;
+        };
+        restrictions.combine(parse_meta_restrictions(name, content));
+    }
+    restrictions
 }
 
 fn determine_encoding(bytes: &[u8], content_type: &mime::Mime) -> &'static Encoding {

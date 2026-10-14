@@ -181,6 +181,10 @@ impl ReadView {
         }
         Ok(results)
     }
+
+    pub(crate) fn document(&self, key: &UrlKey) -> Option<crate::index::IndexedDocument> {
+        self.generation.index.documents().get(key.as_str()).cloned()
+    }
 }
 
 pub struct PersistentIndex {
@@ -217,6 +221,10 @@ struct Generation {
 }
 
 impl PersistentIndex {
+    pub(crate) fn store_identity(&self) -> [u8; 16] {
+        self.store_id
+    }
+
     pub fn create(path: impl AsRef<Path>) -> Result<Self, StorageError> {
         let path = path.as_ref().to_path_buf();
         match fs::symlink_metadata(&path) {
@@ -437,6 +445,7 @@ impl PersistentIndex {
                 control.policy.insert(fence, PolicyEvent::Readmitted);
             }
         }
+        storage_failpoint("apply_before_publish");
         self.publish_locked(&next, Some(&current))?;
         Ok(ApplyOutcome::Applied)
     }

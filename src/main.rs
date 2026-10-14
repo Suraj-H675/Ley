@@ -11,6 +11,23 @@ fn main() -> ExitCode {
         print_usage();
         return ExitCode::SUCCESS;
     }
+    if command == "controlled-demo" {
+        if args.next().is_some() {
+            eprintln!("controlled-demo does not accept arguments");
+            print_usage();
+            return ExitCode::from(2);
+        }
+        return match ley::run_controlled_fixture_demo() {
+            Ok(output) => {
+                print!("{output}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("ley: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     if command != "demo" {
         eprintln!("unknown command: {command:?}");
         print_usage();
@@ -51,6 +68,6 @@ fn main() -> ExitCode {
 
 fn print_usage() {
     println!(
-        "Ley Gate 2 Search Core 0.2\n\nUsage:\n  cargo run --locked -- demo [--query EXPR] [--explain]\n\nQueries support terms, phrases, AND, OR, and implicit AND."
+        "Ley Search Engine\n\nUsage:\n  cargo run --locked -- demo [--query EXPR] [--explain]\n  cargo run --locked -- controlled-demo\n\nThe controlled demo uses only its owned loopback fixture. Search queries support terms, phrases, AND, OR, and implicit AND."
     );
 }

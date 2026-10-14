@@ -1,9 +1,18 @@
+use crate::controlled_crawler::{
+    Clock, ControlledCrawler, CrawlCancellation, CrawlLimits, SourcePolicy, SystemClock,
+};
 use crate::crawler::{
     CrawlConfig, CrawlError, CrawlStats, FixtureResponse, LocalFixture, crawl_fixture,
 };
 use crate::index::{FieldScoreExplanation, MatchEvidence, QueryError, SearchResult};
 use crate::query::parse_query;
+use crate::safe_fetch::SystemResolver;
+use crate::storage::PersistentIndex;
 use std::fmt;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Debug)]
 pub struct DemoOutput {
@@ -122,6 +131,175 @@ pub fn run_demo_with_options(query: &str, explain: bool) -> Result<DemoOutput, D
         results,
         stats: result.stats.into(),
     })
+}
+
+/// Run the Gate 4 crawler against a process-owned local fixture, persist the
+/// frontier and index under a unique temporary directory, then reopen the
+/// index and verify the fixture-only query result survives recovery.
+pub fn run_controlled_fixture_demo() -> Result<String, DemoError> {
+    let fixture = LocalFixture::start(vec![
+        (
+            "/robots.txt".to_owned(),
+            FixtureResponse::text("User-agent: LeyBot\nDisallow: /private\n"),
+        ),
+        (
+            "/".to_owned(),
+            FixtureResponse::html(
+                "<title>Controlled Ley fixture</title><p>controlled frontier durable index</p><a href=\"/docs\">documentation</a><a href=\"/private/denied\">private route</a>",
+            ),
+        ),
+        (
+            "/docs".to_owned(),
+            FixtureResponse::html(
+                "<title>Durable crawler recovery</title><p>the controlled crawler persists the frontier and search intent</p>",
+            ),
+        ),
+        (
+            "/private/denied".to_owned(),
+            FixtureResponse::html("<title>This must not be fetched</title>"),
+        ),
+    ])?;
+    let root = Gate4TempDir::create()?;
+    let index_path = root.path().join("index");
+    let frontier_path = root.path().join("frontier.sqlite");
+    let index = Arc::new(PersistentIndex::create(&index_path).map_err(|error| {
+        DemoError::Proof(format!("could not create Gate 4 demo index: {error}"))
+    })?);
+    let origin = fixture.base_url().origin().ascii_serialization();
+    let now = SystemClock.now_ms();
+    let policy = SourcePolicy::owned_fixture(
+        "gate4-local-demo",
+        vec![origin],
+        vec!["/".to_owned()],
+        now.saturating_add(60_000),
+    );
+    let mut crawler = ControlledCrawler::<SystemResolver, SystemClock>::open_system(
+        &frontier_path,
+        Arc::clone(&index),
+        vec![fixture.capability()],
+        CrawlLimits::default(),
+    )
+    .map_err(|error| DemoError::Proof(format!("could not open Gate 4 demo crawler: {error}")))?;
+    let seed = crate::url_key::UrlKey::parse(fixture.base_url().as_str())
+        .map_err(|error| DemoError::Proof(format!("invalid Gate 4 fixture URL: {error}")))?;
+    crawler
+        .admit_source(policy, &[seed])
+        .map_err(|error| DemoError::Proof(format!("could not admit Gate 4 fixture: {error}")))?;
+    let docs_url = fixture.base_url().join("docs").unwrap();
+    let docs = crate::url_key::UrlKey::parse(docs_url.as_str())
+        .map_err(|error| DemoError::Proof(format!("invalid Gate 4 fixture URL: {error}")))?;
+    crawler
+        .enqueue_seed("gate4-local-demo", docs)
+        .map_err(|error| {
+            DemoError::Proof(format!("could not enqueue Gate 4 fixture page: {error}"))
+        })?;
+    let first_report = crawler
+        .run_until_idle(&CrawlCancellation::default())
+        .map_err(|error| DemoError::Proof(format!("Gate 4 fixture crawl failed: {error}")))?;
+    let request_log = fixture.request_log();
+    if request_log.iter().any(|path| path.starts_with("/private/")) {
+        return Err(DemoError::Proof(
+            "Gate 4 fixture fetched a robots-disallowed path".to_owned(),
+        ));
+    }
+    let before = index
+        .query("controlled")
+        .map_err(|error| DemoError::Proof(format!("Gate 4 query failed: {error}")))?;
+    if before.is_empty() || first_report.indexed != 2 {
+        return Err(DemoError::Proof(format!(
+            "Gate 4 fixture result mismatch: indexed={}, query hits={}",
+            first_report.indexed,
+            before.len()
+        )));
+    }
+    crawler
+        .revoke_source("gate4-local-demo")
+        .map_err(|error| DemoError::Proof(format!("could not revoke Gate 4 fixture: {error}")))?;
+    if !index
+        .query("controlled")
+        .map_err(|error| DemoError::Proof(format!("revocation query failed: {error}")))?
+        .is_empty()
+    {
+        return Err(DemoError::Proof(
+            "revoked Gate 4 fixture remained searchable".to_owned(),
+        ));
+    }
+    let renewed_policy = SourcePolicy::owned_fixture(
+        "gate4-local-demo",
+        vec![fixture.base_url().origin().ascii_serialization()],
+        vec!["/".to_owned()],
+        SystemClock.now_ms().saturating_add(60_000),
+    );
+    crawler.readmit_source(renewed_policy).map_err(|error| {
+        DemoError::Proof(format!(
+            "could not explicitly readmit Gate 4 fixture: {error}"
+        ))
+    })?;
+    let recovery_report = crawler
+        .run_until_idle(&CrawlCancellation::default())
+        .map_err(|error| DemoError::Proof(format!("Gate 4 recovery crawl failed: {error}")))?;
+    if recovery_report.indexed != 2 {
+        return Err(DemoError::Proof(format!(
+            "explicit Gate 4 readmission indexed {} pages instead of 2 (requests={}, log={:?})",
+            recovery_report.indexed,
+            recovery_report.requests,
+            fixture.request_log()
+        )));
+    }
+    let final_request_log = fixture.request_log();
+    drop(crawler);
+    drop(index);
+    let reopened = PersistentIndex::open(&index_path)
+        .map_err(|error| DemoError::Proof(format!("could not reopen Gate 4 index: {error}")))?;
+    let after = reopened
+        .query("controlled")
+        .map_err(|error| DemoError::Proof(format!("reopened Gate 4 query failed: {error}")))?;
+    let before_ids: Vec<&str> = before.iter().map(|item| item.id.as_str()).collect();
+    let after_ids: Vec<&str> = after.iter().map(|item| item.id.as_str()).collect();
+    if before_ids != after_ids {
+        return Err(DemoError::Proof(
+            "Gate 4 query results changed across index reopen".to_owned(),
+        ));
+    }
+    let output = format!(
+        "Ley Gate 4 Controlled Crawler 0.4\nFixture origin: {} (owned loopback listener)\nHTTP requests: {} (accepted sockets: {})\nPages indexed: {}\nFrontier and index: temporary persistent stores; index reopened and query parity confirmed\nRobots-disallowed path: NOT FETCHED\nFixture request log:\n{}\n",
+        fixture.base_url().origin().ascii_serialization(),
+        first_report.requests + recovery_report.requests,
+        fixture.accepted_connections(),
+        recovery_report.indexed,
+        final_request_log
+            .iter()
+            .map(|path| format!("  GET {path}\n"))
+            .collect::<String>(),
+    );
+    Ok(output)
+}
+
+struct Gate4TempDir(PathBuf);
+
+impl Gate4TempDir {
+    fn create() -> Result<Self, DemoError> {
+        let elapsed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("ley-gate4-demo-{}-{elapsed}", std::process::id()));
+        fs::create_dir(&path).map_err(|error| {
+            DemoError::Proof(format!("could not create Gate 4 demo directory: {error}"))
+        })?;
+        Ok(Self(path))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Gate4TempDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
 }
 
 fn prove_demo_path(
