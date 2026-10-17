@@ -1,8 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(target_os = "linux")]
+use std::ffi::CString;
 use std::fmt;
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::num::NonZeroU64;
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -12,8 +16,19 @@ use sha2::{Digest, Sha256};
 
 use crate::analyzer::{ANALYZER_ID, Analyzer, MAX_TERM_SCALARS};
 use crate::html::{HTML_SCHEMA_ID, MAX_DOCUMENT_TOKENS, MAX_FIELDS_BYTES, MAX_TITLE_BYTES};
-use crate::index::{InMemoryIndex, QueryError, SearchResult, StatisticsSource};
+use crate::index::{
+    CorpusStatistics as QueryCorpusStatistics, InMemoryIndex, QueryError, SearchResult,
+    query_with_segment_postings,
+};
+use crate::query::parse_query;
 use crate::url_key::{MAX_URL_KEY_BYTES, UrlKey};
+
+mod manifest;
+mod segment;
+use manifest::{
+    ControlRecord, CorpusStatistics, CurrentPointer, Manifest, PolicyRecord, TerminalRecord,
+};
+use segment::{Segment, SegmentDescriptor};
 
 const STORE_NAME: &str = "STORE";
 const LEASE_KEY_NAME: &str = "LEASE_KEY";
@@ -41,6 +56,17 @@ const HEADER_BYTES: usize = 448;
 const DESCRIPTOR_BYTES: usize = 56;
 const SECTION_COUNT: usize = 4;
 const MAX_GENERATION_BYTES: usize = 512 * 1024 * 1024;
+const MAX_MANIFEST_BYTES: usize = 128 * 1024 * 1024;
+const MAX_SEGMENT_BYTES: usize = 512 * 1024 * 1024;
+const MAX_ACTIVE_SEGMENT_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_SEGMENTS: usize = 4096;
+const MAX_PHYSICAL_POSTING_RECORDS: usize = 4_000_000;
+const MAX_POSITION_VALUES: u64 = 50_000_000;
+const MAX_SNAPSHOT_ESTIMATE_BYTES: u64 = 3 * 1024 * 1024 * 1024;
+const STORE_MAGIC_V6: &[u8; 8] = b"LEYSTOR6";
+const LEASE_KEY_MAGIC_V6: &[u8; 8] = b"LEYMACK6";
+const STORE_V6_MAJOR: u16 = 1;
+const STORE_V6_MINOR: u16 = 0;
 const MAX_DOCUMENTS: usize = 100_000;
 const MAX_TERMS: usize = 500_000;
 const MAX_POSTING_RECORDS: usize = 1_000_000;
@@ -181,8 +207,14 @@ impl FenceLease {
 
 #[derive(Clone)]
 pub struct ReadView {
-    generation: Arc<Generation>,
+    snapshot: Arc<SegmentedSnapshot>,
     public_visible_until_ms: Option<u64>,
+}
+
+struct SegmentedSnapshot {
+    manifest: Manifest,
+    segments: BTreeMap<u64, Arc<Segment>>,
+    documents: BTreeMap<String, crate::index::IndexedDocument>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -224,11 +256,11 @@ struct PublicCollectionRecord {
 
 impl ReadView {
     pub fn generation_id(&self) -> u64 {
-        self.generation.id
+        self.snapshot.manifest.generation_id
     }
 
     pub fn document_count(&self) -> usize {
-        self.generation.index.len()
+        self.snapshot.documents.len()
     }
 
     pub fn query(&self, expression: &str) -> Result<Vec<SearchResult>, StorageError> {
@@ -242,20 +274,86 @@ impl ReadView {
         {
             return Err(StorageError::PublicCollectionExpired);
         }
-        let mut results = self
-            .generation
-            .index
-            .query(expression)
-            .map_err(StorageError::from)?;
-        for result in &mut results {
-            result.explanation.statistics_source =
-                StatisticsSource::PersistentGeneration(self.generation.id);
-        }
-        Ok(results)
+        let query = parse_query(expression)?;
+        let postings = self.snapshot.query_postings(&query.score_terms)?;
+        let statistics = self.snapshot.query_statistics()?;
+        Ok(query_with_segment_postings(
+            &self.snapshot.documents,
+            &postings,
+            &query,
+            &statistics,
+            self.snapshot.manifest.generation_id,
+        )?)
     }
 
     pub(crate) fn document(&self, key: &UrlKey) -> Option<crate::index::IndexedDocument> {
-        self.generation.index.documents().get(key.as_str()).cloned()
+        self.snapshot.documents.get(key.as_str()).cloned()
+    }
+}
+
+impl SegmentedSnapshot {
+    fn query_postings(
+        &self,
+        terms: &[String],
+    ) -> Result<BTreeMap<String, BTreeMap<String, crate::index::Posting>>, StorageError> {
+        let mut merged = BTreeMap::new();
+        for term in terms {
+            let mut by_document = BTreeMap::new();
+            for (segment_id, segment) in &self.segments {
+                let Some(records) = segment.postings.get(term) else {
+                    continue;
+                };
+                for (ordinal, posting) in records {
+                    let document = segment
+                        .documents
+                        .get(*ordinal as usize)
+                        .ok_or_else(|| corrupt("posting ordinal is missing in pinned segment"))?;
+                    let visible = self
+                        .manifest
+                        .live
+                        .get(&document.id)
+                        .is_some_and(|reference| {
+                            reference.segment_id == *segment_id
+                                && reference.ordinal == *ordinal
+                                && decode_version_id(&document.version_id).ok()
+                                    == Some(reference.version)
+                        });
+                    if visible
+                        && by_document
+                            .insert(document.id.clone(), posting.clone())
+                            .is_some()
+                    {
+                        return Err(corrupt("two live segments contain the same document key"));
+                    }
+                }
+            }
+            if !by_document.is_empty() {
+                merged.insert(term.clone(), by_document);
+            }
+        }
+        Ok(merged)
+    }
+
+    fn query_statistics(&self) -> Result<QueryCorpusStatistics, StorageError> {
+        let statistics = &self.manifest.statistics;
+        let document_count = usize::try_from(statistics.document_count)
+            .map_err(|_| corrupt("live document count overflow"))?;
+        let mut field_document_frequencies = BTreeMap::new();
+        for (term, frequencies) in &statistics.field_document_frequencies {
+            field_document_frequencies.insert(
+                term.clone(),
+                (
+                    usize::try_from(frequencies.title).map_err(|_| corrupt("title DF overflow"))?,
+                    usize::try_from(frequencies.body).map_err(|_| corrupt("body DF overflow"))?,
+                ),
+            );
+        }
+        Ok(QueryCorpusStatistics {
+            document_count,
+            title_token_total: statistics.title_token_total,
+            body_token_total: statistics.body_token_total,
+            field_document_frequencies,
+        })
     }
 }
 
@@ -263,6 +361,30 @@ pub struct PersistentIndex {
     path: PathBuf,
     store_id: StoreId,
     writer: Mutex<()>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompactionReport {
+    pub old_generation: u64,
+    pub new_generation: u64,
+    pub merged_segments: Vec<SegmentDescriptorSummary>,
+    pub replacement_segments: Vec<SegmentDescriptorSummary>,
+    pub removed_paths: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SegmentDescriptorSummary {
+    pub id: u64,
+    pub byte_len: u64,
+    pub sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MigrationReport {
+    pub source_generation: u64,
+    pub destination_generation: u64,
+    pub document_count: usize,
+    pub destination: PathBuf,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -307,12 +429,12 @@ impl PersistentIndex {
         create_store_directory(&path)?;
         create_private_file(&path.join(LOCK_NAME), &[])?;
         let store_id = random_store_id()?;
-        let store_bytes = encode_store(store_id);
+        let store_bytes = encode_store_v6(store_id, false);
         create_private_file(&path.join(STORE_NAME), &store_bytes)?;
         let lease_mac_key = random_lease_mac_key()?;
         create_private_file(
             &path.join(LEASE_KEY_NAME),
-            &encode_lease_key(store_id, lease_mac_key),
+            &encode_lease_key_v6(store_id, lease_mac_key),
         )?;
         sync_directory(&path)?;
         sync_directory(
@@ -328,20 +450,22 @@ impl PersistentIndex {
             writer: Mutex::new(()),
         };
         let _lock = store.lock_exclusive()?;
-        let initial = Generation {
-            id: 1,
-            parent_id: 0,
-            index: InMemoryIndex::new(),
-            controls: BTreeMap::new(),
-        };
-        store.publish_locked(&initial, None)?;
+        let initial = empty_manifest(store_id);
+        store.publish_manifest_locked(&initial, None)?;
         Ok(store)
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
         let path = path.as_ref().to_path_buf();
         validate_store_directory(&path)?;
-        let (store_id, _) = decode_store(&read_bounded_file(&path.join(STORE_NAME), STORE_BYTES)?)?;
+        let store_bytes = read_bounded_file(&path.join(STORE_NAME), STORE_BYTES)?;
+        if store_bytes.get(..8) == Some(STORE_MAGIC.as_slice()) {
+            let path_text = path.display();
+            return Err(StorageError::ReindexRequired(format!(
+                "Gate 3 store at {path_text} must be converted to a separate destination; stop all writers, then run `ley reindex-gate3 --source {path_text} --destination NEW_PATH`"
+            )));
+        }
+        let (store_id, _) = decode_store(&store_bytes)?;
         let store = Self {
             path: fs::canonicalize(path)?,
             store_id,
@@ -349,7 +473,7 @@ impl PersistentIndex {
         };
         {
             let _lock = store.lock_shared()?;
-            store.load_committed_locked()?;
+            store.load_snapshot_locked()?;
         }
         Ok(store)
     }
@@ -361,15 +485,16 @@ impl PersistentIndex {
             .lock()
             .map_err(|_| StorageError::CorruptCommitted("writer mutex was poisoned".to_owned()))?;
         let _lock = self.lock_exclusive()?;
-        let current = self.load_committed_locked()?;
-        let mut next = next_generation(&current)?;
-        let control = next.controls.entry(key.clone()).or_default();
+        let current_snapshot = self.load_snapshot_locked()?;
+        let current = &current_snapshot.manifest;
+        let mut next = next_manifest(current)?;
+        let control = next.controls.entry(key.as_str().to_owned()).or_default();
         control.high_water = control
             .high_water
             .checked_add(1)
             .ok_or(StorageError::CapacityExceeded("u64 fence exhausted"))?;
         let fence = NonZeroU64::new(control.high_water).ok_or(StorageError::InvalidLease)?;
-        self.publish_locked(&next, Some(&current))?;
+        self.publish_manifest_locked(&next, None)?;
         Ok(FenceLease {
             store_id: self.store_id,
             key: key.clone(),
@@ -387,8 +512,8 @@ impl PersistentIndex {
             .lock()
             .map_err(|_| StorageError::CorruptCommitted("writer mutex was poisoned".to_owned()))?;
         let _lock = self.lock_exclusive()?;
-        let current = self.load_committed_locked()?;
-        let Some(control) = current.controls.get(&lease.key) else {
+        let current = self.load_manifest_locked()?;
+        let Some(control) = current.controls.get(lease.key.as_str()) else {
             return Err(StorageError::InvalidLease);
         };
         if lease.fence.get() > control.high_water {
@@ -405,8 +530,8 @@ impl PersistentIndex {
         if store_id != self.store_id {
             return Err(StorageError::WrongStoreLease);
         }
-        let current = self.load_committed_locked()?;
-        let Some(control) = current.controls.get(&key) else {
+        let current = self.load_manifest_locked()?;
+        let Some(control) = current.controls.get(key.as_str()) else {
             return Err(StorageError::InvalidLease);
         };
         if fence.get() > control.high_water {
@@ -431,8 +556,9 @@ impl PersistentIndex {
             .lock()
             .map_err(|_| StorageError::CorruptCommitted("writer mutex was poisoned".to_owned()))?;
         let _lock = self.lock_exclusive()?;
-        let current = self.load_committed_locked()?;
-        let mut next = next_generation(&current)?;
+        let current_snapshot = self.load_snapshot_locked()?;
+        let current = &current_snapshot.manifest;
+        let mut next = next_manifest(current)?;
         let fence = lease.fence.get();
         let key = lease.key.clone();
         let mut prepared_document = None;
@@ -459,18 +585,19 @@ impl PersistentIndex {
                     .get(key.as_str())
                     .ok_or_else(|| corrupt("prepared upsert disappeared"))?;
                 let version = decode_version_id(&document.version_id)?;
-                prepared_document = Some((effective_url.clone(), title.clone(), body.clone()));
-                (Some(TerminalIntent::Upsert(version)), None)
+                prepared_document = Some(document.clone());
+                (Some(TerminalRecord::Upsert(version)), None)
             }
-            Intent::Tombstone => (Some(TerminalIntent::Tombstone), None),
-            Intent::Revoke => (Some(TerminalIntent::Tombstone), Some(PolicyEvent::Revoked)),
-            Intent::Readmit => (None, Some(PolicyEvent::Readmitted)),
+            Intent::Tombstone => (Some(TerminalRecord::Tombstone), None),
+            Intent::Revoke => (Some(TerminalRecord::Tombstone), Some(PolicyRecord::Revoked)),
+            Intent::Readmit => (None, Some(PolicyRecord::Readmitted)),
         };
 
-        let control = next.controls.entry(key.clone()).or_default();
+        let key_text = key.as_str().to_owned();
+        let mut control = next.controls.get(&key_text).cloned().unwrap_or_default();
         let stored_terminal = control.terminal.get(&fence).copied();
         let stored_policy = control.policy.get(&fence).copied();
-        if is_exact_replay(terminal, policy, stored_terminal, stored_policy) {
+        if is_exact_manifest_replay(terminal, policy, stored_terminal, stored_policy) {
             return Ok(ApplyOutcome::AlreadyApplied);
         }
         if stored_terminal.is_some() || stored_policy.is_some() {
@@ -479,17 +606,37 @@ impl PersistentIndex {
         if control.high_water != fence {
             return Err(StorageError::StaleFence);
         }
-        let revoked = is_revoked(control);
+        let revoked = manifest_is_revoked(&control);
+        let old_document = current_snapshot.documents.get(&key_text).cloned();
+        let mut new_segment = None;
         match intent {
             Intent::Upsert { .. } => {
                 if revoked {
                     return Err(StorageError::Revoked);
                 }
-                let Some((effective_url, title, body)) = prepared_document else {
+                let Some(document) = prepared_document else {
                     return Err(corrupt("prepared upsert fields missing"));
                 };
-                next.index
-                    .upsert_fields(key.as_str().to_owned(), effective_url, title, body)?;
+                if let Some(previous) = &old_document {
+                    remove_document_statistics(&mut next.statistics, previous)?;
+                }
+                add_document_statistics(&mut next.statistics, &document)?;
+                let segment_id = next.next_segment_id;
+                next.next_segment_id = segment_id
+                    .checked_add(1)
+                    .ok_or(StorageError::CapacityExceeded("segment id exhausted"))?;
+                let segment = Segment::from_documents(segment_id, vec![document.clone()])?;
+                next.live.insert(
+                    key_text.clone(),
+                    manifest::LiveReference {
+                        segment_id,
+                        ordinal: 0,
+                        version: decode_version_id(&document.version_id)?,
+                    },
+                );
+                next.segments.push(segment.descriptor.clone());
+                next.segments.sort_by_key(|descriptor| descriptor.id);
+                new_segment = Some(segment);
                 control.terminal.insert(
                     fence,
                     terminal.ok_or_else(|| corrupt("upsert terminal identity missing"))?,
@@ -499,27 +646,271 @@ impl PersistentIndex {
                 if revoked {
                     return Err(StorageError::Revoked);
                 }
-                next.index.remove_document(key.as_str());
-                control.terminal.insert(fence, TerminalIntent::Tombstone);
+                if let Some(previous) = &old_document {
+                    remove_document_statistics(&mut next.statistics, previous)?;
+                    next.live.remove(&key_text);
+                }
+                control.terminal.insert(fence, TerminalRecord::Tombstone);
             }
             Intent::Revoke => {
                 if revoked {
                     return Err(StorageError::Revoked);
                 }
-                next.index.remove_document(key.as_str());
-                control.terminal.insert(fence, TerminalIntent::Tombstone);
-                control.policy.insert(fence, PolicyEvent::Revoked);
+                if let Some(previous) = &old_document {
+                    remove_document_statistics(&mut next.statistics, previous)?;
+                    next.live.remove(&key_text);
+                }
+                control.terminal.insert(fence, TerminalRecord::Tombstone);
+                control.policy.insert(fence, PolicyRecord::Revoked);
             }
             Intent::Readmit => {
                 if !revoked {
                     return Err(StorageError::NotRevoked);
                 }
-                control.policy.insert(fence, PolicyEvent::Readmitted);
+                control.policy.insert(fence, PolicyRecord::Readmitted);
             }
         }
+        next.controls.insert(key_text, control);
+        validate_proposed_manifest_shape(&next, self.store_id)?;
         storage_failpoint("apply_before_publish");
-        self.publish_locked(&next, Some(&current))?;
+        self.publish_manifest_locked(&next, new_segment.as_ref())?;
         Ok(ApplyOutcome::Applied)
+    }
+
+    pub fn compact(&self) -> Result<CompactionReport, StorageError> {
+        let _writer = self
+            .writer
+            .lock()
+            .map_err(|_| StorageError::CorruptCommitted("writer mutex was poisoned".to_owned()))?;
+        let _lock = self.lock_exclusive()?;
+        let snapshot = self.load_snapshot_locked()?;
+        let current = &snapshot.manifest;
+        let old_segments = current
+            .segments
+            .iter()
+            .map(segment_summary)
+            .collect::<Vec<_>>();
+        let physical_document_count = snapshot
+            .segments
+            .values()
+            .map(|segment| segment.documents.len())
+            .sum::<usize>();
+        if current.segments.len() <= 1 && physical_document_count == snapshot.documents.len() {
+            return Ok(CompactionReport {
+                old_generation: current.generation_id,
+                new_generation: current.generation_id,
+                merged_segments: old_segments.clone(),
+                replacement_segments: old_segments,
+                removed_paths: Vec::new(),
+            });
+        }
+        storage_failpoint("compaction_before_merge");
+        let mut next = next_manifest(current)?;
+        next.segments.clear();
+        next.live.clear();
+        let mut replacement = None;
+        if !snapshot.documents.is_empty() {
+            let segment_id = next.next_segment_id;
+            next.next_segment_id = segment_id
+                .checked_add(1)
+                .ok_or(StorageError::CapacityExceeded("segment id exhausted"))?;
+            let documents = snapshot.documents.values().cloned().collect::<Vec<_>>();
+            let segment = Segment::from_documents(segment_id, documents)?;
+            for (ordinal, document) in segment.documents.iter().enumerate() {
+                next.live.insert(
+                    document.id.clone(),
+                    manifest::LiveReference {
+                        segment_id,
+                        ordinal: u32::try_from(ordinal)
+                            .map_err(|_| StorageError::CapacityExceeded("segment ordinal"))?,
+                        version: decode_version_id(&document.version_id)?,
+                    },
+                );
+            }
+            next.segments.push(segment.descriptor.clone());
+            replacement = Some(segment);
+        }
+        if statistics_for_documents(snapshot.documents.values())? != next.statistics {
+            return Err(corrupt("compaction changed exact live statistics"));
+        }
+        validate_proposed_manifest_shape(&next, self.store_id)?;
+        storage_failpoint("compaction_merge_complete");
+        self.publish_manifest_locked(&next, replacement.as_ref())?;
+        let committed = self.load_manifest_locked()?;
+        let removed_paths = old_segments
+            .iter()
+            .filter(|old| !committed.segments.iter().any(|new| new.id == old.id))
+            .map(|old| segment_name(old.id))
+            .collect();
+        let replacement_segments = committed.segments.iter().map(segment_summary).collect();
+        Ok(CompactionReport {
+            old_generation: current.generation_id,
+            new_generation: committed.generation_id,
+            merged_segments: old_segments,
+            replacement_segments,
+            removed_paths,
+        })
+    }
+
+    pub fn reindex_gate3(
+        source: impl AsRef<Path>,
+        destination: impl AsRef<Path>,
+    ) -> Result<MigrationReport, StorageError> {
+        Self::reindex_gate3_with_publish_hook(source, destination, |_| Ok(()))
+    }
+
+    fn reindex_gate3_with_publish_hook(
+        source: impl AsRef<Path>,
+        destination: impl AsRef<Path>,
+        before_publish: impl FnOnce(&Path) -> Result<(), StorageError>,
+    ) -> Result<MigrationReport, StorageError> {
+        let target = resolve_migration_target(source.as_ref(), destination.as_ref())?;
+        let source_path = target.source;
+        let destination_path = target.destination;
+        let parent = target.parent;
+        validate_store_directory(&source_path)?;
+        let source_store = read_bounded_file(&source_path.join(STORE_NAME), STORE_BYTES)?;
+        if source_store.get(..8) != Some(STORE_MAGIC.as_slice()) {
+            return Err(StorageError::ReindexRequired(
+                "source is not an authentic Gate 3 store".to_owned(),
+            ));
+        }
+        let (store_id, public_gate_required) = decode_store(&source_store)?;
+        let source_index = Self {
+            path: source_path.clone(),
+            store_id,
+            writer: Mutex::new(()),
+        };
+        let _writer = source_index
+            .writer
+            .lock()
+            .map_err(|_| StorageError::CorruptCommitted("writer mutex was poisoned".to_owned()))?;
+        let _source_lock = source_index.lock_exclusive()?;
+        let legacy = source_index.load_committed_locked()?;
+        let lease_mac_key = source_index.read_lease_mac_key_locked()?;
+        let gate = source_index.load_public_collection_locked()?;
+        if public_gate_required != gate.is_some() {
+            return Err(corrupt(
+                "Gate 3 public collection sidecars are inconsistent",
+            ));
+        }
+        let notice = if gate.is_some() {
+            Some(read_bounded_file(
+                &source_index.path.join(PUBLIC_NOTICE_NAME),
+                MAX_PUBLIC_NOTICE_BYTES,
+            )?)
+        } else {
+            None
+        };
+        let public_record = if gate.is_some() {
+            Some(read_bounded_file(
+                &source_index.path.join(PUBLIC_COLLECTION_NAME),
+                MAX_PUBLIC_COLLECTION_BYTES,
+            )?)
+        } else {
+            None
+        };
+
+        let destination_name = destination_path
+            .file_name()
+            .ok_or_else(|| {
+                StorageError::ReindexRequired("destination must name a directory".to_owned())
+            })?
+            .to_string_lossy();
+        let stage_name = format!(
+            ".{destination_name}.ley-reindex-{}-{}",
+            std::process::id(),
+            system_time_ms()?
+        );
+        let stage_path = parent.join(stage_name);
+        create_store_directory(&stage_path)?;
+        let _stage = OwnedStageDirectory(stage_path.clone());
+        create_private_file(&stage_path.join(LOCK_NAME), &[])?;
+        create_private_file(
+            &stage_path.join(STORE_NAME),
+            &encode_store_v6(store_id, gate.is_some()),
+        )?;
+        create_private_file(
+            &stage_path.join(LEASE_KEY_NAME),
+            &encode_lease_key_v6(store_id, lease_mac_key),
+        )?;
+        if let (Some(_gate), Some(notice), Some(record)) = (&gate, &notice, &public_record) {
+            create_private_file(&stage_path.join(PUBLIC_COLLECTION_NAME), record)?;
+            create_private_file(&stage_path.join(PUBLIC_NOTICE_NAME), notice)?;
+        }
+        sync_directory(&stage_path)?;
+
+        let documents = legacy
+            .index
+            .documents()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut manifest = Manifest {
+            generation_id: legacy.id,
+            parent_id: legacy.parent_id,
+            next_segment_id: 1,
+            format_major: 1,
+            format_minor: 0,
+            store_id,
+            analyzer_id: ANALYZER_ID.to_owned(),
+            html_schema_id: HTML_SCHEMA_ID.to_owned(),
+            segments: Vec::new(),
+            live: BTreeMap::new(),
+            controls: controls_to_records(&legacy.controls),
+            statistics: statistics_for_documents(legacy.index.documents().values())?,
+        };
+        let segment = if documents.is_empty() {
+            None
+        } else {
+            let segment_id = manifest.next_segment_id;
+            manifest.next_segment_id = segment_id
+                .checked_add(1)
+                .ok_or(StorageError::CapacityExceeded("segment id exhausted"))?;
+            let segment = Segment::from_documents(segment_id, documents)?;
+            for (ordinal, document) in segment.documents.iter().enumerate() {
+                manifest.live.insert(
+                    document.id.clone(),
+                    manifest::LiveReference {
+                        segment_id,
+                        ordinal: u32::try_from(ordinal)
+                            .map_err(|_| StorageError::CapacityExceeded("segment ordinal"))?,
+                        version: decode_version_id(&document.version_id)?,
+                    },
+                );
+            }
+            manifest.segments.push(segment.descriptor.clone());
+            Some(segment)
+        };
+        validate_proposed_manifest_shape(&manifest, store_id)?;
+        let destination_store = Self {
+            path: fs::canonicalize(&stage_path)?,
+            store_id,
+            writer: Mutex::new(()),
+        };
+        {
+            let _destination_lock = destination_store.lock_exclusive()?;
+            destination_store.publish_manifest_locked(&manifest, segment.as_ref())?;
+            let snapshot = destination_store.load_snapshot_locked()?;
+            if snapshot.documents.len() != legacy.index.len()
+                || snapshot.manifest.controls != manifest.controls
+                || snapshot.manifest.statistics != manifest.statistics
+            {
+                return Err(corrupt(
+                    "Gate 3 migration destination failed logical verification",
+                ));
+            }
+        }
+        ensure_destination_absent(&destination_path)?;
+        before_publish(&destination_path)?;
+        rename_directory_noreplace(&stage_path, &destination_path)?;
+        sync_directory(&parent)?;
+        Ok(MigrationReport {
+            source_generation: legacy.id,
+            destination_generation: manifest.generation_id,
+            document_count: manifest.live.len(),
+            destination: destination_path,
+        })
     }
 
     pub(crate) fn install_public_collection_gate(
@@ -542,7 +933,7 @@ impl PersistentIndex {
             .lock()
             .map_err(|_| StorageError::CorruptCommitted("writer mutex was poisoned".to_owned()))?;
         let _lock = self.lock_exclusive()?;
-        let current = self.load_committed_locked()?;
+        let current = self.load_manifest_locked()?;
         if let Some(existing) = self.load_public_collection_locked()? {
             if !existing.same_admission(gate) {
                 return Err(StorageError::PublicCollectionConflict);
@@ -560,7 +951,8 @@ impl PersistentIndex {
             self.mark_store_as_public_collection()?;
             return Ok(());
         }
-        if current.id != 1 || !current.index.is_empty() || gate.visible_until_ms <= now_ms {
+        if current.generation_id != 1 || !current.live.is_empty() || gate.visible_until_ms <= now_ms
+        {
             return Err(StorageError::PublicCollectionConflict);
         }
 
@@ -588,9 +980,9 @@ impl PersistentIndex {
         if public_visible_until_ms.is_some_and(|deadline| now_ms >= deadline) {
             return Err(StorageError::PublicCollectionExpired);
         }
-        let generation = self.load_committed_locked()?;
+        let snapshot = self.load_snapshot_locked()?;
         Ok(ReadView {
-            generation: Arc::new(generation),
+            snapshot: Arc::new(snapshot),
             public_visible_until_ms,
         })
     }
@@ -625,6 +1017,207 @@ impl PersistentIndex {
         Ok(generation)
     }
 
+    fn load_manifest_locked(&self) -> Result<Manifest, StorageError> {
+        let current_path = self.path.join(CURRENT_NAME);
+        match fs::symlink_metadata(&current_path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(StorageError::IncompleteInitialStore);
+            }
+            Err(error) => return Err(error.into()),
+            Ok(_) => {}
+        }
+        let pointer_bytes = read_bounded_file(&current_path, CURRENT_BYTES)?;
+        let pointer = CurrentPointer::decode(&pointer_bytes, self.store_id)?;
+        let manifest_path = self.path.join(manifest_name(pointer.generation_id));
+        let manifest_bytes = match read_bounded_file(&manifest_path, MAX_MANIFEST_BYTES) {
+            Err(StorageError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(corrupt("CURRENT references a missing manifest"));
+            }
+            result => result?,
+        };
+        if manifest_bytes.len() as u64 != pointer.manifest_len
+            || sha256(&manifest_bytes) != pointer.manifest_sha256
+        {
+            return Err(corrupt("CURRENT manifest length or checksum mismatch"));
+        }
+        let manifest = Manifest::decode(&manifest_bytes, self.store_id, pointer.generation_id)?;
+        validate_manifest_shape(&manifest, self.store_id)?;
+        Ok(manifest)
+    }
+
+    fn load_snapshot_locked(&self) -> Result<SegmentedSnapshot, StorageError> {
+        let pointer_bytes = read_bounded_file(&self.path.join(CURRENT_NAME), CURRENT_BYTES)?;
+        let pointer = CurrentPointer::decode(&pointer_bytes, self.store_id)?;
+        let manifest = self.load_manifest_locked()?;
+        let estimate = snapshot_memory_estimate(&manifest, pointer.manifest_len)?;
+        if estimate > MAX_SNAPSHOT_ESTIMATE_BYTES {
+            return Err(StorageError::CapacityExceeded(
+                "decoded snapshot memory estimate",
+            ));
+        }
+        let mut segments = BTreeMap::new();
+        for descriptor in &manifest.segments {
+            let path = self.path.join(segment_name(descriptor.id));
+            let bytes = match read_bounded_file(&path, MAX_SEGMENT_BYTES) {
+                Err(StorageError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                    return Err(corrupt("manifest references a missing segment"));
+                }
+                result => result?,
+            };
+            let segment = Segment::from_bytes(descriptor, &bytes)?;
+            if segments.insert(descriptor.id, Arc::new(segment)).is_some() {
+                return Err(corrupt("manifest contains a duplicate segment id"));
+            }
+        }
+        let mut documents = BTreeMap::new();
+        for (key, reference) in &manifest.live {
+            let segment = segments
+                .get(&reference.segment_id)
+                .ok_or_else(|| corrupt("live document references an absent segment"))?;
+            let document = segment
+                .documents
+                .get(reference.ordinal as usize)
+                .ok_or_else(|| corrupt("live document ordinal is outside its segment"))?;
+            if document.id != *key || decode_version_id(&document.version_id)? != reference.version
+            {
+                return Err(corrupt(
+                    "live document reference differs from its segment record",
+                ));
+            }
+            documents.insert(key.clone(), document.clone());
+        }
+        validate_live_control_records(&documents, &manifest.controls)?;
+        let actual_statistics = statistics_for_documents(documents.values())?;
+        if actual_statistics != manifest.statistics {
+            return Err(corrupt(
+                "manifest live statistics differ from visible documents",
+            ));
+        }
+        Ok(SegmentedSnapshot {
+            manifest,
+            segments,
+            documents,
+        })
+    }
+
+    fn publish_manifest_locked(
+        &self,
+        manifest: &Manifest,
+        new_segment: Option<&Segment>,
+    ) -> Result<(), StorageError> {
+        validate_proposed_manifest_shape(manifest, self.store_id)?;
+        let current = match self.load_manifest_locked() {
+            Ok(value) => Some(value),
+            Err(StorageError::IncompleteInitialStore) => None,
+            Err(error) => return Err(error),
+        };
+        if let Some(current) = &current {
+            let expected_generation =
+                current
+                    .generation_id
+                    .checked_add(1)
+                    .ok_or(StorageError::CapacityExceeded(
+                        "manifest generation id exhausted",
+                    ))?;
+            if manifest.parent_id != current.generation_id
+                || manifest.generation_id != expected_generation
+            {
+                return Err(corrupt("manifest does not extend the current generation"));
+            }
+        }
+        cleanup_gate6_orphans(&self.path, current.as_ref())?;
+
+        if let Some(segment) = new_segment {
+            let descriptor = manifest
+                .segments
+                .iter()
+                .find(|descriptor| descriptor.id == segment.id)
+                .ok_or_else(|| corrupt("new segment is absent from next manifest"))?;
+            if descriptor != &segment.descriptor {
+                return Err(corrupt("new segment descriptor differs from next manifest"));
+            }
+            let bytes = segment.encode()?;
+            let _ = Segment::from_bytes(descriptor, &bytes)?;
+            let temporary = self.path.join(segment_temp_name(segment.id));
+            let ready = self.path.join(segment_name(segment.id));
+            let mut file = create_private_file_handle(&temporary)?;
+            let split = bytes.len() / 2;
+            file.write_all(&bytes[..split])?;
+            storage_failpoint("segment_write_half");
+            file.write_all(&bytes[split..])?;
+            file.flush()?;
+            storage_failpoint("segment_write_complete");
+            let staged = read_bounded_file(&temporary, MAX_SEGMENT_BYTES)?;
+            let _ = Segment::from_bytes(descriptor, &staged)?;
+            storage_failpoint("segment_validate");
+            file.sync_all()?;
+            storage_failpoint("segment_sync");
+            drop(file);
+            fs::rename(&temporary, &ready)?;
+            storage_failpoint("segment_rename");
+            sync_directory(&self.path)?;
+            storage_failpoint("segment_directory_sync");
+        }
+
+        let bytes = manifest.encode()?;
+        let checked = Manifest::decode(&bytes, self.store_id, manifest.generation_id)?;
+        validate_proposed_manifest_shape(&checked, self.store_id)?;
+        let temporary = self.path.join(manifest_temp_name(manifest.generation_id));
+        let ready = self.path.join(manifest_name(manifest.generation_id));
+        let mut file = create_private_file_handle(&temporary)?;
+        let split = bytes.len() / 2;
+        file.write_all(&bytes[..split])?;
+        storage_failpoint("manifest_write_half");
+        file.write_all(&bytes[split..])?;
+        file.flush()?;
+        storage_failpoint("manifest_write_complete");
+        let staged = read_bounded_file(&temporary, MAX_MANIFEST_BYTES)?;
+        let _ = Manifest::decode(&staged, self.store_id, manifest.generation_id)?;
+        storage_failpoint("manifest_validate");
+        file.sync_all()?;
+        storage_failpoint("manifest_sync");
+        drop(file);
+        fs::rename(&temporary, &ready)?;
+        storage_failpoint("manifest_rename");
+        sync_directory(&self.path)?;
+        storage_failpoint("manifest_directory_sync");
+
+        let pointer = CurrentPointer {
+            store_id: self.store_id,
+            generation_id: manifest.generation_id,
+            manifest_len: bytes.len() as u64,
+            manifest_sha256: sha256(&bytes),
+        };
+        let pointer_bytes = pointer.encode();
+        let temporary = self.path.join(".CURRENT.v6.tmp");
+        let mut pointer_file = create_private_file_handle(&temporary)?;
+        pointer_file.write_all(&pointer_bytes)?;
+        pointer_file.flush()?;
+        storage_failpoint("current_write_complete");
+        let staged = read_bounded_file(&temporary, CURRENT_BYTES)?;
+        let _ = CurrentPointer::decode(&staged, self.store_id)?;
+        if staged != pointer_bytes {
+            return Err(corrupt(
+                "staged Gate 6 CURRENT differs from encoded pointer",
+            ));
+        }
+        pointer_file.sync_all()?;
+        storage_failpoint("current_sync");
+        drop(pointer_file);
+        fs::rename(&temporary, self.path.join(CURRENT_NAME))?;
+        storage_failpoint("pointer_rename");
+        sync_directory(&self.path)?;
+        storage_failpoint("directory_sync");
+
+        let committed = self.load_manifest_locked()?;
+        if committed.generation_id != manifest.generation_id {
+            return Err(corrupt("reopened manifest differs from publication"));
+        }
+        cleanup_gate6_orphans(&self.path, Some(&committed))?;
+        Ok(())
+    }
+
+    #[cfg(test)]
     fn publish_locked(
         &self,
         generation: &Generation,
@@ -744,7 +1337,7 @@ impl PersistentIndex {
             write_private_file_atomically(
                 &path,
                 &self.path.join(".STORE.tmp"),
-                &encode_public_store(self.store_id),
+                &encode_store_v6(self.store_id, true),
             )?;
         }
         Ok(())
@@ -775,7 +1368,7 @@ impl PersistentIndex {
             Ok(bytes) => decode_lease_key(&bytes, self.store_id),
             Err(StorageError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
                 let mac_key = random_lease_mac_key()?;
-                create_private_file(&path, &encode_lease_key(self.store_id, mac_key))?;
+                create_private_file(&path, &encode_lease_key_v6(self.store_id, mac_key))?;
                 sync_directory(&self.path)?;
                 Ok(mac_key)
             }
@@ -784,34 +1377,744 @@ impl PersistentIndex {
     }
 }
 
-fn next_generation(current: &Generation) -> Result<Generation, StorageError> {
-    let id = current
-        .id
-        .checked_add(1)
-        .ok_or(StorageError::CapacityExceeded("generation id exhausted"))?;
-    Ok(Generation {
-        id,
-        parent_id: current.id,
-        index: current.index.clone(),
-        controls: current.controls.clone(),
+struct OwnedStageDirectory(PathBuf);
+
+impl Drop for OwnedStageDirectory {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn resolve_migration_target(
+    source: &Path,
+    destination: &Path,
+) -> Result<ResolvedMigrationTarget, StorageError> {
+    let source = fs::canonicalize(source)?;
+    let requested_parent = destination
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let parent = fs::canonicalize(requested_parent)?;
+    let name = destination.file_name().ok_or_else(|| {
+        StorageError::ReindexRequired("destination must name a directory".to_owned())
+    })?;
+    let destination = parent.join(name);
+    if destination.starts_with(&source) {
+        return Err(StorageError::ReindexRequired(
+            "Gate 3 migration destination must be outside the retained source directory".to_owned(),
+        ));
+    }
+    ensure_destination_absent(&destination)?;
+    Ok(ResolvedMigrationTarget {
+        source,
+        parent,
+        destination,
     })
 }
 
-fn is_exact_replay(
-    terminal: Option<TerminalIntent>,
-    policy: Option<PolicyEvent>,
-    stored_terminal: Option<TerminalIntent>,
-    stored_policy: Option<PolicyEvent>,
+struct ResolvedMigrationTarget {
+    source: PathBuf,
+    parent: PathBuf,
+    destination: PathBuf,
+}
+
+fn ensure_destination_absent(destination: &Path) -> Result<(), StorageError> {
+    match fs::symlink_metadata(destination) {
+        Ok(_) => Err(StorageError::StoreAlreadyExists),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn rename_directory_noreplace(source: &Path, destination: &Path) -> Result<(), StorageError> {
+    let source = CString::new(source.as_os_str().as_bytes())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let destination = CString::new(destination.as_os_str().as_bytes())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            destination.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::EEXIST) => Err(StorageError::StoreAlreadyExists),
+        Some(libc::ENOSYS) | Some(libc::EINVAL) => Err(StorageError::UnsupportedPlatform),
+        _ => Err(error.into()),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn rename_directory_noreplace(_source: &Path, _destination: &Path) -> Result<(), StorageError> {
+    Err(StorageError::UnsupportedPlatform)
+}
+
+fn empty_manifest(store_id: StoreId) -> Manifest {
+    Manifest {
+        generation_id: 1,
+        parent_id: 0,
+        next_segment_id: 1,
+        format_major: 1,
+        format_minor: 0,
+        store_id,
+        analyzer_id: ANALYZER_ID.to_owned(),
+        html_schema_id: HTML_SCHEMA_ID.to_owned(),
+        segments: Vec::new(),
+        live: BTreeMap::new(),
+        controls: BTreeMap::new(),
+        statistics: CorpusStatistics::default(),
+    }
+}
+
+fn next_manifest(current: &Manifest) -> Result<Manifest, StorageError> {
+    let generation_id =
+        current
+            .generation_id
+            .checked_add(1)
+            .ok_or(StorageError::CapacityExceeded(
+                "manifest generation id exhausted",
+            ))?;
+    let mut next = current.clone();
+    next.parent_id = current.generation_id;
+    next.generation_id = generation_id;
+    Ok(next)
+}
+
+fn is_exact_manifest_replay(
+    terminal: Option<TerminalRecord>,
+    policy: Option<PolicyRecord>,
+    stored_terminal: Option<TerminalRecord>,
+    stored_policy: Option<PolicyRecord>,
 ) -> bool {
     match (terminal, policy) {
         (Some(terminal), None) => stored_terminal == Some(terminal),
-        (Some(TerminalIntent::Tombstone), Some(PolicyEvent::Revoked)) => {
-            stored_terminal == Some(TerminalIntent::Tombstone)
-                && stored_policy == Some(PolicyEvent::Revoked)
+        (Some(TerminalRecord::Tombstone), Some(PolicyRecord::Revoked)) => {
+            stored_terminal == Some(TerminalRecord::Tombstone)
+                && stored_policy == Some(PolicyRecord::Revoked)
         }
         (None, Some(policy)) => stored_terminal.is_none() && stored_policy == Some(policy),
         _ => false,
     }
+}
+
+fn manifest_is_revoked(control: &ControlRecord) -> bool {
+    control
+        .policy
+        .last_key_value()
+        .is_some_and(|(_, event)| *event == PolicyRecord::Revoked)
+}
+
+fn checked_increment(value: &mut u64, label: &'static str) -> Result<(), StorageError> {
+    *value = value
+        .checked_add(1)
+        .ok_or(StorageError::CapacityExceeded(label))?;
+    Ok(())
+}
+
+fn add_document_statistics(
+    statistics: &mut CorpusStatistics,
+    document: &crate::index::IndexedDocument,
+) -> Result<(), StorageError> {
+    checked_increment(&mut statistics.document_count, "live document count")?;
+    let term_count = document
+        .title_terms
+        .iter()
+        .chain(&document.body_terms)
+        .collect::<BTreeSet<_>>()
+        .len() as u64;
+    statistics.live_posting_record_count = statistics
+        .live_posting_record_count
+        .checked_add(term_count)
+        .ok_or(StorageError::CapacityExceeded("live posting record count"))?;
+    if statistics.live_posting_record_count > MAX_POSTING_RECORDS as u64 {
+        return Err(StorageError::CapacityExceeded("live posting record limit"));
+    }
+    statistics.title_token_total = statistics
+        .title_token_total
+        .checked_add(document.title_terms.len() as u64)
+        .ok_or(StorageError::CapacityExceeded("title token total"))?;
+    statistics.body_token_total = statistics
+        .body_token_total
+        .checked_add(document.body_terms.len() as u64)
+        .ok_or(StorageError::CapacityExceeded("body token total"))?;
+    update_field_frequencies(statistics, &document.title_terms, true, true)?;
+    update_field_frequencies(statistics, &document.body_terms, false, true)?;
+    Ok(())
+}
+
+fn remove_document_statistics(
+    statistics: &mut CorpusStatistics,
+    document: &crate::index::IndexedDocument,
+) -> Result<(), StorageError> {
+    statistics.document_count = statistics
+        .document_count
+        .checked_sub(1)
+        .ok_or_else(|| corrupt("live document statistic underflow"))?;
+    let term_count = document
+        .title_terms
+        .iter()
+        .chain(&document.body_terms)
+        .collect::<BTreeSet<_>>()
+        .len() as u64;
+    statistics.live_posting_record_count = statistics
+        .live_posting_record_count
+        .checked_sub(term_count)
+        .ok_or_else(|| corrupt("live posting record statistic underflow"))?;
+    statistics.title_token_total = statistics
+        .title_token_total
+        .checked_sub(document.title_terms.len() as u64)
+        .ok_or_else(|| corrupt("title token statistic underflow"))?;
+    statistics.body_token_total = statistics
+        .body_token_total
+        .checked_sub(document.body_terms.len() as u64)
+        .ok_or_else(|| corrupt("body token statistic underflow"))?;
+    update_field_frequencies(statistics, &document.title_terms, true, false)?;
+    update_field_frequencies(statistics, &document.body_terms, false, false)?;
+    Ok(())
+}
+
+fn update_field_frequencies(
+    statistics: &mut CorpusStatistics,
+    terms: &[String],
+    title: bool,
+    add: bool,
+) -> Result<(), StorageError> {
+    let distinct = terms.iter().collect::<BTreeSet<_>>();
+    for term in distinct {
+        if add {
+            let frequency = statistics
+                .field_document_frequencies
+                .entry(term.clone())
+                .or_default();
+            let value = if title {
+                &mut frequency.title
+            } else {
+                &mut frequency.body
+            };
+            checked_increment(value, "field document frequency")?;
+        } else {
+            let frequency = statistics
+                .field_document_frequencies
+                .get_mut(term.as_str())
+                .ok_or_else(|| corrupt("field document frequency is missing"))?;
+            let value = if title {
+                &mut frequency.title
+            } else {
+                &mut frequency.body
+            };
+            *value = value
+                .checked_sub(1)
+                .ok_or_else(|| corrupt("field document frequency underflow"))?;
+            if frequency.title == 0 && frequency.body == 0 {
+                statistics.field_document_frequencies.remove(term.as_str());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn statistics_for_documents<'a>(
+    documents: impl IntoIterator<Item = &'a crate::index::IndexedDocument>,
+) -> Result<CorpusStatistics, StorageError> {
+    let mut statistics = CorpusStatistics::default();
+    for document in documents {
+        add_document_statistics(&mut statistics, document)?;
+    }
+    Ok(statistics)
+}
+
+fn controls_to_records(
+    controls: &BTreeMap<UrlKey, DocumentControl>,
+) -> BTreeMap<String, ControlRecord> {
+    controls
+        .iter()
+        .map(|(key, control)| {
+            let terminal = control
+                .terminal
+                .iter()
+                .map(|(fence, intent)| {
+                    let intent = match intent {
+                        TerminalIntent::Upsert(version) => TerminalRecord::Upsert(*version),
+                        TerminalIntent::Tombstone => TerminalRecord::Tombstone,
+                    };
+                    (*fence, intent)
+                })
+                .collect();
+            let policy = control
+                .policy
+                .iter()
+                .map(|(fence, event)| {
+                    let event = match event {
+                        PolicyEvent::Revoked => PolicyRecord::Revoked,
+                        PolicyEvent::Readmitted => PolicyRecord::Readmitted,
+                    };
+                    (*fence, event)
+                })
+                .collect();
+            (
+                key.as_str().to_owned(),
+                ControlRecord {
+                    high_water: control.high_water,
+                    terminal,
+                    policy,
+                },
+            )
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy)]
+enum ManifestValidationKind {
+    Committed,
+    Proposed,
+}
+
+#[derive(Clone, Copy)]
+enum ManifestLimit {
+    ActiveSegmentCount,
+    LiveDocumentCount,
+    LifecycleControlKeys,
+    LivePostingCount,
+    LiveTermCount,
+    SingleSegmentDocuments,
+    SingleSegmentBytes,
+    SingleSegmentTerms,
+    SingleSegmentPostings,
+    SingleSegmentPositions,
+    ActiveSegmentBytes,
+    ActivePostingCount,
+    ActivePositionCount,
+    PerDocumentLifecycleHistory,
+    LifecycleHistory,
+}
+
+impl ManifestLimit {
+    fn error(self, kind: ManifestValidationKind) -> StorageError {
+        let message = match (kind, self) {
+            (ManifestValidationKind::Committed, _) => "manifest counts exceed configured bounds",
+            (ManifestValidationKind::Proposed, Self::ActiveSegmentCount) => {
+                "active segment count exceeds 4096; run `ley compact --store <store-path>` to merge active segments and reduce descriptor count"
+            }
+            (ManifestValidationKind::Proposed, Self::LiveDocumentCount) => {
+                "live document count exceeds 100000; remove live documents to continue"
+            }
+            (ManifestValidationKind::Proposed, Self::LifecycleControlKeys) => {
+                "retained lifecycle control key count exceeds 100000; compaction cannot reduce retained lifecycle history"
+            }
+            (ManifestValidationKind::Proposed, Self::LivePostingCount) => {
+                "live posting record count exceeds 1000000; reduce live indexed content to continue"
+            }
+            (ManifestValidationKind::Proposed, Self::LiveTermCount) => {
+                "live term count exceeds 500000; reduce live indexed content to continue"
+            }
+            (ManifestValidationKind::Proposed, Self::SingleSegmentDocuments) => {
+                "single segment document limit exceeded; split indexed content across writes"
+            }
+            (ManifestValidationKind::Proposed, Self::SingleSegmentBytes) => {
+                "single segment byte limit exceeded; reduce the indexed document content"
+            }
+            (ManifestValidationKind::Proposed, Self::SingleSegmentTerms) => {
+                "single segment term limit exceeded; reduce the indexed document content"
+            }
+            (ManifestValidationKind::Proposed, Self::SingleSegmentPostings) => {
+                "single segment posting limit exceeded; reduce the indexed document content"
+            }
+            (ManifestValidationKind::Proposed, Self::SingleSegmentPositions) => {
+                "single segment position limit exceeded; reduce the indexed document content"
+            }
+            (ManifestValidationKind::Proposed, Self::ActiveSegmentBytes) => {
+                "active segment bytes exceed 536870912; run `ley compact --store <store-path>` if stale entries or segment overhead account for the excess"
+            }
+            (ManifestValidationKind::Proposed, Self::ActivePostingCount) => {
+                "physical posting records exceed 4000000; run `ley compact --store <store-path>` if stale segments account for the excess"
+            }
+            (ManifestValidationKind::Proposed, Self::ActivePositionCount) => {
+                "physical positions exceed 50000000; run `ley compact --store <store-path>` if stale segments account for the excess"
+            }
+            (ManifestValidationKind::Proposed, Self::PerDocumentLifecycleHistory) => {
+                "per-document lifecycle history exceeds 500000 events; compaction cannot reduce retained lifecycle history"
+            }
+            (ManifestValidationKind::Proposed, Self::LifecycleHistory) => {
+                "lifecycle history exceeds 500000 events; compaction cannot reduce retained lifecycle history"
+            }
+        };
+        match kind {
+            ManifestValidationKind::Committed => corrupt(message),
+            ManifestValidationKind::Proposed => StorageError::CapacityExceeded(message),
+        }
+    }
+}
+
+fn validate_manifest_shape(manifest: &Manifest, store_id: StoreId) -> Result<(), StorageError> {
+    validate_manifest_shape_for(manifest, store_id, ManifestValidationKind::Committed)
+}
+
+fn validate_proposed_manifest_shape(
+    manifest: &Manifest,
+    store_id: StoreId,
+) -> Result<(), StorageError> {
+    validate_manifest_shape_for(manifest, store_id, ManifestValidationKind::Proposed)
+}
+
+fn validate_manifest_shape_for(
+    manifest: &Manifest,
+    store_id: StoreId,
+    kind: ManifestValidationKind,
+) -> Result<(), StorageError> {
+    let manifest_document_count = usize::try_from(manifest.statistics.document_count)
+        .map_err(|_| corrupt("live document count does not fit this platform"))?;
+    if manifest.generation_id == 0
+        || manifest.parent_id >= manifest.generation_id
+        || manifest.next_segment_id == 0
+        || manifest.format_major != 1
+        || manifest.format_minor != 0
+        || manifest.store_id != store_id
+        || manifest.analyzer_id != ANALYZER_ID
+        || manifest.html_schema_id != HTML_SCHEMA_ID
+    {
+        return Err(corrupt("manifest version, identity, or schema is invalid"));
+    }
+    if manifest.segments.len() > MAX_SEGMENTS {
+        return Err(ManifestLimit::ActiveSegmentCount.error(kind));
+    }
+    if manifest.live.len() > MAX_DOCUMENTS {
+        return Err(ManifestLimit::LiveDocumentCount.error(kind));
+    }
+    if manifest.controls.len() > MAX_CONTROL_KEYS {
+        return Err(ManifestLimit::LifecycleControlKeys.error(kind));
+    }
+    if manifest_document_count != manifest.live.len() {
+        return Err(corrupt("manifest counts exceed configured bounds"));
+    }
+    if manifest.statistics.live_posting_record_count > MAX_POSTING_RECORDS as u64 {
+        return Err(ManifestLimit::LivePostingCount.error(kind));
+    }
+    if manifest.statistics.field_document_frequencies.len() > MAX_TERMS {
+        return Err(ManifestLimit::LiveTermCount.error(kind));
+    }
+    let mut segment_ids = BTreeSet::new();
+    let mut segment_bytes = 0u64;
+    let mut posting_count = 0u64;
+    let mut position_count = 0u64;
+    let mut previous_segment = 0;
+    for descriptor in &manifest.segments {
+        if descriptor.id == 0
+            || descriptor.id <= previous_segment
+            || descriptor.id >= manifest.next_segment_id
+            || descriptor.byte_len < 164
+            || descriptor.document_count == 0
+            || !segment_ids.insert(descriptor.id)
+        {
+            return Err(corrupt("manifest segment descriptor is invalid"));
+        }
+        if descriptor.byte_len > MAX_SEGMENT_BYTES as u64 {
+            return Err(ManifestLimit::SingleSegmentBytes.error(kind));
+        }
+        if descriptor.document_count as usize > MAX_DOCUMENTS {
+            return Err(ManifestLimit::SingleSegmentDocuments.error(kind));
+        }
+        if descriptor.term_count as usize > MAX_TERMS {
+            return Err(ManifestLimit::SingleSegmentTerms.error(kind));
+        }
+        if descriptor.posting_count > MAX_PHYSICAL_POSTING_RECORDS as u64 {
+            return Err(ManifestLimit::SingleSegmentPostings.error(kind));
+        }
+        if descriptor.position_count > MAX_POSITION_VALUES {
+            return Err(ManifestLimit::SingleSegmentPositions.error(kind));
+        }
+        previous_segment = descriptor.id;
+        segment_bytes = segment_bytes
+            .checked_add(descriptor.byte_len)
+            .ok_or_else(|| corrupt("active segment byte total overflow"))?;
+        posting_count = posting_count
+            .checked_add(descriptor.posting_count)
+            .ok_or_else(|| corrupt("physical posting total overflow"))?;
+        position_count = position_count
+            .checked_add(descriptor.position_count)
+            .ok_or_else(|| corrupt("physical position total overflow"))?;
+    }
+    if segment_bytes > MAX_ACTIVE_SEGMENT_BYTES {
+        return Err(ManifestLimit::ActiveSegmentBytes.error(kind));
+    }
+    if posting_count > MAX_PHYSICAL_POSTING_RECORDS as u64 {
+        return Err(ManifestLimit::ActivePostingCount.error(kind));
+    }
+    if position_count > MAX_POSITION_VALUES {
+        return Err(ManifestLimit::ActivePositionCount.error(kind));
+    }
+    for (key, reference) in &manifest.live {
+        validate_url_key(key).map_err(|error| corrupt(&error.to_string()))?;
+        let descriptor = manifest
+            .segments
+            .iter()
+            .find(|segment| segment.id == reference.segment_id)
+            .ok_or_else(|| corrupt("live document references an absent segment"))?;
+        if reference.ordinal >= descriptor.document_count || reference.version == [0; 32] {
+            return Err(corrupt(
+                "live document reference is outside its segment or has an invalid version",
+            ));
+        }
+    }
+    let mut total_terminal = 0usize;
+    let mut total_policy = 0usize;
+    let mut old_controls = BTreeMap::new();
+    for (key_text, control) in &manifest.controls {
+        validate_url_key(key_text).map_err(|error| corrupt(&error.to_string()))?;
+        if control.high_water == 0 {
+            return Err(corrupt("manifest control has a zero fence high-water"));
+        }
+        total_terminal = total_terminal
+            .checked_add(control.terminal.len())
+            .ok_or_else(|| corrupt("terminal history count overflow"))?;
+        total_policy = total_policy
+            .checked_add(control.policy.len())
+            .ok_or_else(|| corrupt("policy history count overflow"))?;
+        if control.terminal.len() > MAX_TERMINAL_INTENTS
+            || control.policy.len() > MAX_TERMINAL_INTENTS
+        {
+            return Err(ManifestLimit::PerDocumentLifecycleHistory.error(kind));
+        }
+        if control
+            .terminal
+            .keys()
+            .any(|fence| *fence == 0 || *fence > control.high_water)
+            || control
+                .policy
+                .keys()
+                .any(|fence| *fence == 0 || *fence > control.high_water)
+        {
+            return Err(corrupt("manifest control history exceeds its bound"));
+        }
+        let key = UrlKey::parse(key_text).map_err(|error| corrupt(&error.to_string()))?;
+        let terminal = control
+            .terminal
+            .iter()
+            .map(|(fence, intent)| {
+                let intent = match intent {
+                    TerminalRecord::Upsert(version) => TerminalIntent::Upsert(*version),
+                    TerminalRecord::Tombstone => TerminalIntent::Tombstone,
+                };
+                (*fence, intent)
+            })
+            .collect();
+        let policy = control
+            .policy
+            .iter()
+            .map(|(fence, event)| {
+                let event = match event {
+                    PolicyRecord::Revoked => PolicyEvent::Revoked,
+                    PolicyRecord::Readmitted => PolicyEvent::Readmitted,
+                };
+                (*fence, event)
+            })
+            .collect();
+        old_controls.insert(
+            key,
+            DocumentControl {
+                high_water: control.high_water,
+                terminal,
+                policy,
+            },
+        );
+    }
+    if total_terminal > MAX_TERMINAL_INTENTS || total_policy > MAX_TERMINAL_INTENTS {
+        return Err(ManifestLimit::LifecycleHistory.error(kind));
+    }
+    validate_control_history(&old_controls)?;
+    let live_document_count = manifest.statistics.document_count;
+    if manifest.statistics.title_token_total
+        > live_document_count.saturating_mul(MAX_DOCUMENT_TOKENS as u64)
+        || manifest.statistics.body_token_total
+            > live_document_count.saturating_mul(MAX_DOCUMENT_TOKENS as u64)
+    {
+        return Err(corrupt("manifest token totals exceed document limits"));
+    }
+    for (term, frequencies) in &manifest.statistics.field_document_frequencies {
+        let normalized = Analyzer
+            .analyze(term)
+            .map_err(|_| corrupt("manifest term is invalid"))?;
+        if normalized.len() != 1
+            || normalized[0] != *term
+            || (frequencies.title == 0 && frequencies.body == 0)
+            || frequencies.title > live_document_count
+            || frequencies.body > live_document_count
+        {
+            return Err(corrupt("manifest field document frequency is invalid"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_live_control_records(
+    documents: &BTreeMap<String, crate::index::IndexedDocument>,
+    controls: &BTreeMap<String, ControlRecord>,
+) -> Result<(), StorageError> {
+    for (key, document) in documents {
+        let control = controls
+            .get(key)
+            .ok_or_else(|| corrupt("live document has no lifecycle control"))?;
+        if manifest_is_revoked(control)
+            || control
+                .terminal
+                .last_key_value()
+                .map(|(_, terminal)| *terminal)
+                != Some(TerminalRecord::Upsert(decode_version_id(
+                    &document.version_id,
+                )?))
+        {
+            return Err(corrupt(
+                "live document differs from its latest lifecycle control",
+            ));
+        }
+    }
+    for (key, control) in controls {
+        let has_live_upsert = !manifest_is_revoked(control)
+            && matches!(
+                control.terminal.last_key_value(),
+                Some((_, TerminalRecord::Upsert(_)))
+            );
+        if has_live_upsert && !documents.contains_key(key) {
+            return Err(corrupt(
+                "latest upsert is absent from the live document view",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn snapshot_memory_estimate(manifest: &Manifest, manifest_bytes: u64) -> Result<u64, StorageError> {
+    let segment_bytes = manifest
+        .segments
+        .iter()
+        .try_fold(0u64, |total, item| total.checked_add(item.byte_len))
+        .ok_or_else(|| corrupt("snapshot segment byte estimate overflow"))?;
+    let positions = manifest
+        .segments
+        .iter()
+        .try_fold(0u64, |total, item| total.checked_add(item.position_count))
+        .ok_or_else(|| corrupt("snapshot position estimate overflow"))?;
+    let postings = manifest
+        .segments
+        .iter()
+        .try_fold(0u64, |total, item| total.checked_add(item.posting_count))
+        .ok_or_else(|| corrupt("snapshot posting estimate overflow"))?;
+    let terms = manifest
+        .segments
+        .iter()
+        .try_fold(0u64, |total, item| {
+            total.checked_add(u64::from(item.term_count))
+        })
+        .ok_or_else(|| corrupt("snapshot term estimate overflow"))?;
+    let controls = manifest.controls.len() as u64;
+    let histories = manifest
+        .controls
+        .values()
+        .try_fold(0u64, |total, item| {
+            total.checked_add((item.terminal.len() + item.policy.len()) as u64)
+        })
+        .ok_or_else(|| corrupt("snapshot history estimate overflow"))?;
+    let estimate = manifest_bytes
+        .checked_mul(4)
+        .and_then(|value| value.checked_add(segment_bytes.checked_mul(4)?))
+        .and_then(|value| value.checked_add(positions.checked_mul(64)?))
+        .and_then(|value| value.checked_add(postings.checked_mul(256)?))
+        .and_then(|value| value.checked_add(terms.checked_mul(256)?))
+        .and_then(|value| value.checked_add((manifest.live.len() as u64).checked_mul(2048)?))
+        .and_then(|value| value.checked_add(controls.checked_mul(128)?))
+        .and_then(|value| value.checked_add(histories.checked_mul(64)?))
+        .ok_or_else(|| corrupt("snapshot memory estimate overflow"))?;
+    Ok(estimate)
+}
+
+fn segment_summary(descriptor: &SegmentDescriptor) -> SegmentDescriptorSummary {
+    SegmentDescriptorSummary {
+        id: descriptor.id,
+        byte_len: descriptor.byte_len,
+        sha256: descriptor
+            .sha256
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    }
+}
+
+fn manifest_name(id: u64) -> String {
+    format!("manifest-{id}.ley")
+}
+
+fn manifest_temp_name(id: u64) -> String {
+    format!(".manifest-{id}.tmp")
+}
+
+fn segment_name(id: u64) -> String {
+    format!("seg-{id}.ley")
+}
+
+fn segment_temp_name(id: u64) -> String {
+    format!(".seg-{id}.tmp")
+}
+
+fn parse_owned_id(name: &str, prefix: &str, suffix: &str) -> Option<u64> {
+    let digits = name.strip_prefix(prefix)?.strip_suffix(suffix)?;
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let id = digits.parse::<u64>().ok()?;
+    (id.to_string() == digits).then_some(id)
+}
+
+fn cleanup_gate6_orphans(path: &Path, current: Option<&Manifest>) -> Result<(), StorageError> {
+    let keep_segments = current
+        .map(|value| {
+            value
+                .segments
+                .iter()
+                .map(|item| item.id)
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    let keep_manifests = current
+        .map(|value| BTreeSet::from([value.generation_id]))
+        .unwrap_or_default();
+    let mut removed = false;
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if metadata.file_type().is_dir() {
+            continue;
+        }
+        let stale_segment =
+            parse_owned_id(&name, "seg-", ".ley").is_some_and(|id| !keep_segments.contains(&id));
+        let stale_manifest = parse_owned_id(&name, "manifest-", ".ley")
+            .is_some_and(|id| !keep_manifests.contains(&id));
+        let temporary = parse_owned_id(&name, ".seg-", ".tmp").is_some()
+            || parse_owned_id(&name, ".manifest-", ".tmp").is_some()
+            || name == ".CURRENT.v6.tmp";
+        if (stale_segment || stale_manifest || temporary)
+            && (metadata.file_type().is_file() || metadata.file_type().is_symlink())
+        {
+            fs::remove_file(entry.path())?;
+            removed = true;
+            storage_failpoint("cleanup_after_unlink");
+        }
+    }
+    if removed {
+        sync_directory(path)?;
+        storage_failpoint("cleanup_directory_sync");
+    }
+    Ok(())
 }
 
 fn is_revoked(control: &DocumentControl) -> bool {
@@ -821,14 +2124,18 @@ fn is_revoked(control: &DocumentControl) -> bool {
         .is_some_and(|(_, event)| *event == PolicyEvent::Revoked)
 }
 
-fn encode_store(store_id: StoreId) -> Vec<u8> {
-    encode_store_version(store_id, FORMAT_MINOR, 0)
+fn encode_store_v6(store_id: StoreId, public_collection: bool) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(STORE_BYTES);
+    bytes.extend_from_slice(STORE_MAGIC_V6);
+    put_u16(&mut bytes, STORE_V6_MAJOR);
+    put_u16(&mut bytes, STORE_V6_MINOR);
+    put_u32(&mut bytes, u32::from(public_collection) * PUBLIC_STORE_FLAG);
+    bytes.extend_from_slice(&store_id);
+    bytes.extend_from_slice(&sha256(&bytes));
+    bytes
 }
 
-fn encode_public_store(store_id: StoreId) -> Vec<u8> {
-    encode_store_version(store_id, PUBLIC_STORE_MINOR, PUBLIC_STORE_FLAG)
-}
-
+#[cfg(test)]
 fn encode_store_version(store_id: StoreId, minor: u16, flags: u32) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(STORE_BYTES);
     bytes.extend_from_slice(STORE_MAGIC);
@@ -951,17 +2258,28 @@ fn decode_store(bytes: &[u8]) -> Result<(StoreId, bool), StorageError> {
     if bytes.len() != STORE_BYTES {
         return Err(corrupt("STORE has an invalid length"));
     }
-    if &bytes[..8] != STORE_MAGIC {
-        return Err(corrupt("STORE magic mismatch"));
-    }
     let major = get_u16(bytes, 8)?;
     let minor = get_u16(bytes, 10)?;
     let flags = get_u32(bytes, 12)?;
+    let expected_magic = match &bytes[..8] {
+        magic if magic == STORE_MAGIC => STORE_MAGIC,
+        magic if magic == STORE_MAGIC_V6 => STORE_MAGIC_V6,
+        _ => return Err(corrupt("STORE magic mismatch")),
+    };
+    let is_v6 = expected_magic == STORE_MAGIC_V6;
+    if is_v6 && (major != STORE_V6_MAJOR || minor != STORE_V6_MINOR) {
+        return Err(StorageError::UnsupportedFormat { major, minor });
+    }
     let requires_public_gate = match (major, minor, flags) {
         (FORMAT_MAJOR, FORMAT_MINOR, 0) => false,
         (FORMAT_MAJOR, PUBLIC_STORE_MINOR, PUBLIC_STORE_FLAG) => true,
+        (STORE_V6_MAJOR, STORE_V6_MINOR, 0) if is_v6 => false,
+        (STORE_V6_MAJOR, STORE_V6_MINOR, PUBLIC_STORE_FLAG) if is_v6 => true,
         (FORMAT_MAJOR, version, _) if version == FORMAT_MINOR || version == PUBLIC_STORE_MINOR => {
             return Err(corrupt("STORE flags do not match its version"));
+        }
+        (STORE_V6_MAJOR, STORE_V6_MINOR, _) if is_v6 => {
+            return Err(corrupt("STORE flags do not match its Gate 6 version"));
         }
         _ => return Err(StorageError::UnsupportedFormat { major, minor }),
     };
@@ -973,6 +2291,7 @@ fn decode_store(bytes: &[u8]) -> Result<(StoreId, bool), StorageError> {
     Ok((id, requires_public_gate))
 }
 
+#[cfg(test)]
 fn encode_lease_key(store_id: StoreId, lease_mac_key: LeaseMacKey) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(LEASE_KEY_BYTES);
     bytes.extend_from_slice(LEASE_KEY_MAGIC);
@@ -985,13 +2304,29 @@ fn encode_lease_key(store_id: StoreId, lease_mac_key: LeaseMacKey) -> Vec<u8> {
     bytes
 }
 
+fn encode_lease_key_v6(store_id: StoreId, lease_mac_key: LeaseMacKey) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(LEASE_KEY_BYTES);
+    bytes.extend_from_slice(LEASE_KEY_MAGIC_V6);
+    put_u16(&mut bytes, STORE_V6_MAJOR);
+    put_u16(&mut bytes, STORE_V6_MINOR);
+    put_u32(&mut bytes, 0);
+    bytes.extend_from_slice(&store_id);
+    bytes.extend_from_slice(&lease_mac_key);
+    bytes.extend_from_slice(&sha256(&bytes));
+    bytes
+}
+
 fn decode_lease_key(bytes: &[u8], expected_store_id: StoreId) -> Result<LeaseMacKey, StorageError> {
-    if bytes.len() != LEASE_KEY_BYTES || &bytes[..8] != LEASE_KEY_MAGIC {
+    if bytes.len() != LEASE_KEY_BYTES {
         return Err(corrupt("LEASE_KEY has an invalid length or magic"));
     }
     let major = get_u16(bytes, 8)?;
     let minor = get_u16(bytes, 10)?;
-    if major != FORMAT_MAJOR || minor != FORMAT_MINOR {
+    let is_v6 = &bytes[..8] == LEASE_KEY_MAGIC_V6;
+    if (!is_v6 && &bytes[..8] != LEASE_KEY_MAGIC)
+        || (is_v6 && (major != STORE_V6_MAJOR || minor != STORE_V6_MINOR))
+        || (!is_v6 && (major != FORMAT_MAJOR || minor != FORMAT_MINOR))
+    {
         return Err(StorageError::UnsupportedFormat { major, minor });
     }
     if get_u32(bytes, 12)? != 0 {
@@ -1078,6 +2413,7 @@ fn decode_lease_token(
     Ok((store_id, key, fence))
 }
 
+#[cfg(test)]
 fn encode_current(store_id: StoreId, generation_id: u64, length: u64, hash: [u8; 32]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(CURRENT_BYTES);
     bytes.extend_from_slice(CURRENT_MAGIC);
@@ -1126,6 +2462,7 @@ fn decode_current(
     Ok((generation_id, length, hash))
 }
 
+#[cfg(test)]
 fn encode_generation(generation: &Generation, store_id: StoreId) -> Result<Vec<u8>, StorageError> {
     if generation.id == 0
         || (generation.id == 1 && generation.parent_id != 0)
@@ -1247,6 +2584,7 @@ fn encode_generation(generation: &Generation, store_id: StoreId) -> Result<Vec<u
     Ok(bytes)
 }
 
+#[cfg(test)]
 fn encode_documents(
     index: &InMemoryIndex,
     maximum: usize,
@@ -1292,6 +2630,7 @@ fn encode_documents(
     Ok((encoder.finish(), title_tokens, body_tokens))
 }
 
+#[cfg(test)]
 fn encode_terms(index: &InMemoryIndex, maximum: usize) -> Result<(Vec<u8>, Vec<u8>), StorageError> {
     let mut ordinals = BTreeMap::new();
     for (ordinal, id) in index.documents().keys().enumerate() {
@@ -1371,6 +2710,7 @@ fn encode_terms(index: &InMemoryIndex, maximum: usize) -> Result<(Vec<u8>, Vec<u
     Ok((dictionary_encoder.finish(), posting_bytes))
 }
 
+#[cfg(test)]
 fn encode_controls(
     controls: &BTreeMap<UrlKey, DocumentControl>,
     maximum: usize,
@@ -1414,11 +2754,13 @@ fn encode_controls(
     Ok(encoder.finish())
 }
 
+#[cfg(test)]
 struct Encoder {
     bytes: Vec<u8>,
     maximum: usize,
 }
 
+#[cfg(test)]
 impl Encoder {
     fn new(maximum: usize) -> Self {
         Self {
@@ -2201,10 +3543,12 @@ fn generation_name(generation_id: u64) -> String {
     format!("gen-{generation_id}.ley")
 }
 
+#[cfg(test)]
 fn generation_temp_name(generation_id: u64) -> String {
     format!(".gen-{generation_id}.tmp")
 }
 
+#[cfg(test)]
 fn parse_generation_name(name: &str, prefix: &str, suffix: &str) -> Option<u64> {
     let digits = name.strip_prefix(prefix)?.strip_suffix(suffix)?;
     if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
@@ -2214,6 +3558,7 @@ fn parse_generation_name(name: &str, prefix: &str, suffix: &str) -> Option<u64> 
     (id.to_string() == digits).then_some(id)
 }
 
+#[cfg(test)]
 fn cleanup_owned_files(path: &Path, current: Option<&Generation>) -> Result<(), StorageError> {
     let mut removed = false;
     let keep = current.map(|generation| (generation.id, generation.parent_id));
@@ -2286,10 +3631,12 @@ fn system_time_ms() -> Result<u64, StorageError> {
         .min(u64::MAX as u128) as u64)
 }
 
+#[cfg(test)]
 fn to_u16(value: usize, label: &'static str) -> Result<u16, StorageError> {
     u16::try_from(value).map_err(|_| StorageError::CapacityExceeded(label))
 }
 
+#[cfg(test)]
 fn to_u32(value: usize, label: &'static str) -> Result<u32, StorageError> {
     u32::try_from(value).map_err(|_| StorageError::CapacityExceeded(label))
 }
@@ -2495,7 +3842,9 @@ mod tests {
     use std::process::Command;
     use std::sync::Barrier;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
 
+    use crate::index::StatisticsSource;
     use crate::query::parse_query;
 
     use super::*;
@@ -2704,6 +4053,18 @@ mod tests {
                 reference.len(),
                 "reference count for {expression:?}"
             );
+            let mut reference_results = reference
+                .iter()
+                .map(|hit| hit.result.clone())
+                .collect::<Vec<_>>();
+            for result in &mut reference_results {
+                result.explanation.statistics_source =
+                    StatisticsSource::PersistentGeneration(view.generation_id());
+            }
+            assert_eq!(
+                actual, reference_results,
+                "full independent result for {expression:?}"
+            );
             for (actual, reference) in actual.iter().zip(&reference) {
                 assert_eq!(
                     actual.id, reference.id,
@@ -2716,7 +4077,7 @@ mod tests {
     }
 
     fn assert_lifecycle_statistics(view: &ReadView) {
-        assert_eq!(view.generation.index.len(), 5);
+        assert_eq!(view.document_count(), 5);
         let twin = view.query("twin").unwrap();
         assert_eq!(twin.len(), 4);
         assert!(twin.iter().all(|result| result.score == twin[0].score));
@@ -2808,7 +4169,7 @@ mod tests {
             "old OR new",
         ];
         assert_reference_view(&view, &expected, &queries);
-        assert_eq!(view.generation.index.len(), expected.len());
+        assert_eq!(view.document_count(), expected.len());
         let twin = view.query("twin").unwrap();
         let expected_twin_df = if action == "tombstone" && committed_new {
             1
@@ -2856,12 +4217,174 @@ mod tests {
         lease
     }
 
-    fn committed_generation_path(root: &Path) -> PathBuf {
-        let store = PersistentIndex::open(root).unwrap();
-        let _lock = store.lock_shared().unwrap();
+    #[test]
+    fn cold_open_decodes_compacted_postings_without_rebuilding_or_reencoding() {
+        let temp = TempStore::new();
+        let store = PersistentIndex::create(temp.path()).unwrap();
+        let mut expected = InMemoryIndex::new();
+        for (path, title, body) in [
+            ("alpha", "Rust indexing", "positions survive compaction"),
+            ("beta", "Incremental index", "rust postings are persisted"),
+            ("gamma", "Exact phrase", "positions survive cold open"),
+        ] {
+            let id = key(path);
+            upsert(&store, &id, id.as_str(), title, body);
+            expected
+                .insert_fields(
+                    id.as_str().to_owned(),
+                    id.as_str().to_owned(),
+                    title.to_owned(),
+                    body.to_owned(),
+                )
+                .unwrap();
+        }
+        store.compact().unwrap();
+        assert_eq!(current_manifest(temp.path()).segments.len(), 1);
+
+        crate::index::reset_full_posting_build_count();
+        segment::reset_segment_encoding_count();
+        let reopened = PersistentIndex::open(temp.path()).unwrap();
+        let view = reopened.read_view().unwrap();
+        assert_eq!(crate::index::full_posting_build_count(), 0);
+        assert_eq!(segment::segment_encoding_count(), 0);
+        assert_reference_view(
+            &view,
+            &expected,
+            &[
+                "rust",
+                "index",
+                "\"positions survive\"",
+                "rust AND postings",
+            ],
+        );
+        assert_eq!(crate::index::full_posting_build_count(), 0);
+        assert_eq!(segment::segment_encoding_count(), 0);
+    }
+
+    fn current_manifest(root: &Path) -> Manifest {
+        let store_bytes = read_bounded_file(&root.join(STORE_NAME), STORE_BYTES).unwrap();
+        let (store_id, _) = decode_store(&store_bytes).unwrap();
         let bytes = read_bounded_file(&root.join(CURRENT_NAME), CURRENT_BYTES).unwrap();
-        let (id, _, _) = decode_current(&bytes, store.store_id).unwrap();
-        root.join(generation_name(id))
+        let pointer = CurrentPointer::decode(&bytes, store_id).unwrap();
+        let manifest_bytes = read_bounded_file(
+            &root.join(manifest_name(pointer.generation_id)),
+            MAX_MANIFEST_BYTES,
+        )
+        .unwrap();
+        Manifest::decode(&manifest_bytes, store_id, pointer.generation_id).unwrap()
+    }
+
+    fn install_test_manifest(root: &Path, manifest: &Manifest) {
+        let bytes = manifest.encode().unwrap();
+        fs::write(root.join(manifest_name(manifest.generation_id)), &bytes).unwrap();
+        let pointer = CurrentPointer {
+            store_id: manifest.store_id,
+            generation_id: manifest.generation_id,
+            manifest_len: bytes.len() as u64,
+            manifest_sha256: sha256(&bytes),
+        };
+        fs::write(root.join(CURRENT_NAME), pointer.encode()).unwrap();
+    }
+
+    fn file_inventory(root: &Path) -> BTreeMap<String, (u64, String)> {
+        fs::read_dir(root)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                let name = entry.file_name().into_string().unwrap();
+                let bytes = fs::read(entry.path()).unwrap();
+                (name, (bytes.len() as u64, hex_digest(&sha256(&bytes))))
+            })
+            .collect()
+    }
+
+    fn test_gate(root: &Path, suffix: &str) -> PathBuf {
+        root.join(format!(".test-{suffix}"))
+    }
+
+    fn await_test_gate(root: &Path, role: &str) {
+        let ready = test_gate(root, &format!("{role}-ready"));
+        let release = test_gate(root, "release");
+        fs::write(ready, b"ready").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !release.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "test worker did not get released"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn hex_digest(bytes: &[u8; 32]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    fn write_gate3_fixture(root: &Path) -> (Vec<u8>, Vec<u8>) {
+        create_store_directory(root).unwrap();
+        create_private_file(&root.join(LOCK_NAME), &[]).unwrap();
+        let store_id = [0x43; 16];
+        let lease_mac_key = [0x61; 32];
+        let key = UrlKey::parse("https://doc.rust-lang.org/stable/std/string/struct.String.html")
+            .unwrap();
+        let title = "Gate 3 fixture".to_owned();
+        let body = "incremental migration preserves this current document".to_owned();
+        let mut index = InMemoryIndex::new();
+        index
+            .upsert_fields(
+                key.as_str().to_owned(),
+                key.as_str().to_owned(),
+                title.clone(),
+                body.clone(),
+            )
+            .unwrap();
+        let version =
+            decode_version_id(&index.documents().get(key.as_str()).unwrap().version_id).unwrap();
+        let control = DocumentControl {
+            high_water: 2,
+            terminal: BTreeMap::from([(1, TerminalIntent::Upsert(version))]),
+            policy: BTreeMap::new(),
+        };
+        let generation = Generation {
+            id: 7,
+            parent_id: 6,
+            index,
+            controls: BTreeMap::from([(key.clone(), control)]),
+        };
+        let notice = b"Owned Gate 3 migration fixture notice";
+        let now = system_time_ms().unwrap();
+        let gate = public_gate(notice, now, now + 86_400_000);
+        create_private_file(
+            &root.join(STORE_NAME),
+            &encode_store_version(store_id, PUBLIC_STORE_MINOR, PUBLIC_STORE_FLAG),
+        )
+        .unwrap();
+        create_private_file(
+            &root.join(LEASE_KEY_NAME),
+            &encode_lease_key(store_id, lease_mac_key),
+        )
+        .unwrap();
+        create_private_file(
+            &root.join(PUBLIC_COLLECTION_NAME),
+            &encode_public_collection_record(store_id, &gate, &lease_mac_key).unwrap(),
+        )
+        .unwrap();
+        create_private_file(&root.join(PUBLIC_NOTICE_NAME), notice).unwrap();
+        let store = PersistentIndex {
+            path: fs::canonicalize(root).unwrap(),
+            store_id,
+            writer: Mutex::new(()),
+        };
+        {
+            let _lock = store.lock_exclusive().unwrap();
+            store.publish_locked(&generation, None).unwrap();
+        }
+        let exact = encode_lease_token(store_id, &lease_mac_key, &key, NonZeroU64::new(1).unwrap())
+            .unwrap();
+        let pending =
+            encode_lease_token(store_id, &lease_mac_key, &key, NonZeroU64::new(2).unwrap())
+                .unwrap();
+        (exact, pending)
     }
 
     fn read_lease_mac_key(store: &PersistentIndex) -> Result<LeaseMacKey, StorageError> {
@@ -2880,36 +4403,6 @@ mod tests {
             policy: policy.iter().copied().collect(),
         };
         validate_control_history(&BTreeMap::from([(key("timeline"), control)]))
-    }
-
-    fn rewrite_current_for_generation(root: &Path, generation: &[u8]) {
-        let current_path = root.join(CURRENT_NAME);
-        let mut current = read_bounded_file(&current_path, CURRENT_BYTES).unwrap();
-        current[40..48].copy_from_slice(&(generation.len() as u64).to_be_bytes());
-        current[48..80].copy_from_slice(&sha256(generation));
-        let checksum = sha256(&current[..80]);
-        current[80..112].copy_from_slice(&checksum);
-        fs::write(current_path, current).unwrap();
-    }
-
-    fn refresh_generation_checksums(root: &Path, generation: &mut [u8]) {
-        for section in 0..SECTION_COUNT {
-            let descriptor = 188 + section * DESCRIPTOR_BYTES;
-            let offset = get_u64(generation, descriptor).unwrap() as usize;
-            let length = get_u64(generation, descriptor + 8).unwrap() as usize;
-            let end = offset.checked_add(length).unwrap();
-            let checksum = sha256(&generation[offset..end]);
-            generation[descriptor + 24..descriptor + 56].copy_from_slice(&checksum);
-        }
-        let header_checksum = sha256(&generation[..416]);
-        generation[416..448].copy_from_slice(&header_checksum);
-        rewrite_current_for_generation(root, generation);
-    }
-
-    fn refresh_header_and_pointer(root: &Path, generation: &mut [u8]) {
-        let header_checksum = sha256(&generation[..416]);
-        generation[416..448].copy_from_slice(&header_checksum);
-        rewrite_current_for_generation(root, generation);
     }
 
     fn resign_test_lease(token: &mut [u8], mac_key: &LeaseMacKey, domain: &[u8]) {
@@ -3087,7 +4580,293 @@ mod tests {
                 };
                 let _ = store.apply(&lease, intent);
             }
+            "compact" => {
+                PersistentIndex::open(&root).unwrap().compact().unwrap();
+            }
+            "compact_process" => {
+                if std::env::var("LEY_STORAGE_WAIT_FOR_GATE").as_deref() == Ok("1") {
+                    let role = std::env::var("LEY_STORAGE_PROCESS_ROLE").unwrap();
+                    await_test_gate(&root, &role);
+                }
+                if let Ok(role) = std::env::var("LEY_STORAGE_PROCESS_ROLE") {
+                    fs::write(
+                        test_gate(&root, &format!("{role}-attempting")),
+                        b"attempting",
+                    )
+                    .unwrap();
+                }
+                PersistentIndex::open(&root).unwrap().compact().unwrap();
+            }
+            "upsert_process" => {
+                await_test_gate(&root, "upsert");
+                let store = PersistentIndex::open(&root).unwrap();
+                let beta = key("beta");
+                let lease = store.issue_fence(&beta).unwrap();
+                store
+                    .apply(
+                        &lease,
+                        Intent::Upsert {
+                            effective_url: "https://example.test/beta".to_owned(),
+                            title: "Beta revised".to_owned(),
+                            body: "beta revised".to_owned(),
+                        },
+                    )
+                    .unwrap();
+            }
+            "issue_fence_process" => {
+                let role = std::env::var("LEY_STORAGE_PROCESS_ROLE").unwrap();
+                await_test_gate(&root, &role);
+                let lease = PersistentIndex::open(&root)
+                    .unwrap()
+                    .issue_fence(&key("shared"))
+                    .unwrap();
+                fs::write(
+                    test_gate(&root, &format!("{role}-fence")),
+                    lease.fence().get().to_be_bytes(),
+                )
+                .unwrap();
+            }
+            "hold_reader_lock" => {
+                let store = PersistentIndex::open(&root).unwrap();
+                let _lock = store.lock_shared().unwrap();
+                await_test_gate(&root, "reader");
+            }
+            "verify_crash_snapshot" => {
+                let action = std::env::var("LEY_STORAGE_EXPECT_ACTION").unwrap();
+                let committed_new = std::env::var("LEY_STORAGE_EXPECT_NEW").unwrap() == "1";
+                let expected_generation = std::env::var("LEY_STORAGE_EXPECT_GENERATION")
+                    .unwrap()
+                    .parse::<u64>()
+                    .unwrap();
+                let store = PersistentIndex::open(&root).unwrap();
+                let view = store.read_view().unwrap();
+                assert_eq!(view.generation_id(), expected_generation);
+                assert_crash_view(&store, &action, committed_new);
+            }
+            "verify_differential" => {
+                let store = PersistentIndex::open(&root).unwrap();
+                let view = store.read_view().unwrap();
+                let mut expected = InMemoryIndex::new();
+                expected
+                    .insert_fields(
+                        key("alpha").to_string(),
+                        "https://example.test/alpha".to_owned(),
+                        "New Again".to_owned(),
+                        "blue fresh marker".to_owned(),
+                    )
+                    .unwrap();
+                assert_reference_view(
+                    &view,
+                    &expected,
+                    &["blue", "fresh", "\"fresh marker\"", "old OR missing"],
+                );
+            }
             _ => panic!("unknown child storage action"),
+        }
+    }
+
+    #[test]
+    fn gate3_migration_preserves_source_and_public_bytes_and_restores_replayable_fences() {
+        let source = TempStore::new();
+        let destination = TempStore::new();
+        let (exact_token, pending_token) = write_gate3_fixture(source.path());
+        let before = file_inventory(source.path());
+        let source_store_bytes = fs::read(source.path().join(STORE_NAME)).unwrap();
+        let (store_id, _) = decode_store(&source_store_bytes).unwrap();
+        let record = fs::read(source.path().join(PUBLIC_COLLECTION_NAME)).unwrap();
+        let notice = fs::read(source.path().join(PUBLIC_NOTICE_NAME)).unwrap();
+
+        let report = PersistentIndex::reindex_gate3(source.path(), destination.path()).unwrap();
+        assert_eq!(report.source_generation, 7);
+        assert_eq!(report.destination_generation, 7);
+        assert_eq!(report.document_count, 1);
+        assert_eq!(file_inventory(source.path()), before);
+        assert!(matches!(
+            PersistentIndex::open(source.path()),
+            Err(StorageError::ReindexRequired(_))
+        ));
+
+        let migrated = PersistentIndex::open(destination.path()).unwrap();
+        assert_eq!(migrated.store_identity(), store_id);
+        assert_eq!(
+            fs::read(destination.path().join(PUBLIC_COLLECTION_NAME)).unwrap(),
+            record
+        );
+        assert_eq!(
+            fs::read(destination.path().join(PUBLIC_NOTICE_NAME)).unwrap(),
+            notice
+        );
+        let view = migrated.read_view().unwrap();
+        assert_eq!(view.document_count(), 1);
+        let key = UrlKey::parse("https://doc.rust-lang.org/stable/std/string/struct.String.html")
+            .unwrap();
+        let current = migrated.restore_lease(&exact_token).unwrap();
+        assert_eq!(
+            migrated
+                .apply(
+                    &current,
+                    Intent::Upsert {
+                        effective_url: key.as_str().to_owned(),
+                        title: "Gate 3 fixture".to_owned(),
+                        body: "incremental migration preserves this current document".to_owned(),
+                    },
+                )
+                .unwrap(),
+            ApplyOutcome::AlreadyApplied
+        );
+        assert!(matches!(
+            migrated.apply(&current, Intent::Tombstone),
+            Err(StorageError::ConflictingIntent)
+        ));
+        let pending = migrated.restore_lease(&pending_token).unwrap();
+        assert_eq!(
+            migrated.apply(&pending, Intent::Tombstone).unwrap(),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            migrated.apply(&pending, Intent::Tombstone).unwrap(),
+            ApplyOutcome::AlreadyApplied
+        );
+        assert!(migrated.query("incremental").unwrap().is_empty());
+        assert_reference_view(
+            &view,
+            &{
+                let mut expected = InMemoryIndex::new();
+                expected
+                    .insert_fields(
+                        key.as_str().to_owned(),
+                        key.as_str().to_owned(),
+                        "Gate 3 fixture".to_owned(),
+                        "incremental migration preserves this current document".to_owned(),
+                    )
+                    .unwrap();
+                expected
+            },
+            &["incremental", "\"migration preserves\""],
+        );
+        assert!(matches!(
+            PersistentIndex::reindex_gate3(source.path(), destination.path()),
+            Err(StorageError::StoreAlreadyExists)
+        ));
+        assert_eq!(file_inventory(source.path()), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gate3_migration_rejects_nested_dot_and_symlink_parent_destinations_before_staging() {
+        use std::os::unix::fs::symlink;
+
+        let source = TempStore::new();
+        write_gate3_fixture(source.path());
+        let before = file_inventory(source.path());
+        let alias = source.path().with_extension("source-alias");
+        symlink(source.path(), &alias).unwrap();
+        let destinations = [
+            source.path().join("nested-store"),
+            source.path().join(".").join("dot-store"),
+            alias.join("symlink-store"),
+        ];
+        for destination in destinations {
+            assert!(matches!(
+                PersistentIndex::reindex_gate3(source.path(), &destination),
+                Err(StorageError::ReindexRequired(message))
+                    if message.contains("outside the retained source")
+            ));
+            assert_eq!(file_inventory(source.path()), before);
+        }
+        let nested = source.path().join("nested");
+        fs::create_dir(&nested).unwrap();
+        let dot_dot_destination = nested.join("..").join("dot-dot-store");
+        assert!(matches!(
+            PersistentIndex::reindex_gate3(source.path(), &dot_dot_destination),
+            Err(StorageError::ReindexRequired(message))
+                if message.contains("outside the retained source")
+        ));
+        assert_eq!(fs::read_dir(&nested).unwrap().count(), 0);
+        fs::remove_dir(&nested).unwrap();
+        assert_eq!(file_inventory(source.path()), before);
+        assert!(!source.path().join("nested-store").exists());
+        assert!(!source.path().join("dot-store").exists());
+        assert!(!source.path().join("dot-dot-store").exists());
+        assert!(!source.path().join("symlink-store").exists());
+        fs::remove_file(alias).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gate3_migration_no_replace_preserves_a_destination_created_at_publish() {
+        use std::cell::Cell;
+        use std::os::unix::fs::MetadataExt;
+
+        let source = TempStore::new();
+        let destination = TempStore::new();
+        write_gate3_fixture(source.path());
+        let source_before = file_inventory(source.path());
+        let contender_inode = Cell::new(None);
+        let result = PersistentIndex::reindex_gate3_with_publish_hook(
+            source.path(),
+            destination.path(),
+            |path| {
+                fs::create_dir(path)?;
+                contender_inode.set(Some(fs::symlink_metadata(path)?.ino()));
+                Ok(())
+            },
+        );
+        assert!(matches!(result, Err(StorageError::StoreAlreadyExists)));
+        let contender = fs::symlink_metadata(destination.path()).unwrap();
+        assert!(contender.is_dir());
+        assert_eq!(contender.ino(), contender_inode.get().unwrap());
+        assert_eq!(fs::read_dir(destination.path()).unwrap().count(), 0);
+        assert_eq!(file_inventory(source.path()), source_before);
+    }
+
+    #[test]
+    fn manifest_writer_capacity_is_distinct_from_committed_corruption() {
+        let store_id = [0x6a; 16];
+        let mut at_limit = empty_manifest(store_id);
+        at_limit.next_segment_id = MAX_SEGMENTS as u64 + 1;
+        at_limit.segments = (1..=MAX_SEGMENTS as u64)
+            .map(|id| SegmentDescriptor {
+                id,
+                byte_len: 164,
+                sha256: [0; 32],
+                document_count: 1,
+                term_count: 0,
+                posting_count: 0,
+                position_count: 0,
+            })
+            .collect();
+        validate_manifest_shape(&at_limit, store_id).unwrap();
+
+        let mut over_limit = at_limit.clone();
+        let id = over_limit.next_segment_id;
+        over_limit.next_segment_id += 1;
+        over_limit.segments.push(SegmentDescriptor {
+            id,
+            byte_len: 164,
+            sha256: [0; 32],
+            document_count: 1,
+            term_count: 0,
+            posting_count: 0,
+            position_count: 0,
+        });
+        assert!(matches!(
+            validate_manifest_shape(&over_limit, store_id),
+            Err(StorageError::CorruptCommitted(_))
+        ));
+        match validate_proposed_manifest_shape(&over_limit, store_id) {
+            Err(StorageError::CapacityExceeded(message)) => {
+                assert!(message.contains("ley compact --store <store-path>"));
+            }
+            result => panic!("writer proposal should report actionable capacity: {result:?}"),
+        }
+
+        for limit in [
+            ManifestLimit::LiveDocumentCount,
+            ManifestLimit::LifecycleHistory,
+        ] {
+            let message = ManifestLimit::error(limit, ManifestValidationKind::Proposed).to_string();
+            assert!(!message.contains("ley compact"), "{message}");
         }
     }
 
@@ -3113,7 +4892,18 @@ mod tests {
         assert_eq!(before[0].explanation.average_title_length, 1.0);
         assert_eq!(before[0].explanation.average_body_length, 4.5);
         let parsed = parse_query("rust AND search").unwrap();
-        let reference = crate::reference::exhaustive_search(&pinned.generation.index, &parsed);
+        let mut reference_index = InMemoryIndex::new();
+        for document in pinned.snapshot.documents.values() {
+            reference_index
+                .upsert_fields(
+                    document.id.clone(),
+                    document.effective_url.clone(),
+                    document.title.clone(),
+                    document.body.clone(),
+                )
+                .unwrap();
+        }
+        let reference = crate::reference::exhaustive_search(&reference_index, &parsed);
         assert_eq!(reference.len(), before.len());
         for (expected, actual) in reference.iter().zip(&before) {
             assert_eq!(expected.id, actual.id);
@@ -3165,6 +4955,278 @@ mod tests {
                 "obsolete OR retired OR secret",
             ],
         );
+    }
+
+    #[test]
+    fn append_update_remove_and_compaction_preserve_hashes_and_full_reference_results()
+    -> Result<(), StorageError> {
+        let temp = TempStore::new();
+        let store = PersistentIndex::create(temp.path()).unwrap();
+        let alpha = key("alpha");
+        let beta = key("beta");
+        let mut inventories = BTreeMap::new();
+        let mut expected = InMemoryIndex::new();
+
+        upsert(
+            &store,
+            &alpha,
+            "https://example.test/alpha",
+            "Old Version",
+            "alpha old blue phrase",
+        );
+        expected
+            .insert_fields(
+                alpha.to_string(),
+                "https://example.test/alpha".to_owned(),
+                "Old Version".to_owned(),
+                "alpha old blue phrase".to_owned(),
+            )
+            .unwrap();
+        inventories.insert("after_first_append", file_inventory(temp.path()));
+        let second = upsert(
+            &store,
+            &beta,
+            "https://example.test/beta",
+            "Second Page",
+            "blue shared phrase",
+        );
+        expected
+            .insert_fields(
+                beta.to_string(),
+                "https://example.test/beta".to_owned(),
+                "Second Page".to_owned(),
+                "blue shared phrase".to_owned(),
+            )
+            .unwrap();
+        let after_append = file_inventory(temp.path());
+        for (name, proof) in inventories["after_first_append"]
+            .iter()
+            .filter(|(name, _)| name.starts_with("seg-"))
+        {
+            assert_eq!(after_append.get(name), Some(proof), "append rewrote {name}");
+        }
+        inventories.insert("after_second_append", after_append);
+        assert_reference_view(
+            &store.read_view().unwrap(),
+            &expected,
+            &["blue", "phrase", "alpha AND old", "missing OR shared"],
+        );
+
+        let alpha_update = upsert(
+            &store,
+            &alpha,
+            "https://example.test/alpha",
+            "Updated Version",
+            "green fresh phrase",
+        );
+        expected
+            .upsert_fields(
+                alpha.to_string(),
+                "https://example.test/alpha".to_owned(),
+                "Updated Version".to_owned(),
+                "green fresh phrase".to_owned(),
+            )
+            .unwrap();
+        let after_update = file_inventory(temp.path());
+        for (name, proof) in inventories["after_second_append"]
+            .iter()
+            .filter(|(name, _)| name.starts_with("seg-"))
+        {
+            assert_eq!(after_update.get(name), Some(proof), "update rewrote {name}");
+        }
+        inventories.insert("after_update", after_update);
+        assert_eq!(
+            store
+                .apply(
+                    &alpha_update,
+                    Intent::Upsert {
+                        effective_url: "https://example.test/alpha".to_owned(),
+                        title: "Updated Version".to_owned(),
+                        body: "green fresh phrase".to_owned(),
+                    },
+                )
+                .unwrap(),
+            ApplyOutcome::AlreadyApplied
+        );
+        assert!(matches!(
+            store.apply(&alpha_update, Intent::Tombstone),
+            Err(StorageError::ConflictingIntent)
+        ));
+        let stale_key = key("stale");
+        let stale = store.issue_fence(&stale_key).unwrap();
+        let _current_stale_key = store.issue_fence(&stale_key).unwrap();
+        assert!(matches!(
+            store.apply(&stale, Intent::Tombstone),
+            Err(StorageError::StaleFence)
+        ));
+
+        assert_eq!(
+            store
+                .apply(
+                    &second,
+                    Intent::Upsert {
+                        effective_url: "https://example.test/beta".to_owned(),
+                        title: "Second Page".to_owned(),
+                        body: "blue shared phrase".to_owned(),
+                    },
+                )
+                .unwrap(),
+            ApplyOutcome::AlreadyApplied
+        );
+        assert!(matches!(
+            store.apply(&second, Intent::Tombstone),
+            Err(StorageError::ConflictingIntent)
+        ));
+        let beta_delete = store.issue_fence(&beta).unwrap();
+        store.apply(&beta_delete, Intent::Tombstone).unwrap();
+        expected.remove_document(beta.as_str());
+        let after_remove = file_inventory(temp.path());
+        for (name, proof) in inventories["after_update"]
+            .iter()
+            .filter(|(name, _)| name.starts_with("seg-"))
+        {
+            assert_eq!(after_remove.get(name), Some(proof), "remove rewrote {name}");
+        }
+        inventories.insert("after_remove", after_remove);
+        assert_reference_view(
+            &store.read_view().unwrap(),
+            &expected,
+            &["green", "old OR fresh", "\"fresh phrase\""],
+        );
+
+        let revoke = store.issue_fence(&alpha).unwrap();
+        store.apply(&revoke, Intent::Revoke).unwrap();
+        expected.remove_document(alpha.as_str());
+        assert_reference_view(
+            &store.read_view().unwrap(),
+            &expected,
+            &["green", "old OR fresh"],
+        );
+        let readmit = store.issue_fence(&alpha).unwrap();
+        store.apply(&readmit, Intent::Readmit).unwrap();
+        assert_reference_view(
+            &store.read_view().unwrap(),
+            &expected,
+            &["green", "old OR fresh"],
+        );
+        upsert(
+            &store,
+            &alpha,
+            "https://example.test/alpha",
+            "New Again",
+            "blue fresh marker",
+        );
+        expected
+            .upsert_fields(
+                alpha.to_string(),
+                "https://example.test/alpha".to_owned(),
+                "New Again".to_owned(),
+                "blue fresh marker".to_owned(),
+            )
+            .unwrap();
+        let before_compaction = store.read_view().unwrap();
+        let before_compaction_results = before_compaction.query("blue OR fresh").unwrap();
+        inventories.insert("before_compaction", file_inventory(temp.path()));
+        let input_manifest = current_manifest(temp.path());
+        let input_segment_ids = input_manifest
+            .segments
+            .iter()
+            .map(|descriptor| descriptor.id)
+            .collect::<Vec<_>>();
+
+        let report = store.compact().unwrap();
+        let after_compaction = store.read_view().unwrap();
+        let after_compaction_results = after_compaction.query("blue OR fresh").unwrap();
+        let mut before_compaction_at_new_generation = before_compaction_results.clone();
+        for result in &mut before_compaction_at_new_generation {
+            result.explanation.statistics_source =
+                StatisticsSource::PersistentGeneration(report.new_generation);
+        }
+        assert_eq!(
+            before_compaction_at_new_generation,
+            after_compaction_results
+        );
+        assert_reference_view(
+            &after_compaction,
+            &expected,
+            &["blue", "fresh", "\"fresh marker\"", "old OR missing"],
+        );
+        assert_eq!(report.merged_segments.len(), input_segment_ids.len());
+        assert_eq!(
+            report
+                .merged_segments
+                .iter()
+                .map(|segment| segment.id)
+                .collect::<Vec<_>>(),
+            input_segment_ids
+        );
+        assert_eq!(report.replacement_segments.len(), 1);
+        let after_compaction_inventory = file_inventory(temp.path());
+        for (name, proof) in &inventories["before_compaction"] {
+            if name == STORE_NAME || name == LEASE_KEY_NAME || name == LOCK_NAME {
+                assert_eq!(after_compaction_inventory.get(name), Some(proof));
+            }
+        }
+        for segment_id in &input_segment_ids {
+            assert!(!temp.path().join(segment_name(*segment_id)).exists());
+        }
+        assert!(
+            temp.path()
+                .join(segment_name(report.replacement_segments[0].id))
+                .exists()
+        );
+        assert_eq!(
+            before_compaction.query("blue OR fresh").unwrap(),
+            before_compaction_results,
+            "an eager reader snapshot remains queryable after its source files are removed"
+        );
+        inventories.insert("after_compaction", after_compaction_inventory);
+
+        let mut verifier = Command::new(std::env::current_exe().unwrap());
+        verifier
+            .args([
+                "--exact",
+                "storage::tests::child_storage_worker",
+                "--nocapture",
+            ])
+            .env("LEY_STORAGE_TEST_ACTION", "verify_differential")
+            .env("LEY_STORAGE_TEST_PATH", temp.path());
+        let output = verifier.output().unwrap();
+        assert!(
+            output.status.success(),
+            "fresh-process post-compaction reference check failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        if let Some(evidence_path) = std::env::var_os("LEY_GATE6_EVIDENCE_OUT") {
+            let evidence = serde_json::json!({
+                "snapshots": inventories,
+                "compaction": {
+                    "old_generation": report.old_generation,
+                    "new_generation": report.new_generation,
+                    "merged_segments": report.merged_segments.iter().map(|segment| {
+                        serde_json::json!({"id": segment.id, "byte_len": segment.byte_len, "sha256": segment.sha256})
+                    }).collect::<Vec<_>>(),
+                    "replacement_segments": report.replacement_segments.iter().map(|segment| {
+                        serde_json::json!({"id": segment.id, "byte_len": segment.byte_len, "sha256": segment.sha256})
+                    }).collect::<Vec<_>>(),
+                    "removed_paths": report.removed_paths,
+                },
+                "checks": {
+                    "append_kept_existing_segment_hashes": true,
+                    "update_kept_existing_segment_hashes": true,
+                    "remove_kept_all_segment_hashes": true,
+                    "compaction_removed_only_merged_inputs_and_added_one_replacement": true,
+                    "old_reader_queried_after_input_files_were_removed": true,
+                    "fresh_process_reference_match": true,
+                },
+            });
+            let mut file = File::create(evidence_path)?;
+            serde_json::to_writer_pretty(&mut file, &evidence)
+                .map_err(|_| corrupt("incremental evidence could not be written"))?;
+            file.sync_all()?;
+        }
+        Ok(())
     }
 
     #[test]
@@ -3267,6 +5329,7 @@ mod tests {
         );
         let old_view = store.read_view().unwrap();
         let old_generation_id = old_view.generation_id();
+        let old_segment_id = *old_view.snapshot.segments.keys().next().unwrap();
         let old_snapshot = old_view.query("alpha").unwrap();
         assert_eq!(
             old_snapshot[0].explanation.statistics_source,
@@ -3416,24 +5479,13 @@ mod tests {
         assert_eq!(reopened.query("current").unwrap().len(), 1);
         let current_view = reopened.read_view().unwrap();
         assert_ne!(current_view.generation_id(), old_generation_id);
-        let current_generation_path = temp
-            .path()
-            .join(generation_name(current_view.generation_id()));
-        let current_generation = fs::read(&current_generation_path).unwrap();
-        let retained_parent_id = get_u64(&current_generation, 44).unwrap();
-        assert!(retained_parent_id > 0);
+        assert!(temp.path().join(segment_name(old_segment_id)).exists());
         assert!(
             temp.path()
-                .join(generation_name(retained_parent_id))
+                .join(manifest_name(current_view.generation_id()))
                 .exists()
         );
-        assert!(
-            !temp
-                .path()
-                .join(generation_name(old_generation_id))
-                .exists(),
-            "cleanup removed the old generation file while its decoded view remained pinned"
-        );
+        assert!(!temp.path().join(manifest_name(old_generation_id)).exists());
         assert_eq!(old_view.query("alpha").unwrap(), old_snapshot);
         query_send.send(()).unwrap();
         assert_eq!(reader.join().unwrap(), old_snapshot);
@@ -3468,17 +5520,13 @@ mod tests {
             .unwrap();
         let unused = store.issue_fence(&document).unwrap();
 
-        let generation_path = committed_generation_path(temp.path());
-        let mut generation = fs::read(&generation_path).unwrap();
-        let controls_offset = get_u64(&generation, 188 + 3 * DESCRIPTOR_BYTES).unwrap() as usize;
-        let key_len = usize::from(get_u16(&generation, controls_offset).unwrap());
-        let terminal_count = get_u32(&generation, controls_offset + 10).unwrap() as usize;
-        assert_eq!(terminal_count, 3);
-        let readmitted_fence_offset = controls_offset + 18 + key_len + terminal_count * 48 + 16;
-        generation[readmitted_fence_offset..readmitted_fence_offset + 8]
-            .copy_from_slice(&unused.fence().get().to_be_bytes());
-        refresh_generation_checksums(temp.path(), &mut generation);
-        fs::write(generation_path, generation).unwrap();
+        let mut manifest = current_manifest(temp.path());
+        let control = manifest.controls.get_mut(document.as_str()).unwrap();
+        assert_eq!(control.terminal.len(), 3);
+        control
+            .policy
+            .insert(unused.fence().get(), PolicyRecord::Readmitted);
+        install_test_manifest(temp.path(), &manifest);
 
         assert_corrupt_open(temp.path());
     }
@@ -3568,171 +5616,343 @@ mod tests {
     }
 
     #[test]
-    fn committed_format_rejects_invalid_versions_truncation_forged_document_and_posting_counts_offsets_positions_checksums_and_missing_files()
-     {
-        let mut cases: Vec<CorruptionCase> = Vec::new();
-
-        cases.push(Box::new(|temp| {
-            let store = PersistentIndex::create(temp.path()).unwrap();
-            let k = key("version");
-            upsert(&store, &k, "https://example.test/version", "", "alpha");
-            let generation_path = committed_generation_path(temp.path());
-            let mut generation = fs::read(&generation_path).unwrap();
-            generation[10..12].copy_from_slice(&4u16.to_be_bytes());
-            refresh_generation_checksums(temp.path(), &mut generation);
-            fs::write(generation_path, generation).unwrap();
-            assert!(matches!(
-                PersistentIndex::open(temp.path()),
-                Err(StorageError::UnsupportedFormat { .. })
-            ));
-        }));
-
-        cases.push(Box::new(|temp| {
-            let store = PersistentIndex::create(temp.path()).unwrap();
-            let k = key("version");
-            upsert(&store, &k, "https://example.test/version", "", "alpha");
-            let generation_path = committed_generation_path(temp.path());
-            let mut generation = fs::read(&generation_path).unwrap();
-            generation.truncate(generation.len() - 1);
-            rewrite_current_for_generation(temp.path(), &generation);
-            fs::write(generation_path, generation).unwrap();
-            assert_corrupt_open(temp.path());
-        }));
-
-        cases.push(Box::new(|temp| {
-            let store = PersistentIndex::create(temp.path()).unwrap();
-            let k = key("version");
-            upsert(&store, &k, "https://example.test/version", "", "alpha");
-            let generation_path = committed_generation_path(temp.path());
-            let mut generation = fs::read(&generation_path).unwrap();
-            generation[140..148].copy_from_slice(&999_999u64.to_be_bytes());
-            refresh_header_and_pointer(temp.path(), &mut generation);
-            fs::write(generation_path, generation).unwrap();
-            assert_corrupt_open(temp.path());
-        }));
-
-        cases.push(Box::new(|temp| {
-            let store = PersistentIndex::create(temp.path()).unwrap();
-            let k = key("version");
-            upsert(&store, &k, "https://example.test/version", "", "alpha");
-            let generation_path = committed_generation_path(temp.path());
-            let mut generation = fs::read(&generation_path).unwrap();
-            generation[124..132].copy_from_slice(&999_999u64.to_be_bytes());
-            refresh_generation_checksums(temp.path(), &mut generation);
-            fs::write(generation_path, generation).unwrap();
-            assert_corrupt_open(temp.path());
-        }));
-
-        cases.push(Box::new(|temp| {
-            let store = PersistentIndex::create(temp.path()).unwrap();
-            let k = key("version");
-            upsert(&store, &k, "https://example.test/version", "", "alpha beta");
-            let generation_path = committed_generation_path(temp.path());
-            let mut generation = fs::read(&generation_path).unwrap();
-            let dictionary_descriptor = 188 + DESCRIPTOR_BYTES;
-            let dictionary_offset = get_u64(&generation, dictionary_descriptor).unwrap() as usize;
-            let dictionary_length =
-                get_u64(&generation, dictionary_descriptor + 8).unwrap() as usize;
-            assert!(dictionary_length > 0);
-            generation.remove(dictionary_offset + dictionary_length - 1);
-            let new_generation_length = generation.len() as u64;
-            generation[116..124].copy_from_slice(&new_generation_length.to_be_bytes());
-            generation[dictionary_descriptor + 8..dictionary_descriptor + 16]
-                .copy_from_slice(&((dictionary_length - 1) as u64).to_be_bytes());
-            for section in 2..SECTION_COUNT {
-                let descriptor = 188 + section * DESCRIPTOR_BYTES;
-                let offset = get_u64(&generation, descriptor).unwrap();
-                generation[descriptor..descriptor + 8].copy_from_slice(&(offset - 1).to_be_bytes());
+    fn cross_process_writers_readers_and_compaction_races_are_serialized() {
+        fn spawn_worker(
+            root: &Path,
+            action: &str,
+            role: Option<&str>,
+            wait: bool,
+        ) -> std::process::Child {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "storage::tests::child_storage_worker",
+                    "--nocapture",
+                ])
+                .env("LEY_STORAGE_TEST_ACTION", action)
+                .env("LEY_STORAGE_TEST_PATH", root);
+            if let Some(role) = role {
+                command.env("LEY_STORAGE_PROCESS_ROLE", role);
             }
-            refresh_generation_checksums(temp.path(), &mut generation);
-            fs::write(generation_path, generation).unwrap();
-            assert_corrupt_open(temp.path());
-        }));
+            if wait {
+                command.env("LEY_STORAGE_WAIT_FOR_GATE", "1");
+            }
+            command.spawn().unwrap()
+        }
 
-        cases.push(Box::new(|temp| {
-            let store = PersistentIndex::create(temp.path()).unwrap();
-            let k = key("version");
-            upsert(&store, &k, "https://example.test/version", "", "alpha");
-            let generation_path = committed_generation_path(temp.path());
-            let mut generation = fs::read(&generation_path).unwrap();
-            refresh_generation_checksums(temp.path(), &mut generation);
-            generation[188..196].copy_from_slice(&u64::MAX.to_be_bytes());
-            refresh_header_and_pointer(temp.path(), &mut generation);
-            fs::write(generation_path, generation).unwrap();
-            assert_corrupt_open(temp.path());
-        }));
+        fn wait_ready(root: &Path, role: &str) {
+            let ready = test_gate(root, &format!("{role}-ready"));
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !ready.exists() {
+                assert!(
+                    Instant::now() < deadline,
+                    "{role} child did not become ready"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
 
-        cases.push(Box::new(|temp| {
-            let store = PersistentIndex::create(temp.path()).unwrap();
-            let k = key("version");
-            upsert(&store, &k, "https://example.test/version", "", "alpha");
-            let current_path = temp.path().join(CURRENT_NAME);
-            let mut current = fs::read(&current_path).unwrap();
-            current[32] ^= 1;
-            fs::write(current_path, current).unwrap();
-            assert_corrupt_open(temp.path());
-        }));
+        fn finish_child(child: std::process::Child, label: &str) {
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{label} child failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
 
-        cases.push(Box::new(|temp| {
+        fn clear_gates(root: &Path) {
+            if let Ok(entries) = fs::read_dir(root) {
+                for entry in entries.flatten() {
+                    if entry.file_name().to_string_lossy().starts_with(".test-") {
+                        let _ = fs::remove_file(entry.path());
+                    }
+                }
+            }
+        }
+
+        let temp = TempStore::new();
+        PersistentIndex::create(temp.path()).unwrap();
+        let first = spawn_worker(temp.path(), "issue_fence_process", Some("first"), true);
+        let second = spawn_worker(temp.path(), "issue_fence_process", Some("second"), true);
+        wait_ready(temp.path(), "first");
+        wait_ready(temp.path(), "second");
+        fs::write(test_gate(temp.path(), "release"), b"go").unwrap();
+        finish_child(first, "first fence writer");
+        finish_child(second, "second fence writer");
+        let mut fence_values = [
+            u64::from_be_bytes(
+                fs::read(test_gate(temp.path(), "first-fence"))
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+            ),
+            u64::from_be_bytes(
+                fs::read(test_gate(temp.path(), "second-fence"))
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+            ),
+        ];
+        fence_values.sort_unstable();
+        assert_eq!(fence_values, [1, 2]);
+        assert_eq!(
+            current_manifest(temp.path()).controls["https://example.test/shared"].high_water,
+            2
+        );
+        clear_gates(temp.path());
+
+        let store = PersistentIndex::open(temp.path()).unwrap();
+        upsert(
+            &store,
+            &key("alpha"),
+            "https://example.test/alpha",
+            "Alpha",
+            "alpha stable",
+        );
+        upsert(
+            &store,
+            &key("beta"),
+            "https://example.test/beta",
+            "Beta",
+            "beta obsolete",
+        );
+
+        let reader = spawn_worker(temp.path(), "hold_reader_lock", None, false);
+        wait_ready(temp.path(), "reader");
+        let mut compactor = spawn_worker(
+            temp.path(),
+            "compact_process",
+            Some("blocked-compactor"),
+            false,
+        );
+        let attempt_notice = test_gate(temp.path(), "blocked-compactor-attempting");
+        let attempt_deadline = Instant::now() + Duration::from_secs(10);
+        while !attempt_notice.exists() {
+            assert!(Instant::now() < attempt_deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            compactor.try_wait().unwrap().is_none(),
+            "exclusive compaction passed an active cross-process shared lock"
+        );
+        fs::write(test_gate(temp.path(), "release"), b"release reader").unwrap();
+        finish_child(reader, "shared-lock reader");
+        finish_child(compactor, "waiting compactor");
+        clear_gates(temp.path());
+
+        let before_race_generation = current_manifest(temp.path()).generation_id;
+        let racing_compactor = spawn_worker(temp.path(), "compact_process", Some("compact"), true);
+        let racing_writer = spawn_worker(temp.path(), "upsert_process", Some("upsert"), true);
+        wait_ready(temp.path(), "compact");
+        wait_ready(temp.path(), "upsert");
+        fs::write(test_gate(temp.path(), "release"), b"race").unwrap();
+        finish_child(racing_compactor, "racing compactor");
+        finish_child(racing_writer, "racing writer");
+        let reopened = PersistentIndex::open(temp.path()).unwrap();
+        let generation_delta = reopened
+            .read_view()
+            .unwrap()
+            .generation_id()
+            .saturating_sub(before_race_generation);
+        assert!(
+            matches!(generation_delta, 2 | 3),
+            "serialized writer/compactor order publishes two generations when the already compacted store is compacted first, and three when the update creates stale postings first; observed delta {generation_delta}"
+        );
+        let mut expected = InMemoryIndex::new();
+        expected
+            .insert_fields(
+                "https://example.test/alpha".to_owned(),
+                "https://example.test/alpha".to_owned(),
+                "Alpha".to_owned(),
+                "alpha stable".to_owned(),
+            )
+            .unwrap();
+        expected
+            .insert_fields(
+                "https://example.test/beta".to_owned(),
+                "https://example.test/beta".to_owned(),
+                "Beta revised".to_owned(),
+                "beta revised".to_owned(),
+            )
+            .unwrap();
+        assert_reference_view(
+            &reopened.read_view().unwrap(),
+            &expected,
+            &["alpha", "beta", "obsolete", "beta AND revised"],
+        );
+    }
+
+    #[test]
+    fn gate6_format_rejects_versions_truncation_counts_offsets_positions_checksums_and_missing_files()
+     {
+        fn seed(temp: &TempStore) -> (Manifest, Vec<u8>) {
             let store = PersistentIndex::create(temp.path()).unwrap();
-            let k = key("version");
-            upsert(&store, &k, "https://example.test/version", "", "alpha");
-            let generation_path = committed_generation_path(temp.path());
-            let mut generation = fs::read(&generation_path).unwrap();
-            generation[52..84].copy_from_slice(&[7; 32]);
-            refresh_header_and_pointer(temp.path(), &mut generation);
-            fs::write(generation_path, generation).unwrap();
+            upsert(
+                &store,
+                &key("format"),
+                "https://example.test/format",
+                "",
+                "alpha beta",
+            );
+            let manifest = current_manifest(temp.path());
+            let descriptor = manifest.segments.first().unwrap();
+            let bytes = fs::read(temp.path().join(segment_name(descriptor.id))).unwrap();
+            (manifest, bytes)
+        }
+
+        fn install_segment(temp: &TempStore, mut manifest: Manifest, bytes: Vec<u8>) {
+            let descriptor = manifest.segments.first_mut().unwrap();
+            descriptor.byte_len = bytes.len() as u64;
+            descriptor.sha256 = sha256(&bytes);
+            fs::write(temp.path().join(segment_name(descriptor.id)), &bytes).unwrap();
+            install_test_manifest(temp.path(), &manifest);
+        }
+
+        fn refresh_segment_checksums(bytes: &mut [u8]) {
+            let payload_hash = sha256(&bytes[164..]);
+            bytes[100..132].copy_from_slice(&payload_hash);
+            let header_hash = sha256(&bytes[..132]);
+            bytes[132..164].copy_from_slice(&header_hash);
+        }
+
+        let mut cases: Vec<CorruptionCase> = Vec::new();
+        cases.push(Box::new(|temp| {
+            let (manifest, mut bytes) = seed(temp);
+            bytes[8..10].copy_from_slice(&2u16.to_be_bytes());
+            refresh_segment_checksums(&mut bytes);
+            install_segment(temp, manifest, bytes);
             assert!(matches!(
                 PersistentIndex::open(temp.path()),
-                Err(StorageError::ReindexRequired(_))
+                Err(StorageError::UnsupportedFormat { major: 2, .. })
             ));
         }));
-
         cases.push(Box::new(|temp| {
-            let store = PersistentIndex::create(temp.path()).unwrap();
-            let k = key("version");
-            upsert(&store, &k, "https://example.test/version", "", "alpha");
-            let generation_path = committed_generation_path(temp.path());
-            let mut generation = fs::read(&generation_path).unwrap();
-            let dictionary_offset = get_u64(&generation, 188 + DESCRIPTOR_BYTES).unwrap() as usize;
-            generation[dictionary_offset + 20..dictionary_offset + 28]
+            let (manifest, mut bytes) = seed(temp);
+            bytes.truncate(bytes.len() - 1);
+            install_segment(temp, manifest, bytes);
+            assert_corrupt_open(temp.path());
+        }));
+        cases.push(Box::new(|temp| {
+            let (mut manifest, mut bytes) = seed(temp);
+            let count = u32::from_be_bytes(bytes[24..28].try_into().unwrap()) + 1;
+            bytes[24..28].copy_from_slice(&count.to_be_bytes());
+            manifest.segments[0].document_count = count;
+            refresh_segment_checksums(&mut bytes);
+            install_segment(temp, manifest, bytes);
+            assert_corrupt_open(temp.path());
+        }));
+        cases.push(Box::new(|temp| {
+            let (mut manifest, mut bytes) = seed(temp);
+            let count = u64::from_be_bytes(bytes[32..40].try_into().unwrap()) + 1;
+            bytes[32..40].copy_from_slice(&count.to_be_bytes());
+            manifest.segments[0].posting_count = count;
+            refresh_segment_checksums(&mut bytes);
+            install_segment(temp, manifest, bytes);
+            assert_corrupt_open(temp.path());
+        }));
+        cases.push(Box::new(|temp| {
+            let (manifest, mut bytes) = seed(temp);
+            bytes[48..56].copy_from_slice(&165u64.to_be_bytes());
+            refresh_segment_checksums(&mut bytes);
+            install_segment(temp, manifest, bytes);
+            assert_corrupt_open(temp.path());
+        }));
+        cases.push(Box::new(|temp| {
+            let (manifest, mut bytes) = seed(temp);
+            let dictionary_offset = u64::from_be_bytes(bytes[64..72].try_into().unwrap()) as usize;
+            let term_len = usize::from(u16::from_be_bytes(
+                bytes[dictionary_offset + 4..dictionary_offset + 6]
+                    .try_into()
+                    .unwrap(),
+            ));
+            let first_posting_offset = dictionary_offset + 4 + 2 + term_len;
+            bytes[first_posting_offset..first_posting_offset + 8]
                 .copy_from_slice(&u64::MAX.to_be_bytes());
-            refresh_generation_checksums(temp.path(), &mut generation);
-            fs::write(generation_path, generation).unwrap();
+            refresh_segment_checksums(&mut bytes);
+            install_segment(temp, manifest, bytes);
             assert_corrupt_open(temp.path());
         }));
-
         cases.push(Box::new(|temp| {
-            let store = PersistentIndex::create(temp.path()).unwrap();
-            let k = key("version");
-            upsert(&store, &k, "https://example.test/version", "", "alpha");
-            let generation_path = committed_generation_path(temp.path());
-            let mut generation = fs::read(&generation_path).unwrap();
-            let posting_offset = get_u64(&generation, 188 + 2 * DESCRIPTOR_BYTES).unwrap() as usize;
-            generation[posting_offset + 16..posting_offset + 20]
-                .copy_from_slice(&999u32.to_be_bytes());
-            refresh_generation_checksums(temp.path(), &mut generation);
-            fs::write(generation_path, generation).unwrap();
+            let (manifest, mut bytes) = seed(temp);
+            let posting_offset = u64::from_be_bytes(bytes[80..88].try_into().unwrap()) as usize;
+            bytes[posting_offset + 3] = 0;
+            refresh_segment_checksums(&mut bytes);
+            install_segment(temp, manifest, bytes);
             assert_corrupt_open(temp.path());
         }));
-
         cases.push(Box::new(|temp| {
-            let store = PersistentIndex::create(temp.path()).unwrap();
-            let k = key("version");
-            upsert(&store, &k, "https://example.test/version", "", "alpha");
-            let generation_path = committed_generation_path(temp.path());
-            let mut generation = fs::read(&generation_path).unwrap();
-            generation[HEADER_BYTES] ^= 1;
-            fs::write(generation_path, generation).unwrap();
+            let (manifest, mut bytes) = seed(temp);
+            let posting_offset = u64::from_be_bytes(bytes[80..88].try_into().unwrap()) as usize;
+            assert_eq!(bytes[posting_offset + 3], 1);
+            bytes[posting_offset + 3] = 2;
+            refresh_segment_checksums(&mut bytes);
+            install_segment(temp, manifest, bytes);
             assert_corrupt_open(temp.path());
         }));
-
+        cases.push(Box::new(|temp| {
+            let (manifest, mut bytes) = seed(temp);
+            let last = bytes.len() - 1;
+            bytes[last] ^= 1;
+            fs::write(
+                temp.path().join(segment_name(manifest.segments[0].id)),
+                bytes,
+            )
+            .unwrap();
+            assert_corrupt_open(temp.path());
+        }));
+        cases.push(Box::new(|temp| {
+            let (manifest, _) = seed(temp);
+            fs::remove_file(temp.path().join(segment_name(manifest.segments[0].id))).unwrap();
+            assert_corrupt_open(temp.path());
+        }));
+        cases.push(Box::new(|temp| {
+            let (manifest, _) = seed(temp);
+            fs::remove_file(temp.path().join(manifest_name(manifest.generation_id))).unwrap();
+            assert_corrupt_open(temp.path());
+        }));
+        cases.push(Box::new(|temp| {
+            let (manifest, _) = seed(temp);
+            let path = temp.path().join(manifest_name(manifest.generation_id));
+            let mut bytes = fs::read(&path).unwrap();
+            let payload = serde_json::from_slice::<serde_json::Value>(&bytes[112..]).unwrap();
+            let mut payload = payload;
+            payload
+                .as_object_mut()
+                .unwrap()
+                .insert("unexpected".to_owned(), serde_json::json!(true));
+            let payload = serde_json::to_vec(&payload).unwrap();
+            bytes.truncate(112);
+            bytes[32..40].copy_from_slice(&(payload.len() as u64).to_be_bytes());
+            bytes[40..72].copy_from_slice(&sha256(&payload));
+            let header_hash = sha256(&bytes[..72]);
+            bytes[72..104].copy_from_slice(&header_hash);
+            bytes.extend_from_slice(&payload);
+            let pointer = CurrentPointer {
+                store_id: manifest.store_id,
+                generation_id: manifest.generation_id,
+                manifest_len: bytes.len() as u64,
+                manifest_sha256: sha256(&bytes),
+            };
+            fs::write(path, bytes).unwrap();
+            fs::write(temp.path().join(CURRENT_NAME), pointer.encode()).unwrap();
+            assert_corrupt_open(temp.path());
+        }));
         cases.push(Box::new(|temp| {
             let store = PersistentIndex::create(temp.path()).unwrap();
-            let k = key("version");
-            upsert(&store, &k, "https://example.test/version", "", "alpha");
-            let generation_path = committed_generation_path(temp.path());
-            fs::remove_file(generation_path).unwrap();
+            upsert(
+                &store,
+                &key("format"),
+                "https://example.test/format",
+                "",
+                "alpha",
+            );
+            let pointer_path = temp.path().join(CURRENT_NAME);
+            let mut pointer = fs::read(&pointer_path).unwrap();
+            pointer[32] ^= 1;
+            fs::write(pointer_path, pointer).unwrap();
             assert_corrupt_open(temp.path());
         }));
 
@@ -3743,117 +5963,118 @@ mod tests {
     }
 
     #[test]
-    fn process_exit_at_publication_seams_keeps_only_old_or_new_committed_state() {
-        const FAILPOINTS: [&str; 8] = [
-            "generation_write_half",
-            "generation_write_complete",
-            "generation_validate",
-            "generation_sync",
-            "generation_ready",
-            "current_sync",
-            "pointer_rename",
-            "directory_sync",
+    fn child_termination_at_segment_manifest_merge_and_cleanup_seams_reopens_one_generation() {
+        let scenarios = [
+            ("upsert", "segment_write_half", false),
+            ("upsert", "segment_write_complete", false),
+            ("upsert", "segment_validate", false),
+            ("upsert", "segment_sync", false),
+            ("upsert", "segment_rename", false),
+            ("upsert", "segment_directory_sync", false),
+            ("upsert", "manifest_write_half", false),
+            ("upsert", "manifest_write_complete", false),
+            ("upsert", "manifest_validate", false),
+            ("upsert", "manifest_sync", false),
+            ("upsert", "manifest_rename", false),
+            ("upsert", "manifest_directory_sync", false),
+            ("upsert", "current_write_complete", false),
+            ("upsert", "current_sync", false),
+            ("upsert", "pointer_rename", true),
+            ("upsert", "directory_sync", true),
+            ("tombstone", "manifest_write_half", false),
+            ("tombstone", "pointer_rename", true),
+            ("compact", "compaction_before_merge", false),
+            ("compact", "compaction_merge_complete", false),
+            ("compact", "cleanup_after_unlink", true),
+            ("compact", "cleanup_directory_sync", true),
         ];
 
-        for failpoint in FAILPOINTS {
-            for action in ["create", "upsert", "tombstone"] {
-                let temp = TempStore::new();
-                if action != "create" {
-                    let store = PersistentIndex::create(temp.path()).unwrap();
-                    let crash_key = key("crash");
-                    upsert(
-                        &store,
-                        &crash_key,
-                        "https://example.test/crash",
-                        "Twin Old",
-                        "old marker",
-                    );
-                    upsert(
-                        &store,
-                        &key("sentinel"),
-                        "https://example.test/sentinel",
-                        "Twin Sentinel",
-                        "old marker sentinel",
-                    );
-                    let lease = store.issue_fence(&crash_key).unwrap();
-                    write_lease_bundle(&temp.0, &[store.export_lease(&lease).unwrap()]);
-                }
-                let mut command = Command::new(std::env::current_exe().unwrap());
-                command
-                    .args([
-                        "--exact",
-                        "storage::tests::child_storage_worker",
-                        "--nocapture",
-                    ])
-                    .env("LEY_STORAGE_TEST_ACTION", action)
-                    .env("LEY_STORAGE_TEST_PATH", temp.path())
-                    .env("LEY_STORAGE_FAILPOINT", failpoint);
-                let output = command.output().unwrap();
-                assert_eq!(
-                    output.status.code(),
-                    Some(86),
-                    "child did not stop at {failpoint} for {action}: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
+        for (action, failpoint, committed_new) in scenarios {
+            let temp = TempStore::new();
+            let store = PersistentIndex::create(temp.path()).unwrap();
+            let crash_key = key("crash");
+            upsert(
+                &store,
+                &crash_key,
+                "https://example.test/crash",
+                "Twin Old",
+                "old marker",
+            );
+            upsert(
+                &store,
+                &key("sentinel"),
+                "https://example.test/sentinel",
+                "Twin Sentinel",
+                "old marker sentinel",
+            );
+            let lease = store.issue_fence(&crash_key).unwrap();
+            write_lease_bundle(&temp.0, &[store.export_lease(&lease).unwrap()]);
+            let old_generation = current_manifest(temp.path()).generation_id;
 
-                let new_is_committed = matches!(failpoint, "pointer_rename" | "directory_sync");
-                if action == "create" {
-                    if new_is_committed {
-                        let reopened = PersistentIndex::open(temp.path()).unwrap();
-                        let view = reopened.read_view().unwrap();
-                        assert!(view.generation.index.is_empty());
-                        assert!(view.query("any").unwrap().is_empty());
-                    } else {
-                        assert!(matches!(
-                            PersistentIndex::open(temp.path()),
-                            Err(StorageError::IncompleteInitialStore)
-                        ));
-                    }
-                    continue;
-                }
-                let reopened = PersistentIndex::open(temp.path()).unwrap();
-                assert_crash_view(&reopened, action, new_is_committed);
-                let lease = reopened
-                    .restore_lease(&read_lease_bundle(temp.path())[0])
-                    .unwrap();
-                let intent = || {
-                    if action == "upsert" {
-                        Intent::Upsert {
-                            effective_url: "https://example.test/crash".to_owned(),
-                            title: "Twin Old".to_owned(),
-                            body: "new marker marker".to_owned(),
-                        }
-                    } else {
-                        Intent::Tombstone
-                    }
-                };
-                if new_is_committed {
-                    assert_eq!(
-                        reopened.apply(&lease, intent()).unwrap(),
-                        ApplyOutcome::AlreadyApplied
-                    );
-                } else {
-                    let recovered_id = reopened.read_view().unwrap().generation_id();
-                    reopened.issue_fence(&key("sentinel")).unwrap();
-                    assert!(
-                        !temp
-                            .path()
-                            .join(generation_temp_name(recovered_id + 1))
-                            .exists()
-                    );
-                    assert!(!temp.path().join(".CURRENT.tmp").exists());
-                    assert_crash_view(&reopened, action, false);
-                    assert_eq!(
-                        reopened.apply(&lease, intent()).unwrap(),
-                        ApplyOutcome::Applied
-                    );
-                    assert_crash_view(&reopened, action, true);
-                }
-                assert_eq!(
-                    reopened.apply(&lease, intent()).unwrap(),
-                    ApplyOutcome::AlreadyApplied
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "storage::tests::child_storage_worker",
+                    "--nocapture",
+                ])
+                .env("LEY_STORAGE_TEST_ACTION", action)
+                .env("LEY_STORAGE_TEST_PATH", temp.path())
+                .env("LEY_STORAGE_FAILPOINT", failpoint);
+            let output = command.output().unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(86),
+                "child did not stop at {failpoint} for {action}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+
+            let expected_generation = old_generation + u64::from(committed_new);
+            let mut verifier = Command::new(std::env::current_exe().unwrap());
+            verifier
+                .args([
+                    "--exact",
+                    "storage::tests::child_storage_worker",
+                    "--nocapture",
+                ])
+                .env("LEY_STORAGE_TEST_ACTION", "verify_crash_snapshot")
+                .env("LEY_STORAGE_TEST_PATH", temp.path())
+                .env("LEY_STORAGE_EXPECT_ACTION", action)
+                .env(
+                    "LEY_STORAGE_EXPECT_NEW",
+                    u8::from(committed_new).to_string(),
+                )
+                .env(
+                    "LEY_STORAGE_EXPECT_GENERATION",
+                    expected_generation.to_string(),
                 );
-                assert_crash_view(&reopened, action, true);
+            let verified = verifier.output().unwrap();
+            assert!(
+                verified.status.success(),
+                "fresh-process verification failed after {failpoint} for {action}: {}",
+                String::from_utf8_lossy(&verified.stderr)
+            );
+        }
+
+        for (failpoint, committed) in [("manifest_write_half", false), ("pointer_rename", true)] {
+            let temp = TempStore::new();
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "storage::tests::child_storage_worker",
+                    "--nocapture",
+                ])
+                .env("LEY_STORAGE_TEST_ACTION", "create")
+                .env("LEY_STORAGE_TEST_PATH", temp.path())
+                .env("LEY_STORAGE_FAILPOINT", failpoint);
+            let output = command.output().unwrap();
+            assert_eq!(output.status.code(), Some(86));
+            if committed {
+                let store = PersistentIndex::open(temp.path()).unwrap();
+                assert_eq!(store.read_view().unwrap().document_count(), 0);
+            } else {
+                assert!(PersistentIndex::open(temp.path()).is_err());
             }
         }
     }

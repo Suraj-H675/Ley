@@ -130,6 +130,88 @@ fn main() -> ExitCode {
             }
         };
     }
+    if command == "compact" {
+        let Some(flag) = args.next() else {
+            eprintln!("compact requires --store PATH");
+            return ExitCode::from(2);
+        };
+        let Some(path) = args.next() else {
+            eprintln!("compact requires a store path");
+            return ExitCode::from(2);
+        };
+        if flag != "--store" || args.next().is_some() {
+            eprintln!("compact accepts only --store PATH");
+            print_usage();
+            return ExitCode::from(2);
+        }
+        return match ley::storage::PersistentIndex::open(&path).and_then(|store| store.compact()) {
+            Ok(report) => {
+                println!(
+                    "Compaction generation {} -> {}; merged {} segments, replaced with {}; removed {} files",
+                    report.old_generation,
+                    report.new_generation,
+                    report.merged_segments.len(),
+                    report.replacement_segments.len(),
+                    report.removed_paths.len()
+                );
+                for segment in &report.merged_segments {
+                    println!(
+                        "  input seg-{}.ley {} {}",
+                        segment.id, segment.byte_len, segment.sha256
+                    );
+                }
+                for segment in &report.replacement_segments {
+                    println!(
+                        "  output seg-{}.ley {} {}",
+                        segment.id, segment.byte_len, segment.sha256
+                    );
+                }
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("ley: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if command == "reindex-gate3" {
+        let mut source = None;
+        let mut destination = None;
+        while let Some(argument) = args.next() {
+            match argument.as_str() {
+                "--source" if source.is_none() => source = args.next(),
+                "--destination" if destination.is_none() => destination = args.next(),
+                _ => {
+                    eprintln!("unknown or repeated reindex-gate3 argument: {argument:?}");
+                    print_usage();
+                    return ExitCode::from(2);
+                }
+            }
+        }
+        let (Some(source), Some(destination)) = (source, destination) else {
+            eprintln!("reindex-gate3 requires --source OLD and --destination NEW");
+            return ExitCode::from(2);
+        };
+        return match ley::storage::PersistentIndex::reindex_gate3(&source, &destination) {
+            Ok(report) => {
+                println!(
+                    "Reindexed Gate 3 generation {} to Gate 6 generation {}: {} documents at {}",
+                    report.source_generation,
+                    report.destination_generation,
+                    report.document_count,
+                    report.destination.display()
+                );
+                println!(
+                    "Stop old writers and switch the configured store path to the destination."
+                );
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("ley: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     if command == "revoke-source" {
         let mut store = None;
         let mut frontier = None;
@@ -288,6 +370,6 @@ fn main() -> ExitCode {
 
 fn print_usage() {
     println!(
-        "Ley Search Engine\n\nUsage:\n  cargo run --locked -- demo [--query EXPR] [--explain]\n  cargo run --locked -- controlled-demo\n  cargo run --locked -- fixture-index --store PATH\n  cargo run --locked -- search --store PATH --query EXPR\n  cargo run --locked -- serve --store PATH [--bind 127.0.0.1:7331]\n  cargo run --locked -- revoke-source --store PATH --frontier PATH --source-id ID\n  cargo run --locked -- crawl-public --policy PATH --store PATH --frontier PATH --requests 1..12 --approved-policy-sha256 HASH --allow-public-requests\n\nThe controlled demo uses its owned loopback fixture. fixture-index creates authored synthetic documents without network access. search opens a persistent store and prints the current generation's ordered results and full score explanations as bounded JSON. serve binds to loopback and exposes read-only health and search routes. revoke-source publishes local tombstones and makes no network requests; earlier immutable generations may retain bytes until compaction. Public crawling requires an enabled reviewed policy and an explicit hash approval. Search queries support terms, phrases, AND, OR, and implicit AND."
+        "Ley Search Engine\n\nUsage:\n  cargo run --locked -- demo [--query EXPR] [--explain]\n  cargo run --locked -- controlled-demo\n  cargo run --locked -- fixture-index --store PATH\n  cargo run --locked -- search --store PATH --query EXPR\n  cargo run --locked -- serve --store PATH [--bind 127.0.0.1:7331]\n  cargo run --locked -- compact --store PATH\n  cargo run --locked -- reindex-gate3 --source OLD --destination NEW\n  cargo run --locked -- revoke-source --store PATH --frontier PATH --source-id ID\n  cargo run --locked -- crawl-public --policy PATH --store PATH --frontier PATH --requests 1..12 --approved-policy-sha256 HASH --allow-public-requests\n\nThe controlled demo uses its owned loopback fixture. fixture-index creates authored synthetic documents without network access. search opens a persistent store and prints the current generation's ordered results and full score explanations as bounded JSON. serve binds to loopback and exposes read-only health and search routes. The Gate 6 store appends immutable segments and compacts them explicitly; some aggregate segment limits recommend `compact` when merging can help, while live-corpus and retained lifecycle-history limits do not because compaction cannot reduce them. reindex-gate3 copies a stopped Gate 3 store to a separate destination and preserves the source bytes. Public crawling requires an enabled reviewed policy and an explicit hash approval. Search queries support terms, phrases, AND, OR, and implicit AND."
     );
 }

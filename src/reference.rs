@@ -1,10 +1,16 @@
-use crate::index::{InMemoryIndex, IndexedDocument};
+use std::collections::BTreeMap;
+
+use crate::index::{
+    FieldScoreExplanation, InMemoryIndex, IndexedDocument, MatchEvidence, ScoreExplanation,
+    SearchResult, StatisticsSource, TermScoreExplanation,
+};
 use crate::query::{Expr, ParsedQuery};
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ReferenceHit {
     pub id: String,
     pub score: f64,
+    pub result: SearchResult,
 }
 
 pub(crate) fn exhaustive_search(index: &InMemoryIndex, query: &ParsedQuery) -> Vec<ReferenceHit> {
@@ -23,13 +29,36 @@ pub(crate) fn exhaustive_search(index: &InMemoryIndex, query: &ParsedQuery) -> V
         .map(|document| document.body_terms.len() as f64)
         .sum::<f64>()
         / count as f64;
+    let mut document_frequencies = BTreeMap::new();
+    for term in &query.score_terms {
+        let title = documents
+            .iter()
+            .filter(|document| {
+                document
+                    .title_terms
+                    .iter()
+                    .any(|candidate| candidate == term)
+            })
+            .count();
+        let body = documents
+            .iter()
+            .filter(|document| {
+                document
+                    .body_terms
+                    .iter()
+                    .any(|candidate| candidate == term)
+            })
+            .count();
+        document_frequencies.insert(term.as_str(), (title, body));
+    }
     let mut hits = Vec::new();
 
     for document in &documents {
-        if !matches_document(&query.root, document) {
+        let Some(matched) = match_evidence(&query.root, document) else {
             continue;
-        }
-        let mut score = 0.0;
+        };
+        let mut total_score = 0.0;
+        let mut term_explanations = Vec::with_capacity(query.score_terms.len());
         for term in &query.score_terms {
             let title_frequency = document
                 .title_terms
@@ -41,38 +70,59 @@ pub(crate) fn exhaustive_search(index: &InMemoryIndex, query: &ParsedQuery) -> V
                 .iter()
                 .filter(|candidate| *candidate == term)
                 .count();
-            if title_frequency > 0 {
-                let title_frequency_documents = documents
-                    .iter()
-                    .filter(|candidate| candidate.title_terms.iter().any(|value| value == term))
-                    .count();
-                score += reference_field_score(
-                    count,
-                    title_frequency_documents,
-                    title_frequency,
-                    document.title_terms.len(),
-                    mean_title_length,
-                    2.0,
-                );
-            }
-            if body_frequency > 0 {
-                let body_frequency_documents = documents
-                    .iter()
-                    .filter(|candidate| candidate.body_terms.iter().any(|value| value == term))
-                    .count();
-                score += reference_field_score(
-                    count,
-                    body_frequency_documents,
-                    body_frequency,
-                    document.body_terms.len(),
-                    mean_body_length,
-                    1.0,
-                );
-            }
+            let (title_df, body_df) = document_frequencies[term.as_str()];
+            let title = reference_field_explanation(
+                count,
+                title_df,
+                title_frequency,
+                document.title_terms.len(),
+                mean_title_length,
+                2.0,
+            );
+            let body = reference_field_explanation(
+                count,
+                body_df,
+                body_frequency,
+                document.body_terms.len(),
+                mean_body_length,
+                1.0,
+            );
+            total_score += title.contribution;
+            total_score += body.contribution;
+            term_explanations.push(TermScoreExplanation {
+                term: term.clone(),
+                title,
+                body,
+            });
         }
+        let explanation = ScoreExplanation {
+            normalized_terms: query.score_terms.clone(),
+            document_count: count,
+            average_title_length: mean_title_length,
+            average_body_length: mean_body_length,
+            statistics_source: StatisticsSource::CurrentInMemoryDocumentView,
+            terms: term_explanations,
+            total_score,
+        };
+        let snippet = document.body.chars().take(160).collect::<String>();
+        let snippet = if document.body.chars().count() > 160 {
+            format!("{snippet}…")
+        } else {
+            snippet
+        };
+        let result = SearchResult {
+            id: document.id.clone(),
+            version_id: document.version_id.clone(),
+            title: document.title.clone(),
+            snippet,
+            score: total_score,
+            matched,
+            explanation,
+        };
         hits.push(ReferenceHit {
             id: document.id.clone(),
-            score,
+            score: total_score,
+            result,
         });
     }
 
@@ -85,49 +135,122 @@ pub(crate) fn exhaustive_search(index: &InMemoryIndex, query: &ParsedQuery) -> V
     hits
 }
 
-fn matches_document(expression: &Expr, document: &IndexedDocument) -> bool {
+fn match_evidence(expression: &Expr, document: &IndexedDocument) -> Option<MatchEvidence> {
     match expression {
         Expr::Term(term) => {
-            document.title_terms.contains(term) || document.body_terms.contains(term)
+            let title_positions = matching_positions(&document.title_terms, term);
+            let body_positions = matching_positions(&document.body_terms, term);
+            (!title_positions.is_empty() || !body_positions.is_empty()).then(|| {
+                MatchEvidence::Term {
+                    term: term.clone(),
+                    title_positions,
+                    body_positions,
+                }
+            })
         }
         Expr::Phrase(phrase) => {
-            phrase_occurs(&document.title_terms, phrase)
-                || phrase_occurs(&document.body_terms, phrase)
+            let title_starts = phrase_starts(&document.title_terms, phrase);
+            let body_starts = phrase_starts(&document.body_terms, phrase);
+            (!title_starts.is_empty() || !body_starts.is_empty()).then(|| MatchEvidence::Phrase {
+                terms: phrase.clone(),
+                title_starts,
+                body_starts,
+            })
         }
-        Expr::And(children) => children
-            .iter()
-            .all(|child| matches_document(child, document)),
-        Expr::Or(children) => children
-            .iter()
-            .any(|child| matches_document(child, document)),
+        Expr::And(children) => {
+            let mut matches = children.iter().map(|child| match_evidence(child, document));
+            let mut evidence = matches.next()??;
+            for next in matches {
+                let next = next?;
+                evidence = combine_and(evidence, next);
+            }
+            Some(evidence)
+        }
+        Expr::Or(children) => {
+            let mut matches = children
+                .iter()
+                .filter_map(|child| match_evidence(child, document));
+            let mut evidence = matches.next()?;
+            for next in matches {
+                evidence = combine_or(evidence, next);
+            }
+            Some(evidence)
+        }
     }
 }
 
-fn phrase_occurs(field: &[String], phrase: &[String]) -> bool {
-    !phrase.is_empty()
-        && field
-            .windows(phrase.len())
-            .any(|window| window.iter().zip(phrase).all(|(left, right)| left == right))
+fn matching_positions(field: &[String], term: &str) -> Vec<u32> {
+    field
+        .iter()
+        .enumerate()
+        .filter(|(_, value)| value.as_str() == term)
+        .map(|(position, _)| u32::try_from(position).expect("bounded document position"))
+        .collect()
 }
 
-fn reference_field_score(
+fn phrase_starts(field: &[String], phrase: &[String]) -> Vec<u32> {
+    if phrase.is_empty() {
+        return Vec::new();
+    }
+    field
+        .windows(phrase.len())
+        .enumerate()
+        .filter(|(_, window)| window.iter().zip(phrase).all(|(left, right)| left == right))
+        .map(|(start, _)| u32::try_from(start).expect("bounded document position"))
+        .collect()
+}
+
+fn combine_and(left: MatchEvidence, right: MatchEvidence) -> MatchEvidence {
+    match left {
+        MatchEvidence::And(mut children) => {
+            children.push(right);
+            MatchEvidence::And(children)
+        }
+        other => MatchEvidence::And(vec![other, right]),
+    }
+}
+
+fn combine_or(left: MatchEvidence, right: MatchEvidence) -> MatchEvidence {
+    match left {
+        MatchEvidence::Or(mut children) => {
+            children.push(right);
+            MatchEvidence::Or(children)
+        }
+        other => MatchEvidence::Or(vec![other, right]),
+    }
+}
+
+fn reference_field_explanation(
     corpus_size: usize,
     field_document_frequency: usize,
     frequency: usize,
     field_length: usize,
     field_mean: f64,
     boost: f64,
-) -> f64 {
-    if frequency == 0 || field_mean == 0.0 {
-        return 0.0;
+) -> FieldScoreExplanation {
+    let inverse_frequency = (1.0
+        + (corpus_size as f64 - field_document_frequency as f64 + 0.5)
+            / (field_document_frequency as f64 + 0.5))
+        .ln();
+    let contribution = if frequency == 0 || field_mean == 0.0 {
+        0.0
+    } else {
+        let k1 = 1.2;
+        let b = 0.75;
+        let term_frequency = frequency as f64;
+        let length_factor = 1.0 - b + b * field_length as f64 / field_mean;
+        boost * inverse_frequency * term_frequency * (k1 + 1.0)
+            / (term_frequency + k1 * length_factor)
+    };
+    FieldScoreExplanation {
+        term_frequency: frequency,
+        document_frequency: field_document_frequency,
+        document_length: field_length,
+        average_length: field_mean,
+        idf: inverse_frequency,
+        weight: boost,
+        contribution,
     }
-    let n = corpus_size as f64;
-    let df = field_document_frequency as f64;
-    let inverse_frequency = (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
-    let tf = frequency as f64;
-    let relative_length = field_length as f64 / field_mean;
-    let denominator = tf + 1.2 * (1.0 - 0.75 + 0.75 * relative_length);
-    boost * inverse_frequency * (tf * 2.2) / denominator
 }
 
 #[cfg(test)]
@@ -169,6 +292,10 @@ mod tests {
             "match set and ordering for {expression:?}"
         );
         for (actual, expected) in actual.iter().zip(expected) {
+            assert_eq!(
+                actual, &expected.result,
+                "full independent result for {expression:?}"
+            );
             assert!(
                 (actual.score - expected.score).abs() <= 1e-12,
                 "score mismatch for {:?} on {expression:?}: {} != {}",

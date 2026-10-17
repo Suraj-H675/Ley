@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { connect, createServer } from "node:net";
 import { once } from "node:events";
+import { PassThrough } from "node:stream";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -10,11 +11,19 @@ import { chromium } from "playwright";
 
 const uiRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const repoRoot = path.resolve(uiRoot, "..");
-const scratch = await mkdtemp(path.join(tmpdir(), "ley-http-e2e-store-"));
-const artifacts = await mkdtemp(path.join(tmpdir(), "ley-http-e2e-browser-"));
-const storePath = path.join(scratch, "index");
+const scratch = process.env.LEY_E2E_STORE_PATH
+  ? undefined
+  : await mkdtemp(path.join(tmpdir(), "ley-http-e2e-store-"));
+const storePath = process.env.LEY_E2E_STORE_PATH
+  ? path.resolve(process.env.LEY_E2E_STORE_PATH)
+  : path.join(scratch, "index");
+const artifacts = process.env.LEY_E2E_ARTIFACT_DIR
+  ? path.resolve(process.env.LEY_E2E_ARTIFACT_DIR)
+  : await mkdtemp(path.join(tmpdir(), "ley-http-e2e-browser-"));
+await mkdir(artifacts, { recursive: true });
 const children = [];
 let browser;
+const RAW_HTTP_TIMEOUT_MS = 4000;
 
 function run(command, args, options = {}) {
   return new Promise((resolve, reject) => {
@@ -41,6 +50,13 @@ async function freePort() {
   return address.port;
 }
 
+async function selectedPort(name) {
+  if (process.env[name] === undefined) return freePort();
+  const port = Number(process.env[name]);
+  assert.ok(Number.isInteger(port) && port > 0 && port <= 65535, `${name} must be a valid TCP port`);
+  return port;
+}
+
 function start(command, args, options = {}) {
   const child = spawn(command, args, { ...options, stdio: ["ignore", "ignore", "pipe"] });
   let stderr = "";
@@ -64,35 +80,63 @@ async function waitForHttp(url) {
   throw new Error(`local server did not become ready at ${url}: ${lastError}`);
 }
 
-async function connectRaw(port) {
-  const socket = connect(port, "127.0.0.1");
-  await once(socket, "connect");
+function createRawResponseReader(socket, timeoutMs = RAW_HTTP_TIMEOUT_MS) {
   let buffered = Buffer.alloc(0);
   let wakeReader;
   let socketError;
+  let socketEnded = false;
+  let socketClosed = false;
+  const wake = () => {
+    wakeReader?.();
+  };
   socket.on("data", (chunk) => {
     buffered = Buffer.concat([buffered, chunk]);
-    wakeReader?.();
-    wakeReader = undefined;
+    wake();
   });
   socket.on("error", (error) => {
     socketError = error;
-    wakeReader?.();
-    wakeReader = undefined;
+    wake();
   });
-  socket.setTimeout(4000, () => socket.destroy(new Error("local HTTP response timed out")));
-
-  async function waitFor(predicate) {
+  socket.on("end", () => {
+    socketEnded = true;
+    wake();
+  });
+  socket.on("close", () => {
+    socketClosed = true;
+    wake();
+  });
+  async function waitFor(predicate, deadline, stage) {
     while (!predicate()) {
       if (socketError) throw socketError;
-      await new Promise((resolve) => { wakeReader = resolve; });
+      if (socketEnded || socketClosed) {
+        throw new Error(`local HTTP socket closed before the complete ${stage}`);
+      }
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) throw new Error(`local HTTP response deadline expired during ${stage}`);
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          if (wakeReader === onWake) wakeReader = undefined;
+          reject(new Error(`local HTTP response deadline expired during ${stage}`));
+        }, remainingMs);
+        const onWake = () => {
+          clearTimeout(timer);
+          if (wakeReader === onWake) wakeReader = undefined;
+          resolve();
+        };
+        wakeReader = onWake;
+        if (predicate() || socketError || socketEnded || socketClosed) onWake();
+      });
     }
   }
 
   return {
     socket,
+    dispose() {
+      socket.destroy();
+    },
     async readResponse() {
-      await waitFor(() => buffered.indexOf("\r\n\r\n") >= 0);
+      const deadline = Date.now() + timeoutMs;
+      await waitFor(() => buffered.indexOf("\r\n\r\n") >= 0, deadline, "response headers");
       const boundary = buffered.indexOf("\r\n\r\n");
       const header = buffered.subarray(0, boundary).toString("latin1");
       const lengthLine = header.split("\r\n").find((line) => /^content-length:/i.test(line));
@@ -100,13 +144,65 @@ async function connectRaw(port) {
       const bodyLength = Number(lengthLine.split(":", 2)[1].trim());
       assert.ok(Number.isSafeInteger(bodyLength) && bodyLength >= 0 && bodyLength <= 1024 * 1024);
       const bodyStart = boundary + 4;
-      await waitFor(() => buffered.length >= bodyStart + bodyLength);
+      await waitFor(() => buffered.length >= bodyStart + bodyLength, deadline, "response body");
       const status = Number(header.split("\r\n", 1)[0].split(" ", 2)[1]);
       const body = buffered.subarray(bodyStart, bodyStart + bodyLength).toString("utf8");
       buffered = buffered.subarray(bodyStart + bodyLength);
       return { status, header, body };
     },
   };
+}
+
+async function connectRaw(port, timeoutMs = RAW_HTTP_TIMEOUT_MS) {
+  const socket = connect(port, "127.0.0.1");
+  const reader = createRawResponseReader(socket, timeoutMs);
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      socket.destroy();
+      reject(new Error("local HTTP connection timed out"));
+    }, timeoutMs);
+    const onError = (error) => {
+      clearTimeout(timer);
+      reject(error);
+    };
+    socket.once("error", onError);
+    socket.once("connect", () => {
+      clearTimeout(timer);
+      socket.removeListener("error", onError);
+      resolve();
+    });
+  });
+  socket.setTimeout(RAW_HTTP_TIMEOUT_MS, () => socket.destroy(new Error("local HTTP response timed out")));
+  return reader;
+}
+
+async function verifyRawReaderFailures() {
+  const eofSocket = new PassThrough();
+  const eofReader = createRawResponseReader(eofSocket);
+  const eofResponse = eofReader.readResponse();
+  eofSocket.end();
+  await assert.rejects(eofResponse, /closed before the complete response headers/);
+  eofReader.dispose();
+
+  const truncatedSocket = new PassThrough();
+  const truncatedReader = createRawResponseReader(truncatedSocket);
+  const truncatedResponse = truncatedReader.readResponse();
+  truncatedSocket.write("HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nxy");
+  truncatedSocket.end();
+  await assert.rejects(truncatedResponse, /closed before the complete response body/);
+  truncatedReader.dispose();
+
+  const timeoutReader = createRawResponseReader(new PassThrough(), 50);
+  await assert.rejects(timeoutReader.readResponse(), /deadline expired during response headers/);
+  timeoutReader.dispose();
+
+  const errorSocket = new PassThrough();
+  const errorReader = createRawResponseReader(errorSocket);
+  const errorResponse = errorReader.readResponse();
+  errorSocket.destroy(new Error("owned raw-socket error check"));
+  await assert.rejects(errorResponse, /owned raw-socket error check/);
+  errorReader.dispose();
+  console.log("Raw HTTP EOF, truncated-body, socket-error, and deadline checks passed.");
 }
 
 async function chromiumExecutable() {
@@ -150,14 +246,25 @@ async function stopChildren() {
 }
 
 try {
+  await verifyRawReaderFailures();
   await run("cargo", ["build", "--locked", "--offline", "--bin", "ley"], { cwd: repoRoot });
   const ley = path.join(repoRoot, "target", "debug", "ley");
-  await run(ley, ["fixture-index", "--store", storePath], { cwd: repoRoot });
+  let storeExists = true;
+  try {
+    await access(storePath);
+  } catch {
+    storeExists = false;
+  }
+  if (storeExists) {
+    assert.equal(process.env.LEY_E2E_REUSE_STORE, "1", "refusing to overwrite an existing fixture index");
+  } else {
+    await run(ley, ["fixture-index", "--store", storePath], { cwd: repoRoot });
+  }
   const cli = JSON.parse(await run(ley, ["search", "--store", storePath, "--query", "rust"], { cwd: repoRoot }));
   assert.equal(cli.corpusSize, 3);
 
-  const apiPort = await freePort();
-  const uiPort = await freePort();
+  const apiPort = await selectedPort("LEY_E2E_API_PORT");
+  const uiPort = await selectedPort("LEY_E2E_UI_PORT");
   const uiOrigin = `http://127.0.0.1:${uiPort}`;
   const apiOrigin = `http://127.0.0.1:${apiPort}`;
   const apiServer = start(ley, ["serve", "--store", storePath, "--bind", `127.0.0.1:${apiPort}`], { cwd: repoRoot });
@@ -170,7 +277,8 @@ try {
 
   const apiResponse = await fetch(`${apiOrigin}/api/search?q=rust`);
   assert.equal(apiResponse.status, 200);
-  assert.deepEqual(await apiResponse.json(), cli, "persistent CLI and HTTP API JSON must match");
+  const apiRustSearch = await apiResponse.json();
+  assert.deepEqual(apiRustSearch, cli, "persistent CLI and HTTP API JSON must match");
 
   for (const [port, target] of [[apiPort, "/api/search?q=rust"], [uiPort, "/api/search?q=rust"]]) {
     for (const headers of [
@@ -178,24 +286,33 @@ try {
       `Host: 127.0.0.1:${port}\r\nOrigin: http://attacker.example`,
     ]) {
       const socket = await connectRaw(port);
-      socket.socket.end(`GET ${target} HTTP/1.1\r\n${headers}\r\nConnection: close\r\n\r\n`);
-      const denied = await socket.readResponse();
-      assert.equal(denied.status, 403);
-      assert.doesNotMatch(denied.body, /fixtures\.ley\.test|Rust in Ley/);
+      try {
+        socket.socket.write(`GET ${target} HTTP/1.1\r\n${headers}\r\nConnection: close\r\n\r\n`);
+        const denied = await socket.readResponse();
+        assert.equal(denied.status, 403);
+        assert.doesNotMatch(denied.body, /fixtures\.ley\.test|Rust in Ley/);
+      } finally {
+        socket.dispose();
+      }
     }
   }
 
   const malformedSocket = await connectRaw(uiPort);
-  malformedSocket.socket.write(`GET http://[bad HTTP/1.1\r\nHost: 127.0.0.1:${uiPort}\r\nConnection: keep-alive\r\n\r\n`);
-  const malformed = await malformedSocket.readResponse();
-  assert.equal(malformed.status, 400);
-  assert.ok(Buffer.byteLength(malformed.body) <= 128);
-  malformedSocket.socket.write(`GET / HTTP/1.1\r\nHost: 127.0.0.1:${uiPort}\r\nConnection: keep-alive\r\n\r\n`);
-  assert.equal((await malformedSocket.readResponse()).status, 200);
-  malformedSocket.socket.destroy();
+  try {
+    malformedSocket.socket.write(`GET http://[bad HTTP/1.1\r\nHost: 127.0.0.1:${uiPort}\r\nConnection: keep-alive\r\n\r\n`);
+    const malformed = await malformedSocket.readResponse();
+    assert.equal(malformed.status, 400);
+    assert.ok(Buffer.byteLength(malformed.body) <= 128);
+    malformedSocket.socket.write(`GET / HTTP/1.1\r\nHost: 127.0.0.1:${uiPort}\r\nConnection: keep-alive\r\n\r\n`);
+    assert.equal((await malformedSocket.readResponse()).status, 200);
+  } finally {
+    malformedSocket.dispose();
+  }
 
   const browserRequests = [];
   const browserErrors = [];
+  const browserResults = [];
+  const screenshotPaths = [];
   browser = await chromium.launch({
     executablePath: await chromiumExecutable(),
     headless: true,
@@ -217,13 +334,23 @@ try {
     assert.ok((await page.locator(".result-title").allTextContents()).includes(body.results[0].title));
     assert.equal(body.generation, body.results[0].explanation.statisticsSource.generation);
     assert.equal(body.results[0].score, body.results[0].explanation.totalScore);
+    browserResults.push({
+      query,
+      generation: body.generation,
+      corpusSize: body.corpusSize,
+      resultIds: body.results.map((result) => result.id),
+      topScore: body.results[0].score,
+      topExplanation: body.results[0].explanation,
+    });
     assert.equal(await page.locator(".results-section img,.results-section script,.results-section [onerror]").count(), 0);
     await page.locator("details").first().evaluate((element) => { element.open = true; });
     for (const width of [1280, 700, 390, 320]) {
       await page.setViewportSize({ width, height: 900 });
       const scrollWidth = await page.evaluate(() => document.documentElement.scrollWidth);
       assert.ok(scrollWidth <= width, `${query} at ${width}px has horizontal overflow (${scrollWidth}px)`);
-      await page.screenshot({ path: path.join(artifacts, `${query}-${width}.png`), fullPage: true });
+      const screenshot = path.join(artifacts, `${query}-${width}.png`);
+      await page.screenshot({ path: screenshot, fullPage: true });
+      screenshotPaths.push(screenshot);
     }
   }
   await input.fill('"');
@@ -237,14 +364,27 @@ try {
   assert.match(await notice.text(), /MIT License/);
   assert.equal(apiServer.child.exitCode, null);
   assert.equal(uiServer.child.exitCode, null);
+  await writeFile(path.join(artifacts, "results.json"), JSON.stringify({
+    storePath,
+    generation: cli.generation,
+    cliRustSearch: cli,
+    apiRustSearch,
+    browserResults,
+    viewportWidths: [1280, 700, 390, 320],
+    malformedQueryStatus: "alert shown",
+    browserRequests,
+    browserErrors,
+    noticeStatus: notice.status,
+    screenshots: screenshotPaths,
+  }, null, 2));
   console.log(`Real Chromium HTTP path passed: UI ${uiOrigin} -> API ${apiOrigin} -> generation ${cli.generation}.`);
-  console.log(`Queries rust, bm25, adversarial, and malformed-query error passed. Screenshots: ${artifacts}`);
+  console.log(`Queries rust, bm25, adversarial, and malformed-query error passed. Screenshots and results: ${artifacts}`);
 } catch (error) {
   console.error(`Real browser HTTP verification failed. UI and API use only 127.0.0.1. ${error.message}`);
   throw error;
 } finally {
   if (browser) await browser.close();
   await stopChildren();
-  await rm(scratch, { recursive: true, force: true });
+  if (scratch) await rm(scratch, { recursive: true, force: true });
   console.log(`local servers stopped; browser artifacts retained at ${artifacts}`);
 }

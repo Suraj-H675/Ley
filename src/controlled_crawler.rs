@@ -728,6 +728,11 @@ impl FrontierDb {
                 backoff_until_ms INTEGER NOT NULL DEFAULT 0,
                 failures INTEGER NOT NULL DEFAULT 0
             );
+            CREATE TABLE IF NOT EXISTS robots_inflight (
+                candidate_key TEXT PRIMARY KEY REFERENCES frontier(url_key) ON DELETE CASCADE,
+                origins TEXT NOT NULL,
+                min_origin_delay_ms INTEGER NOT NULL CHECK(min_origin_delay_ms >= 0)
+            );
             CREATE TABLE IF NOT EXISTS outbox (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 url_key TEXT NOT NULL,
@@ -760,7 +765,7 @@ impl FrontierDb {
                 key TEXT PRIMARY KEY,
                 value BLOB NOT NULL
             );
-            PRAGMA user_version=4;",
+            PRAGMA user_version=5;",
         )?;
         conn.execute(
             "INSERT OR IGNORE INTO frontier_meta(key,value) VALUES ('index_store_id',?1)",
@@ -1378,7 +1383,8 @@ fn robot_failure(
 #[derive(Default)]
 struct OriginActivity {
     active: usize,
-    next_start: Option<Instant>,
+    active_with_delay: usize,
+    quiet_until: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -1390,6 +1396,7 @@ struct OriginLimiter {
 struct OriginPermit {
     limiter: Arc<OriginLimiter>,
     origin: String,
+    min_delay: Duration,
 }
 
 impl OriginLimiter {
@@ -1411,14 +1418,21 @@ impl OriginLimiter {
             let state = activity.entry(origin.to_owned()).or_default();
             let now = Instant::now();
             let delay = state
-                .next_start
+                .quiet_until
                 .map_or(Duration::ZERO, |next| next.saturating_duration_since(now));
-            if state.active < per_origin_active && delay.is_zero() {
+            let spacing_active = !min_delay.is_zero() || state.active_with_delay > 0;
+            let active_slot = if spacing_active {
+                state.active == 0
+            } else {
+                state.active < per_origin_active
+            };
+            if active_slot && delay.is_zero() {
                 state.active += 1;
-                state.next_start = Some(now + min_delay);
+                state.active_with_delay += usize::from(!min_delay.is_zero());
                 return Ok(OriginPermit {
                     limiter: Arc::clone(self),
                     origin: origin.to_owned(),
+                    min_delay,
                 });
             }
             let wait_for = if delay.is_zero() {
@@ -1440,6 +1454,15 @@ impl Drop for OriginPermit {
         if let Ok(mut activity) = self.limiter.activity.lock() {
             if let Some(state) = activity.get_mut(&self.origin) {
                 state.active = state.active.saturating_sub(1);
+                if !self.min_delay.is_zero() {
+                    state.active_with_delay = state.active_with_delay.saturating_sub(1);
+                    let quiet_until = Instant::now() + self.min_delay;
+                    state.quiet_until = Some(
+                        state
+                            .quiet_until
+                            .map_or(quiet_until, |existing| existing.max(quiet_until)),
+                    );
+                }
             }
             self.limiter.changed.notify_all();
         }
@@ -2615,6 +2638,14 @@ where
                 "UPDATE source_policy SET request_count=request_count+?2 WHERE source_id=?1",
                 params![policy.id, request_budget as i64],
             )?;
+            tx.execute(
+                "INSERT INTO robots_inflight(candidate_key,origins,min_origin_delay_ms) VALUES (?1,?2,?3)",
+                params![
+                    candidate.key.as_str(),
+                    policy.allowed_origins.join("\n"),
+                    policy.min_origin_delay_ms.min(MAX_RETRY_MS) as i64,
+                ],
+            )?;
             FrontierDb::event(
                 &tx,
                 now,
@@ -2923,6 +2954,7 @@ where
     ) -> Result<usize, CrawlError> {
         match result {
             WorkerResult::Page { job, result } => {
+                self.record_page_completion(&job)?;
                 if !self.page_job_is_current(&job)? {
                     return Ok(1);
                 }
@@ -2963,12 +2995,11 @@ where
                     Err(result) => (result.requests, result.wire_bytes, result.decoded_bytes),
                 };
                 let unused = job.request_budget.saturating_sub(requests);
-                let tx = self.db.transaction()?;
-                tx.execute(
-                    "UPDATE source_policy SET request_count=MAX(0,request_count-?2) WHERE source_id=?1",
-                    params![job.source.id, unused as i64],
-                )?;
-                tx.commit()?;
+                let visited_origins = match &result {
+                    Ok(result) => result.visited_origins.as_slice(),
+                    Err(result) => result.visited_origins.as_slice(),
+                };
+                self.finish_robots_attempt(&job, visited_origins, unused)?;
                 report.compressed_bytes = report.compressed_bytes.saturating_add(wire_bytes);
                 report.decompressed_bytes = report.decompressed_bytes.saturating_add(decoded_bytes);
                 if report.compressed_bytes > self.limits.max_wire_bytes_per_run
@@ -2986,6 +3017,43 @@ where
                 Ok(requests)
             }
         }
+    }
+
+    fn record_page_completion(&mut self, job: &PageJob) -> Result<(), CrawlError> {
+        let now = self.clock.now_ms();
+        let due = now.saturating_add(job.source.min_origin_delay_ms.min(MAX_RETRY_MS));
+        self.db.conn.execute(
+            "INSERT INTO origin_state(origin,next_request_ms,backoff_until_ms,failures) VALUES (?1,?2,0,0) ON CONFLICT(origin) DO UPDATE SET next_request_ms=MAX(next_request_ms,excluded.next_request_ms)",
+            params![origin_of_url(&job.url), due as i64],
+        )?;
+        Ok(())
+    }
+
+    fn finish_robots_attempt(
+        &mut self,
+        job: &RobotsJob,
+        visited_origins: &[String],
+        unused_requests: usize,
+    ) -> Result<(), CrawlError> {
+        let now = self.clock.now_ms();
+        let due = now.saturating_add(job.source.min_origin_delay_ms.min(MAX_RETRY_MS));
+        let tx = self.db.transaction()?;
+        tx.execute(
+            "UPDATE source_policy SET request_count=MAX(0,request_count-?2) WHERE source_id=?1",
+            params![job.source.id, unused_requests as i64],
+        )?;
+        for origin in std::iter::once(&job.origin).chain(visited_origins) {
+            tx.execute(
+                "INSERT INTO origin_state(origin,next_request_ms,backoff_until_ms,failures) VALUES (?1,?2,0,0) ON CONFLICT(origin) DO UPDATE SET next_request_ms=MAX(next_request_ms,excluded.next_request_ms)",
+                params![origin, due as i64],
+            )?;
+        }
+        tx.execute(
+            "DELETE FROM robots_inflight WHERE candidate_key=?1",
+            [job.candidate_key.as_str()],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     fn handle_page_response(
@@ -4039,10 +4107,72 @@ where
     fn recover_abandoned_fetches(&mut self) -> Result<(), CrawlError> {
         let now = self.clock.now_ms();
         let tx = self.db.transaction()?;
+        let abandoned_pages = {
+            let mut statement = tx.prepare(
+                "SELECT f.fetch_url,s.min_origin_delay_ms FROM frontier f LEFT JOIN source_policy s ON s.source_id=f.source_id WHERE f.state='inflight'",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for (fetch_url, stored_delay) in abandoned_pages {
+            let delay = stored_delay
+                .and_then(|value| u64::try_from(value).ok())
+                .ok_or_else(|| {
+                    CrawlError::Policy("inflight page has invalid source delay".to_owned())
+                })?
+                .min(MAX_RETRY_MS);
+            let url = Url::parse(&fetch_url).map_err(|error| CrawlError::Url(error.to_string()))?;
+            let origin = origin_of_url(&url);
+            tx.execute(
+                "INSERT INTO origin_state(origin,next_request_ms,backoff_until_ms,failures) VALUES (?1,?2,0,0) ON CONFLICT(origin) DO UPDATE SET next_request_ms=MAX(next_request_ms,excluded.next_request_ms)",
+                params![origin, now.saturating_add(delay) as i64],
+            )?;
+        }
+        let abandoned_robots = {
+            let mut statement = tx.prepare(
+                "SELECT origins,min_origin_delay_ms FROM robots_inflight ORDER BY candidate_key",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for (origins, stored_delay) in abandoned_robots {
+            let delay = u64::try_from(stored_delay)
+                .map_err(|_| {
+                    CrawlError::Policy("robots marker has invalid origin delay".to_owned())
+                })?
+                .min(MAX_RETRY_MS);
+            let origins: Vec<&str> = origins.lines().collect();
+            if origins.is_empty() || origins.len() > MAX_ORIGINS {
+                return Err(CrawlError::Policy(
+                    "robots marker has an invalid admitted-origin snapshot".to_owned(),
+                ));
+            }
+            for origin in origins {
+                let url = Url::parse(origin).map_err(|error| CrawlError::Url(error.to_string()))?;
+                if origin_of_url(&url) != origin
+                    || url.path() != "/"
+                    || url.query().is_some()
+                    || url.fragment().is_some()
+                {
+                    return Err(CrawlError::Policy(
+                        "robots marker contains a non-canonical origin".to_owned(),
+                    ));
+                }
+                tx.execute(
+                    "INSERT INTO origin_state(origin,next_request_ms,backoff_until_ms,failures) VALUES (?1,?2,0,0) ON CONFLICT(origin) DO UPDATE SET next_request_ms=MAX(next_request_ms,excluded.next_request_ms)",
+                    params![origin, now.saturating_add(delay) as i64],
+                )?;
+            }
+        }
         tx.execute(
             "UPDATE frontier SET state='ready',fetch_url=url_key,schedule_id=NULL,lease_token=NULL,attempts=0,redirect_count=0,redirect_seen=url_key,reason='recovered abandoned network lease; replacement gets a higher index fence' WHERE state='inflight'",
             [],
         )?;
+        tx.execute("DELETE FROM robots_inflight", [])?;
         FrontierDb::event(
             &tx,
             now,
@@ -4112,12 +4242,11 @@ where
                     .insert(job.candidate_key.clone(), one_shot_cache);
             }
         }
-        let min_delay = job.source.min_origin_delay_ms.min(MAX_RETRY_MS);
         let tx = self.db.transaction()?;
         for origin in result.visited_origins {
             tx.execute(
-                "INSERT INTO origin_state(origin,next_request_ms,backoff_until_ms,failures) VALUES (?1,?2,0,0) ON CONFLICT(origin) DO UPDATE SET next_request_ms=MAX(next_request_ms,excluded.next_request_ms),backoff_until_ms=0,failures=0",
-                params![origin, now.saturating_add(min_delay) as i64],
+                "UPDATE origin_state SET backoff_until_ms=0,failures=0 WHERE origin=?1",
+                [origin],
             )?;
         }
         FrontierDb::event(
@@ -4141,7 +4270,7 @@ where
         report.skipped(failure.reason.clone());
         report.failure(&failure.reason);
         let now = self.clock.now_ms();
-        let (next_request, backoff, failures) = self.origin_state(&job.origin)?;
+        let (_, backoff, failures) = self.origin_state(&job.origin)?;
         let failure_count = failures.saturating_add(1).min(16);
         let exp = DEFAULT_RETRY_MS
             .saturating_mul(1u64 << (failure_count as u32).min(16))
@@ -4157,8 +4286,8 @@ where
             params![job.origin, retry as i64, failure.reason],
         )?;
         tx.execute(
-            "INSERT INTO origin_state(origin,next_request_ms,backoff_until_ms,failures) VALUES (?1,?2,?3,?4) ON CONFLICT(origin) DO UPDATE SET backoff_until_ms=MAX(backoff_until_ms,excluded.backoff_until_ms),failures=excluded.failures",
-            params![job.origin, next_request.max(now.saturating_add(job.source.min_origin_delay_ms)) as i64, backoff.max(retry) as i64, failure_count as i64],
+            "UPDATE origin_state SET backoff_until_ms=MAX(backoff_until_ms,?2),failures=?3 WHERE origin=?1",
+            params![job.origin, backoff.max(retry) as i64, failure_count as i64],
         )?;
         FrontierDb::event(
             &tx,
@@ -4168,12 +4297,6 @@ where
             "robots_denied",
             &failure.reason,
         )?;
-        for origin in failure.visited_origins {
-            tx.execute(
-                "INSERT INTO origin_state(origin,next_request_ms,backoff_until_ms,failures) VALUES (?1,?2,0,0) ON CONFLICT(origin) DO UPDATE SET next_request_ms=MAX(next_request_ms,excluded.next_request_ms)",
-                params![origin, now.saturating_add(job.source.min_origin_delay_ms) as i64],
-            )?;
-        }
         tx.commit()?;
         Ok(())
     }
@@ -4256,6 +4379,8 @@ mod tests {
     struct AnswerSetResolver {
         answers: Arc<Vec<Vec<std::net::SocketAddr>>>,
         next: Arc<std::sync::atomic::AtomicUsize>,
+        delayed_call: Option<(usize, Duration)>,
+        observations: Arc<Mutex<Vec<(usize, Instant, Instant)>>>,
     }
 
     impl AnswerSetResolver {
@@ -4263,13 +4388,30 @@ mod tests {
             Self {
                 answers: Arc::new(answers),
                 next: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                delayed_call: None,
+                observations: Arc::new(Mutex::new(Vec::new())),
             }
+        }
+
+        fn delay_call(mut self, call: usize, delay: Duration) -> Self {
+            self.delayed_call = Some((call, delay));
+            self
         }
     }
 
     impl DestinationResolver for AnswerSetResolver {
         fn resolve(&self, _host: &str, _port: u16) -> std::io::Result<Vec<std::net::SocketAddr>> {
             let index = self.next.fetch_add(1, Ordering::SeqCst);
+            let started = Instant::now();
+            if let Some((delayed_call, delay)) = self.delayed_call
+                && index == delayed_call
+            {
+                thread::sleep(delay);
+            }
+            self.observations
+                .lock()
+                .unwrap()
+                .push((index, started, Instant::now()));
             self.answers
                 .get(index)
                 .or_else(|| self.answers.last())
@@ -4443,6 +4585,27 @@ mod tests {
         Arc<PersistentIndex>,
         ControlledCrawler<AnswerSetResolver, SystemClock>,
     ) {
+        open_public_tls_crawler_at_origin_with_resolver(
+            temp,
+            fixture,
+            AnswerSetResolver::new(answers),
+            limits,
+            source,
+            origin,
+        )
+    }
+
+    fn open_public_tls_crawler_at_origin_with_resolver(
+        temp: &TestDir,
+        fixture: &crate::safe_fetch::tls_test_support::Fixture,
+        resolver: AnswerSetResolver,
+        limits: CrawlLimits,
+        source: PublicTlsSourceSpec,
+        origin: String,
+    ) -> (
+        Arc<PersistentIndex>,
+        ControlledCrawler<AnswerSetResolver, SystemClock>,
+    ) {
         let origin_url = Url::parse(&format!("{origin}/")).unwrap();
         let canonical_origin = origin_of_url(&origin_url);
         let authority = crate::safe_fetch::PublicAuthority::from_origin(&origin_url)
@@ -4470,7 +4633,7 @@ mod tests {
         let mut crawler = ControlledCrawler::open_with_public(
             &frontier_path,
             Arc::clone(&index),
-            AnswerSetResolver::new(answers),
+            resolver,
             Vec::new(),
             vec![authority],
             limits,
@@ -4487,6 +4650,92 @@ mod tests {
         let seed = UrlKey::parse(&format!("{}{}", origin, source.seed_path)).unwrap();
         crawler.admit_source(policy, &[seed]).unwrap();
         (index, crawler)
+    }
+
+    #[test]
+    fn public_crawl_spacing_does_not_expire_during_dns_resolution() {
+        let host = "public.example.org";
+        let fixture = crate::safe_fetch::tls_test_support::Fixture::start(
+            host,
+            BTreeMap::from([
+                (
+                    "/robots.txt".to_owned(),
+                    crate::safe_fetch::tls_test_support::Response::text(
+                        "User-agent: LeyBot\nAllow: /\n",
+                    ),
+                ),
+                (
+                    "/page".to_owned(),
+                    crate::safe_fetch::tls_test_support::Response::html(
+                        "<title>First page</title><a href=\"/second\">Second</a>",
+                    ),
+                ),
+                (
+                    "/second".to_owned(),
+                    crate::safe_fetch::tls_test_support::Response::html(
+                        "<title>Second page</title>",
+                    ),
+                ),
+            ]),
+        );
+        let temp = TestDir::new();
+        let origin = format!("https://{host}");
+        let resolver = AnswerSetResolver::new(vec![vec![fixture.address]])
+            .delay_call(1, Duration::from_millis(400));
+        let observed_resolver = resolver.clone();
+        let (index, mut crawler) = open_public_tls_crawler_at_origin_with_resolver(
+            &temp,
+            &fixture,
+            resolver,
+            CrawlLimits::default(),
+            PublicTlsSourceSpec {
+                id: "tls-delayed-resolver-spacing",
+                seed_path: "/page",
+                max_requests: 6,
+                min_origin_delay_ms: 200,
+            },
+            origin,
+        );
+
+        let result = run_bounded_crawl(
+            &mut crawler,
+            6,
+            12 * MAX_COMPRESSED_RESPONSE_BYTES,
+            32 * MAX_DECODED_RESPONSE_BYTES,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+
+        assert_eq!(result.report.requests, 3);
+        assert_eq!(result.report.pages_fetched, 2);
+        assert_eq!(index.query("First OR Second").unwrap().len(), 2);
+        let resolutions = observed_resolver.observations.lock().unwrap().clone();
+        assert_eq!(resolutions.len(), 3);
+        assert_eq!(resolutions[1].0, 1);
+        assert!(
+            resolutions[1].2.duration_since(resolutions[1].1) >= Duration::from_millis(400),
+            "the page resolver call must consume the configured 400ms delay"
+        );
+        let inflight_robots: i64 = crawler
+            .db
+            .conn
+            .query_row("SELECT COUNT(*) FROM robots_inflight", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            inflight_robots, 0,
+            "completed robots work clears its marker"
+        );
+        let starts = fixture.request_starts();
+        assert_eq!(starts.len(), 3);
+        let page_to_second = starts[2].duration_since(starts[1]);
+        eprintln!(
+            "resolver_delay={:?}; server_arrival_gap={page_to_second:?}; configured_delay=200ms",
+            resolutions[1].2.duration_since(resolutions[1].1)
+        );
+        assert!(
+            page_to_second >= Duration::from_millis(180),
+            "server saw /page then /second after {page_to_second:?}; min_origin_delay_ms is 200"
+        );
     }
 
     #[test]
@@ -8587,6 +8836,23 @@ mod tests {
                 std::slice::from_ref(&key),
             )
             .unwrap();
+        let origin = origin_of_url(&key.to_url().unwrap());
+        crawler
+            .db
+            .conn
+            .execute(
+                "UPDATE source_policy SET min_origin_delay_ms=250 WHERE source_id='frontier-restart'",
+                [],
+            )
+            .unwrap();
+        crawler
+            .db
+            .conn
+            .execute(
+                "INSERT INTO origin_state(origin,next_request_ms,backoff_until_ms,failures) VALUES (?1,99000,0,0)",
+                [&origin],
+            )
+            .unwrap();
         let stale_lease = index.issue_fence(&key).unwrap();
         let stale_token = index.export_lease(&stale_lease).unwrap();
         crawler
@@ -8600,7 +8866,7 @@ mod tests {
         drop(crawler);
 
         let mut recovered =
-            open_fixture_crawler(&frontier_path, Arc::clone(&index), &fixture, clock);
+            open_fixture_crawler(&frontier_path, Arc::clone(&index), &fixture, clock.clone());
         let (state, schedule, token): (String, Option<i64>, Option<Vec<u8>>) = recovered
             .db
             .conn
@@ -8613,6 +8879,26 @@ mod tests {
         assert_eq!(state, "ready");
         assert!(schedule.is_none());
         assert!(token.is_none());
+        let recovered_due: i64 = recovered
+            .db
+            .conn
+            .query_row(
+                "SELECT next_request_ms FROM origin_state WHERE origin=?1",
+                [&origin],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(recovered_due, 100_250);
+        clock.set(100_250);
+        assert_eq!(
+            recovered
+                .run_until_idle(&CrawlCancellation::default())
+                .unwrap()
+                .requests,
+            1,
+            "recovered work refreshes robots before the page request"
+        );
+        clock.set(100_500);
         assert_eq!(
             recovered
                 .run_until_idle(&CrawlCancellation::default())
@@ -8634,6 +8920,133 @@ mod tests {
         ));
         assert_eq!(index.query("frontier").unwrap().len(), 1);
         assert_reference_parity(&index, &[key.as_str().to_owned()], "frontier AND restart");
+    }
+
+    #[test]
+    fn abandoned_robots_refresh_recovers_quiet_period_for_all_admitted_origins() {
+        let alias = "robots-recovery-hop.fixture.test";
+        let fixture = LocalFixture::start_with_origin(|origin| {
+            let port = Url::parse(origin.url("/").unwrap().as_str())
+                .unwrap()
+                .port()
+                .unwrap();
+            vec![(
+                "/robots.txt".to_owned(),
+                FixtureResponse::redirect(format!("http://{alias}:{port}/hop")),
+            )]
+        })
+        .unwrap();
+        let original_origin = fixture.base_url().origin().ascii_serialization();
+        let port = fixture.base_url().port().unwrap();
+        let endpoint: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let mut mapping = BTreeMap::from([("127.0.0.1".to_owned(), vec![endpoint])]);
+        mapping.insert(alias.to_owned(), vec![endpoint]);
+        let mut capabilities = vec![fixture.capability()];
+        capabilities.push(
+            fixture
+                .capability()
+                .named_for_host(alias)
+                .expect("alias of an owned listener"),
+        );
+        let redirected_origin = format!("http://{alias}:{port}");
+        let origins = vec![original_origin, redirected_origin];
+        let temp = TestDir::new();
+        let index = Arc::new(PersistentIndex::create(temp.path().join("index")).unwrap());
+        let frontier_path = temp.path().join("frontier.sqlite");
+        let clock = ManualClock::new(200_000);
+        let resolver = FixtureResolver(Arc::new(mapping));
+        let mut crawler = ControlledCrawler::open(
+            &frontier_path,
+            Arc::clone(&index),
+            resolver.clone(),
+            capabilities.clone(),
+            CrawlLimits::default(),
+            clock.clone(),
+        )
+        .unwrap();
+        let mut source = SourcePolicy::owned_fixture(
+            "robots-recovery",
+            origins.clone(),
+            vec!["/".to_owned()],
+            1_000_000,
+        );
+        source.min_origin_delay_ms = 250;
+        let seed = fixture_seed(&fixture, "/");
+        crawler
+            .admit_source(source, std::slice::from_ref(&seed))
+            .unwrap();
+        drop(crawler);
+        let legacy = Connection::open(&frontier_path).unwrap();
+        legacy
+            .execute_batch("DROP TABLE robots_inflight; PRAGMA user_version=4;")
+            .unwrap();
+        drop(legacy);
+        let mut crawler = ControlledCrawler::open(
+            &frontier_path,
+            Arc::clone(&index),
+            resolver.clone(),
+            capabilities.clone(),
+            CrawlLimits::default(),
+            clock.clone(),
+        )
+        .unwrap();
+        let preserved_sources: i64 = crawler
+            .db
+            .conn
+            .query_row("SELECT COUNT(*) FROM source_policy", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(preserved_sources, 1);
+        let mut report = CrawlReport::default();
+        let job = crawler
+            .next_job(&mut report, 0, 0, 1, &HashMap::new(), &HashSet::new())
+            .unwrap()
+            .expect("robots refresh should be dispatched first");
+        assert!(matches!(&job, WorkerJob::Robots(_)));
+        let marker_count: i64 = crawler
+            .db
+            .conn
+            .query_row("SELECT COUNT(*) FROM robots_inflight", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(marker_count, 1);
+        drop(job);
+        drop(crawler);
+
+        let recovered = ControlledCrawler::open(
+            &frontier_path,
+            index,
+            resolver,
+            capabilities,
+            CrawlLimits::default(),
+            clock,
+        )
+        .unwrap();
+        assert_eq!(
+            recovered
+                .db
+                .conn
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            5
+        );
+        for origin in origins {
+            let due: i64 = recovered
+                .db
+                .conn
+                .query_row(
+                    "SELECT next_request_ms FROM origin_state WHERE origin=?1",
+                    [&origin],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(due, 200_250, "restart must quiet admitted origin {origin}");
+        }
+        let marker_count: i64 = recovered
+            .db
+            .conn
+            .query_row("SELECT COUNT(*) FROM robots_inflight", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(marker_count, 0);
+        assert_eq!(fixture.accepted_connections(), 0);
     }
 
     #[test]

@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::BTreeMap;
 
 use sha2::{Digest, Sha256};
@@ -26,6 +28,21 @@ pub struct IndexedDocument {
     pub title_terms: Vec<String>,
     pub body_terms: Vec<String>,
     pub version_id: String,
+}
+
+#[cfg(test)]
+thread_local! {
+    static FULL_POSTING_BUILDS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_full_posting_build_count() {
+    FULL_POSTING_BUILDS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn full_posting_build_count() -> usize {
+    FULL_POSTING_BUILDS.with(Cell::get)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -220,37 +237,18 @@ impl InMemoryIndex {
         &self,
         query: &ParsedQuery,
     ) -> Result<Vec<SearchResult>, QueryError> {
-        if self.documents.is_empty() {
-            return Ok(Vec::new());
-        }
-        let matches = self.evaluate(&query.root);
-        let statistics = self.statistics(&query.score_terms);
-        let mut results = Vec::with_capacity(matches.len());
-        for (document_id, matched) in matches {
-            let Some(document) = self.documents.get(&document_id) else {
-                continue;
-            };
-            let explanation = self.explain_score(document, query, &statistics)?;
-            results.push(SearchResult {
-                id: document.id.clone(),
-                version_id: document.version_id.clone(),
-                title: document.title.clone(),
-                snippet: make_snippet(&document.body),
-                score: explanation.total_score,
-                matched,
-                explanation,
-            });
-        }
-        results.sort_by(|left, right| {
-            right
-                .score
-                .total_cmp(&left.score)
-                .then_with(|| left.id.as_bytes().cmp(right.id.as_bytes()))
-        });
-        Ok(results)
+        execute_query(
+            &self.documents,
+            &self.postings,
+            query,
+            None,
+            StatisticsSource::CurrentInMemoryDocumentView,
+        )
     }
 
     fn add_document(&mut self, document: IndexedDocument) {
+        #[cfg(test)]
+        FULL_POSTING_BUILDS.with(|count| count.set(count.get() + 1));
         add_positions(
             &mut self.postings,
             &document.id,
@@ -265,188 +263,269 @@ impl InMemoryIndex {
         );
         self.documents.insert(document.id.clone(), document);
     }
+}
 
-    fn evaluate(&self, expression: &Expr) -> BTreeMap<String, MatchEvidence> {
-        match expression {
-            Expr::Term(term) => self.term_matches(term),
-            Expr::Phrase(terms) => self.phrase_matches(terms),
-            Expr::And(children) => {
-                let mut child_matches = children.iter().map(|child| self.evaluate(child));
-                let Some(mut intersection) = child_matches.next() else {
-                    return BTreeMap::new();
-                };
-                for next in child_matches {
-                    intersection = intersect_match_sets(intersection, next);
-                }
-                intersection
-            }
-            Expr::Or(children) => {
-                let mut children = children.iter().map(|child| self.evaluate(child));
-                let Some(mut union) = children.next() else {
-                    return BTreeMap::new();
-                };
-                for next in children {
-                    union = union_match_sets(union, next);
-                }
-                union
-            }
-        }
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CorpusStatistics {
+    pub document_count: usize,
+    pub title_token_total: u64,
+    pub body_token_total: u64,
+    pub field_document_frequencies: BTreeMap<String, (usize, usize)>,
+}
+
+pub(crate) fn query_with_segment_postings(
+    documents: &BTreeMap<String, IndexedDocument>,
+    postings: &BTreeMap<String, BTreeMap<String, Posting>>,
+    query: &ParsedQuery,
+    corpus: &CorpusStatistics,
+    generation_id: u64,
+) -> Result<Vec<SearchResult>, QueryError> {
+    execute_query(
+        documents,
+        postings,
+        query,
+        Some(corpus),
+        StatisticsSource::PersistentGeneration(generation_id),
+    )
+}
+
+fn execute_query(
+    documents: &BTreeMap<String, IndexedDocument>,
+    postings: &BTreeMap<String, BTreeMap<String, Posting>>,
+    query: &ParsedQuery,
+    corpus: Option<&CorpusStatistics>,
+    source: StatisticsSource,
+) -> Result<Vec<SearchResult>, QueryError> {
+    if documents.is_empty() {
+        return Ok(Vec::new());
     }
-
-    fn term_matches(&self, term: &str) -> BTreeMap<String, MatchEvidence> {
-        self.postings
-            .get(term)
-            .into_iter()
-            .flat_map(|by_document| by_document.iter())
-            .map(|(id, posting)| {
-                (
-                    id.clone(),
-                    MatchEvidence::Term {
-                        term: term.to_owned(),
-                        title_positions: posting.title_positions.clone(),
-                        body_positions: posting.body_positions.clone(),
-                    },
-                )
-            })
-            .collect()
-    }
-
-    fn phrase_matches(&self, terms: &[String]) -> BTreeMap<String, MatchEvidence> {
-        let Some(first) = terms.first() else {
-            return BTreeMap::new();
+    let matches = evaluate(postings, &query.root);
+    let statistics = statistics(documents, postings, &query.score_terms, corpus);
+    let mut results = Vec::with_capacity(matches.len());
+    for (document_id, matched) in matches {
+        let Some(document) = documents.get(&document_id) else {
+            continue;
         };
-        let Some(candidates) = self.postings.get(first) else {
-            return BTreeMap::new();
-        };
-        let mut matches = BTreeMap::new();
-        for id in candidates.keys() {
-            let title_starts = phrase_starts(&self.postings, id, terms, true);
-            let body_starts = phrase_starts(&self.postings, id, terms, false);
-            if !title_starts.is_empty() || !body_starts.is_empty() {
-                matches.insert(
-                    id.clone(),
-                    MatchEvidence::Phrase {
-                        terms: terms.to_vec(),
-                        title_starts,
-                        body_starts,
-                    },
-                );
+        let explanation = explain_score(document, postings, query, &statistics, source.clone())?;
+        results.push(SearchResult {
+            id: document.id.clone(),
+            version_id: document.version_id.clone(),
+            title: document.title.clone(),
+            snippet: make_snippet(&document.body),
+            score: explanation.total_score,
+            matched,
+            explanation,
+        });
+    }
+    results.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| left.id.as_bytes().cmp(right.id.as_bytes()))
+    });
+    Ok(results)
+}
+
+fn evaluate(
+    postings: &BTreeMap<String, BTreeMap<String, Posting>>,
+    expression: &Expr,
+) -> BTreeMap<String, MatchEvidence> {
+    match expression {
+        Expr::Term(term) => term_matches(postings, term),
+        Expr::Phrase(terms) => phrase_matches(postings, terms),
+        Expr::And(children) => {
+            let mut child_matches = children.iter().map(|child| evaluate(postings, child));
+            let Some(mut intersection) = child_matches.next() else {
+                return BTreeMap::new();
+            };
+            for next in child_matches {
+                intersection = intersect_match_sets(intersection, next);
             }
+            intersection
         }
-        matches
-    }
-
-    fn statistics(&self, terms: &[String]) -> SearchStatistics {
-        let document_count = self.documents.len();
-        let divisor = document_count as f64;
-        let average_title_length = self
-            .documents
-            .values()
-            .map(|document| document.title_terms.len() as f64)
-            .sum::<f64>()
-            / divisor;
-        let average_body_length = self
-            .documents
-            .values()
-            .map(|document| document.body_terms.len() as f64)
-            .sum::<f64>()
-            / divisor;
-        let term_statistics = terms
-            .iter()
-            .map(|term| {
-                let title_df = self
-                    .postings
-                    .get(term)
-                    .map(|by_document| {
-                        by_document
-                            .values()
-                            .filter(|posting| !posting.title_positions.is_empty())
-                            .count()
-                    })
-                    .unwrap_or(0);
-                let body_df = self
-                    .postings
-                    .get(term)
-                    .map(|by_document| {
-                        by_document
-                            .values()
-                            .filter(|posting| !posting.body_positions.is_empty())
-                            .count()
-                    })
-                    .unwrap_or(0);
-                (
-                    term.clone(),
-                    TermStatistics {
-                        title_df,
-                        body_df,
-                        title_idf: bm25_idf(document_count as f64, title_df as f64),
-                        body_idf: bm25_idf(document_count as f64, body_df as f64),
-                    },
-                )
-            })
-            .collect();
-        SearchStatistics {
-            document_count,
-            average_title_length,
-            average_body_length,
-            terms: term_statistics,
+        Expr::Or(children) => {
+            let mut children = children.iter().map(|child| evaluate(postings, child));
+            let Some(mut union) = children.next() else {
+                return BTreeMap::new();
+            };
+            for next in children {
+                union = union_match_sets(union, next);
+            }
+            union
         }
     }
+}
 
-    fn explain_score(
-        &self,
-        document: &IndexedDocument,
-        query: &ParsedQuery,
-        statistics: &SearchStatistics,
-    ) -> Result<ScoreExplanation, QueryError> {
-        let mut total_score = 0.0;
-        let mut terms = Vec::with_capacity(query.score_terms.len());
-        for term in &query.score_terms {
-            let posting = self
-                .postings
-                .get(term)
-                .and_then(|by_document| by_document.get(&document.id));
-            let term_statistics = statistics
-                .terms
-                .get(term)
-                .expect("query terms have statistics");
-            let title = field_score(
-                posting.map_or(0, |value| value.title_positions.len()),
-                term_statistics.title_df,
-                document.title_terms.len(),
-                statistics.average_title_length,
-                term_statistics.title_idf,
-                2.0,
-            );
-            let body = field_score(
-                posting.map_or(0, |value| value.body_positions.len()),
-                term_statistics.body_df,
-                document.body_terms.len(),
-                statistics.average_body_length,
-                term_statistics.body_idf,
-                1.0,
-            );
-            total_score += title.contribution;
-            total_score += body.contribution;
-            terms.push(TermScoreExplanation {
-                term: term.clone(),
-                title,
-                body,
-            });
-        }
-        if !total_score.is_finite() {
-            return Err(QueryError::NonFiniteScore);
-        }
-        Ok(ScoreExplanation {
-            normalized_terms: query.score_terms.clone(),
-            document_count: statistics.document_count,
-            average_title_length: statistics.average_title_length,
-            average_body_length: statistics.average_body_length,
-            statistics_source: StatisticsSource::CurrentInMemoryDocumentView,
-            terms,
-            total_score,
+fn term_matches(
+    postings: &BTreeMap<String, BTreeMap<String, Posting>>,
+    term: &str,
+) -> BTreeMap<String, MatchEvidence> {
+    postings
+        .get(term)
+        .into_iter()
+        .flat_map(|by_document| by_document.iter())
+        .map(|(id, posting)| {
+            (
+                id.clone(),
+                MatchEvidence::Term {
+                    term: term.to_owned(),
+                    title_positions: posting.title_positions.clone(),
+                    body_positions: posting.body_positions.clone(),
+                },
+            )
         })
+        .collect()
+}
+
+fn phrase_matches(
+    postings: &BTreeMap<String, BTreeMap<String, Posting>>,
+    terms: &[String],
+) -> BTreeMap<String, MatchEvidence> {
+    let Some(first) = terms.first() else {
+        return BTreeMap::new();
+    };
+    let Some(candidates) = postings.get(first) else {
+        return BTreeMap::new();
+    };
+    let mut matches = BTreeMap::new();
+    for id in candidates.keys() {
+        let title_starts = phrase_starts(postings, id, terms, true);
+        let body_starts = phrase_starts(postings, id, terms, false);
+        if !title_starts.is_empty() || !body_starts.is_empty() {
+            matches.insert(
+                id.clone(),
+                MatchEvidence::Phrase {
+                    terms: terms.to_vec(),
+                    title_starts,
+                    body_starts,
+                },
+            );
+        }
     }
+    matches
+}
+
+fn statistics(
+    documents: &BTreeMap<String, IndexedDocument>,
+    postings: &BTreeMap<String, BTreeMap<String, Posting>>,
+    terms: &[String],
+    corpus: Option<&CorpusStatistics>,
+) -> SearchStatistics {
+    let document_count = corpus.map_or(documents.len(), |value| value.document_count);
+    let (average_title_length, average_body_length) = corpus.map_or_else(
+        || {
+            let divisor = document_count as f64;
+            (
+                documents
+                    .values()
+                    .map(|document| document.title_terms.len() as f64)
+                    .sum::<f64>()
+                    / divisor,
+                documents
+                    .values()
+                    .map(|document| document.body_terms.len() as f64)
+                    .sum::<f64>()
+                    / divisor,
+            )
+        },
+        |value| {
+            let divisor = value.document_count as f64;
+            (
+                value.title_token_total as f64 / divisor,
+                value.body_token_total as f64 / divisor,
+            )
+        },
+    );
+    let term_statistics = terms
+        .iter()
+        .map(|term| {
+            let (title_df, body_df) = corpus
+                .and_then(|value| value.field_document_frequencies.get(term).copied())
+                .unwrap_or_else(|| {
+                    postings
+                        .get(term)
+                        .map(|by_document| {
+                            by_document.values().fold((0, 0), |(title, body), posting| {
+                                (
+                                    title + usize::from(!posting.title_positions.is_empty()),
+                                    body + usize::from(!posting.body_positions.is_empty()),
+                                )
+                            })
+                        })
+                        .unwrap_or((0, 0))
+                });
+            (
+                term.clone(),
+                TermStatistics {
+                    title_df,
+                    body_df,
+                    title_idf: bm25_idf(document_count as f64, title_df as f64),
+                    body_idf: bm25_idf(document_count as f64, body_df as f64),
+                },
+            )
+        })
+        .collect();
+    SearchStatistics {
+        document_count,
+        average_title_length,
+        average_body_length,
+        terms: term_statistics,
+    }
+}
+
+fn explain_score(
+    document: &IndexedDocument,
+    postings: &BTreeMap<String, BTreeMap<String, Posting>>,
+    query: &ParsedQuery,
+    statistics: &SearchStatistics,
+    source: StatisticsSource,
+) -> Result<ScoreExplanation, QueryError> {
+    let mut total_score = 0.0;
+    let mut terms = Vec::with_capacity(query.score_terms.len());
+    for term in &query.score_terms {
+        let posting = postings
+            .get(term)
+            .and_then(|by_document| by_document.get(&document.id));
+        let term_statistics = statistics
+            .terms
+            .get(term)
+            .expect("query terms have statistics");
+        let title = field_score(
+            posting.map_or(0, |value| value.title_positions.len()),
+            term_statistics.title_df,
+            document.title_terms.len(),
+            statistics.average_title_length,
+            term_statistics.title_idf,
+            2.0,
+        );
+        let body = field_score(
+            posting.map_or(0, |value| value.body_positions.len()),
+            term_statistics.body_df,
+            document.body_terms.len(),
+            statistics.average_body_length,
+            term_statistics.body_idf,
+            1.0,
+        );
+        total_score += title.contribution;
+        total_score += body.contribution;
+        terms.push(TermScoreExplanation {
+            term: term.clone(),
+            title,
+            body,
+        });
+    }
+    if !total_score.is_finite() {
+        return Err(QueryError::NonFiniteScore);
+    }
+    Ok(ScoreExplanation {
+        normalized_terms: query.score_terms.clone(),
+        document_count: statistics.document_count,
+        average_title_length: statistics.average_title_length,
+        average_body_length: statistics.average_body_length,
+        statistics_source: source,
+        terms,
+        total_score,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -465,7 +544,7 @@ struct TermStatistics {
     body_idf: f64,
 }
 
-fn analyze_document(
+pub(crate) fn analyze_document(
     id: String,
     effective_url: String,
     title: String,
