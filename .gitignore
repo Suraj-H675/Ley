@@ -15,6 +15,8 @@
 # Ordinary local development outputs; refine based on actual toolchain.
 /target/
 /node_modules/
+/ui/node_modules/
+/ui/dist/
 /.env
 /.env.*
 !/.env.example

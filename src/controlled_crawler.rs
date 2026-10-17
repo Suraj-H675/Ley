@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -17,10 +17,12 @@ use crate::html::{
     MAX_OUTGOING_LINKS, MAX_TITLE_BYTES, extract_html,
 };
 use crate::page_policy::parse_x_robots_tags;
+use crate::public_policy::{PublicCrawlPolicy, PublicPolicyError, PublicSourcePolicy};
 use crate::robots::{MAX_ROBOTS_BYTES, parse_robots};
 use crate::safe_fetch::{
-    DEFAULT_REQUEST_TIMEOUT, DestinationResolver, FixtureCapability, HttpResponse,
-    MAX_ROBOTS_REDIRECTS, SafeFetchError, SafeFetcher, SystemResolver,
+    DEFAULT_REQUEST_TIMEOUT, DestinationEvidence, DestinationResolver, FixtureCapability,
+    HttpResponse, MAX_ROBOTS_REDIRECTS, PublicAuthority, SafeFetchError, SafeFetcher,
+    SystemResolver,
 };
 use crate::storage::{ApplyOutcome, Intent, PersistentIndex, StorageError};
 use crate::url_key::UrlKey;
@@ -100,6 +102,18 @@ pub(crate) enum RetentionPolicy {
     WhilePolicyValid,
 }
 
+pub(crate) struct PublicSourceAdmission {
+    pub id: String,
+    pub origins: Vec<String>,
+    pub allowed_path_prefixes: Vec<String>,
+    pub policy_sha256: String,
+    pub crawl_contact: String,
+    pub valid_until_ms: u64,
+    pub retention: RetentionPolicy,
+    pub max_requests: u64,
+    pub min_origin_delay_ms: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SourcePolicy {
     pub id: String,
@@ -133,6 +147,20 @@ impl SourcePolicy {
         }
     }
 
+    pub(crate) fn public(admission: PublicSourceAdmission) -> Self {
+        Self {
+            id: admission.id,
+            allowed_origins: admission.origins,
+            allowed_path_prefixes: admission.allowed_path_prefixes,
+            rights_basis: format!("public_source_policy_sha256={}", admission.policy_sha256),
+            crawl_contact: admission.crawl_contact,
+            valid_until_ms: admission.valid_until_ms,
+            retention: admission.retention,
+            max_requests: admission.max_requests,
+            min_origin_delay_ms: admission.min_origin_delay_ms,
+        }
+    }
+
     fn validate<R: DestinationResolver + 'static>(
         &self,
         now_ms: u64,
@@ -147,13 +175,22 @@ impl SourcePolicy {
         {
             return Err(CrawlError::Policy("source ID is invalid".to_owned()));
         }
-        if self.rights_basis != "authored_local_fixture"
-            || self.crawl_contact != "ley-local-fixture"
+        let fixture_policy = self.rights_basis == "authored_local_fixture"
+            && self.crawl_contact == "ley-local-fixture";
+        let public_policy = self
+            .rights_basis
+            .strip_prefix("public_source_policy_sha256=")
+            .is_some_and(|digest| {
+                digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+            && !self.crawl_contact.trim().is_empty()
+            && self.crawl_contact.len() <= MAX_POLICY_TEXT_BYTES;
+        if (!fixture_policy && !public_policy)
             || self.rights_basis.len() > MAX_POLICY_TEXT_BYTES
             || self.crawl_contact.len() > MAX_POLICY_TEXT_BYTES
         {
             return Err(CrawlError::Policy(
-                "Gate 4 admits only documented authored local fixtures".to_owned(),
+                "source policy must have an explicit fixture or reviewed public basis".to_owned(),
             ));
         }
         if self.valid_until_ms <= now_ms
@@ -169,20 +206,27 @@ impl SourcePolicy {
         }
         for origin in &self.allowed_origins {
             let parsed = Url::parse(origin).map_err(|error| CrawlError::Url(error.to_string()))?;
+            let authorized = if fixture_policy {
+                fetcher.has_fixture_capability(&parsed)
+            } else {
+                fetcher.has_public_authority(&parsed)
+            };
             if origin_of_url(&parsed) != *origin
                 || parsed.path() != "/"
                 || parsed.query().is_some()
                 || parsed.fragment().is_some()
-                || !fetcher.has_capability(&parsed)
+                || !authorized
             {
                 return Err(CrawlError::Policy(
-                    "origin is not an exact owned fixture authority".to_owned(),
+                    "origin is not an exact authority in the active source policy".to_owned(),
                 ));
             }
         }
         if self.allowed_path_prefixes.is_empty()
             || self.allowed_path_prefixes.iter().any(|path| {
-                !path.starts_with('/') || path.len() > 2048 || path.contains(['\r', '\n'])
+                !crate::url_key::path_is_within_prefix(path, path)
+                    || path.len() > 2048
+                    || path.contains(['?', '#', '\\', '\r', '\n'])
             })
         {
             return Err(CrawlError::Policy(
@@ -214,7 +258,35 @@ impl SourcePolicy {
         }
         self.allowed_path_prefixes
             .iter()
-            .any(|prefix| url.path().starts_with(prefix))
+            .any(|prefix| crate::url_key::path_is_within_prefix(url.path(), prefix))
+    }
+
+    fn allows_origin_url(&self, url: &Url, now_ms: u64) -> bool {
+        now_ms < self.valid_until_ms
+            && !matches!(self.retention, RetentionPolicy::Until(deadline) if now_ms >= deadline)
+            && self
+                .allowed_origins
+                .iter()
+                .any(|origin| origin == &origin_of_url(url))
+    }
+
+    fn same_admission_except_retention_deadline(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.allowed_origins == other.allowed_origins
+            && self.allowed_path_prefixes == other.allowed_path_prefixes
+            && self.rights_basis == other.rights_basis
+            && self.crawl_contact == other.crawl_contact
+            && self.valid_until_ms == other.valid_until_ms
+            && self.max_requests == other.max_requests
+            && self.min_origin_delay_ms == other.min_origin_delay_ms
+            && matches!(
+                (self.retention, other.retention),
+                (RetentionPolicy::Until(_), RetentionPolicy::Until(_))
+                    | (
+                        RetentionPolicy::WhilePolicyValid,
+                        RetentionPolicy::WhilePolicyValid
+                    )
+            )
     }
 
     fn to_db_fields(&self) -> (String, String, i64, String, String, i64, i64, i64) {
@@ -333,6 +405,31 @@ impl CrawlLimits {
         }
         Ok(())
     }
+
+    fn bounded_public(
+        request_count: usize,
+        max_wire_bytes: usize,
+        max_decoded_bytes: usize,
+    ) -> Result<Self, CrawlError> {
+        if request_count == 0 || request_count > 12 {
+            return Err(CrawlError::Policy(
+                "public request budget must be between 1 and 12".to_owned(),
+            ));
+        }
+        let limits = Self {
+            max_requests_per_run: request_count,
+            global_active: 2,
+            per_origin_active: 1,
+            max_wire_bytes_per_run: max_wire_bytes,
+            max_decompressed_bytes_per_run: max_decoded_bytes,
+            max_runtime: Duration::from_secs(60),
+            request_timeout: Duration::from_secs(5),
+            max_retries: 1,
+            page_redirects: 5,
+        };
+        limits.validate()?;
+        Ok(limits)
+    }
 }
 
 pub(crate) trait Clock: Send + Sync {
@@ -365,7 +462,8 @@ impl CrawlCancellation {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct CrawlReport {
     pub requests: usize,
     pub pages_fetched: usize,
@@ -373,12 +471,140 @@ pub(crate) struct CrawlReport {
     pub tombstoned: usize,
     pub retries: usize,
     pub disallowed: usize,
+    pub duplicate_urls: usize,
+    pub link_discovery: LinkDiscoveryCounts,
+    pub failed_pages: usize,
+    pub skipped_reasons: BTreeMap<String, usize>,
+    pub failure_reasons: Vec<String>,
     pub transport_failures: usize,
     pub outbox_replays: usize,
     pub rejected_intents: usize,
     pub max_active: usize,
     pub compressed_bytes: usize,
     pub decompressed_bytes: usize,
+    pub network_evidence: Vec<DestinationEvidence>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BoundedStopReason {
+    FrontierIdle,
+    RequestBudget,
+    ByteBudget,
+    RuntimeBudget,
+    SourceBudget,
+    SourceDeadline,
+    NoProgress,
+}
+
+impl BoundedStopReason {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::FrontierIdle => "frontier_idle",
+            Self::RequestBudget => "request_budget",
+            Self::ByteBudget => "byte_budget",
+            Self::RuntimeBudget => "runtime_budget",
+            Self::SourceBudget => "source_budget",
+            Self::SourceDeadline => "source_deadline",
+            Self::NoProgress => "no_progress",
+        }
+    }
+
+    pub(crate) fn bounded_run_finished(self) -> bool {
+        self == Self::FrontierIdle
+    }
+}
+
+pub(crate) struct BoundedCrawlResult {
+    pub report: CrawlReport,
+    pub stop_reason: BoundedStopReason,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DispatchEligibility {
+    At(u64),
+    SourceBudget,
+    SourceDeadline,
+    Idle,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LinkDiscoveryCounts {
+    pub enqueued: usize,
+    pub source_denied: usize,
+    pub duplicates: usize,
+    pub malformed: usize,
+    pub capacity: usize,
+}
+
+impl LinkDiscoveryCounts {
+    fn merge(&mut self, next: Self) {
+        self.enqueued = self.enqueued.saturating_add(next.enqueued);
+        self.source_denied = self.source_denied.saturating_add(next.source_denied);
+        self.duplicates = self.duplicates.saturating_add(next.duplicates);
+        self.malformed = self.malformed.saturating_add(next.malformed);
+        self.capacity = self.capacity.saturating_add(next.capacity);
+    }
+
+    pub(crate) fn candidates(&self) -> usize {
+        self.enqueued
+            .saturating_add(self.source_denied)
+            .saturating_add(self.duplicates)
+            .saturating_add(self.malformed)
+            .saturating_add(self.capacity)
+    }
+}
+
+impl CrawlReport {
+    fn merge(&mut self, mut next: Self) {
+        self.requests = self.requests.saturating_add(next.requests);
+        self.pages_fetched = self.pages_fetched.saturating_add(next.pages_fetched);
+        self.indexed = self.indexed.saturating_add(next.indexed);
+        self.tombstoned = self.tombstoned.saturating_add(next.tombstoned);
+        self.retries = self.retries.saturating_add(next.retries);
+        self.disallowed = self.disallowed.saturating_add(next.disallowed);
+        self.duplicate_urls = self.duplicate_urls.saturating_add(next.duplicate_urls);
+        self.link_discovery.merge(next.link_discovery);
+        self.failed_pages = self.failed_pages.saturating_add(next.failed_pages);
+        for (reason, count) in next.skipped_reasons {
+            if self.skipped_reasons.contains_key(&reason) || self.skipped_reasons.len() < 32 {
+                *self.skipped_reasons.entry(reason).or_default() += count;
+            }
+        }
+        self.failure_reasons.append(&mut next.failure_reasons);
+        self.failure_reasons.truncate(64);
+        self.transport_failures = self
+            .transport_failures
+            .saturating_add(next.transport_failures);
+        self.outbox_replays = self.outbox_replays.saturating_add(next.outbox_replays);
+        self.rejected_intents = self.rejected_intents.saturating_add(next.rejected_intents);
+        self.max_active = self.max_active.max(next.max_active);
+        self.compressed_bytes = self.compressed_bytes.saturating_add(next.compressed_bytes);
+        self.decompressed_bytes = self
+            .decompressed_bytes
+            .saturating_add(next.decompressed_bytes);
+        let available_evidence = 10_000usize.saturating_sub(self.network_evidence.len());
+        self.network_evidence
+            .extend(next.network_evidence.into_iter().take(available_evidence));
+    }
+
+    fn skipped(&mut self, reason: impl Into<String>) {
+        self.disallowed = self.disallowed.saturating_add(1);
+        let reason = reason.into();
+        if self.skipped_reasons.contains_key(&reason) || self.skipped_reasons.len() < 32 {
+            *self.skipped_reasons.entry(reason).or_default() += 1;
+        }
+    }
+
+    fn failure(&mut self, reason: &str) {
+        if self.failure_reasons.len() >= 64 {
+            return;
+        }
+        let bounded = reason.chars().take(512).collect::<String>();
+        if !bounded.is_empty() {
+            self.failure_reasons.push(bounded);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -909,9 +1135,14 @@ fn fetch_robots_worker<R: DestinationResolver + 'static, C: Clock>(
                 visited_origins,
             ));
         }
-        if !job.source.allows_url(&current, clock.now_ms()) || !fetcher.has_capability(&current) {
+        let source_allows = if redirects == 0 && origin_of_url(&current) == job.origin {
+            job.source.allows_origin_url(&current, clock.now_ms())
+        } else {
+            job.source.allows_url(&current, clock.now_ms())
+        };
+        if !source_allows || !fetcher.has_capability(&current) {
             return Err(robot_failure(
-                "robots redirect is outside admitted fixture scope".to_owned(),
+                "robots redirect is outside admitted source scope".to_owned(),
                 requests,
                 None,
                 wire_bytes,
@@ -1227,6 +1458,9 @@ pub(crate) struct ControlledCrawler<R, C> {
     last_origin: String,
     pending_replay_count: usize,
     pending_rejected_count: usize,
+    pending_link_discovery: LinkDiscoveryCounts,
+    pending_failed_pages: usize,
+    pending_failure_reasons: Vec<String>,
 }
 
 impl<R, C> ControlledCrawler<R, C>
@@ -1234,6 +1468,7 @@ where
     R: DestinationResolver + 'static,
     C: Clock + 'static,
 {
+    #[cfg(test)]
     pub(crate) fn open(
         path: &Path,
         index: Arc<PersistentIndex>,
@@ -1242,11 +1477,33 @@ where
         limits: CrawlLimits,
         clock: C,
     ) -> Result<Self, CrawlError> {
+        Self::open_with_public(
+            path,
+            index,
+            resolver,
+            capabilities,
+            Vec::new(),
+            limits,
+            clock,
+        )
+    }
+
+    pub(crate) fn open_with_public(
+        path: &Path,
+        index: Arc<PersistentIndex>,
+        resolver: R,
+        capabilities: Vec<FixtureCapability>,
+        public_authorities: Vec<PublicAuthority>,
+        limits: CrawlLimits,
+        clock: C,
+    ) -> Result<Self, CrawlError> {
         limits.validate()?;
         let owner_lock = acquire_frontier_owner(path)?;
         validate_frontier_store(path, &index)?;
-        let fetcher =
-            Arc::new(SafeFetcher::new(resolver, capabilities).with_timeout(limits.request_timeout));
+        let fetcher = Arc::new(
+            SafeFetcher::new_with_public(resolver, capabilities, public_authorities)
+                .with_timeout(limits.request_timeout),
+        );
         let db = FrontierDb::open(path, index.store_identity())?;
         let mut crawler = Self {
             _owner_lock: owner_lock,
@@ -1260,6 +1517,9 @@ where
             last_origin: String::new(),
             pending_replay_count: 0,
             pending_rejected_count: 0,
+            pending_link_discovery: LinkDiscoveryCounts::default(),
+            pending_failed_pages: 0,
+            pending_failure_reasons: Vec::new(),
         };
         crawler.recover_abandoned_fetches()?;
         crawler.expire_due_sources()?;
@@ -1273,11 +1533,28 @@ where
         capabilities: Vec<FixtureCapability>,
         limits: CrawlLimits,
     ) -> Result<ControlledCrawler<SystemResolver, SystemClock>, CrawlError> {
-        ControlledCrawler::open(
+        ControlledCrawler::<SystemResolver, SystemClock>::open_system_with_public(
+            path,
+            index,
+            capabilities,
+            Vec::new(),
+            limits,
+        )
+    }
+
+    pub(crate) fn open_system_with_public(
+        path: &Path,
+        index: Arc<PersistentIndex>,
+        capabilities: Vec<FixtureCapability>,
+        public_authorities: Vec<PublicAuthority>,
+        limits: CrawlLimits,
+    ) -> Result<ControlledCrawler<SystemResolver, SystemClock>, CrawlError> {
+        ControlledCrawler::open_with_public(
             path,
             index,
             SystemResolver,
             capabilities,
+            public_authorities,
             limits,
             SystemClock,
         )
@@ -1298,6 +1575,46 @@ where
         let (origins, paths, valid_until, rights, contact, retention, max_requests, delay) =
             policy.to_db_fields();
         let tx = self.db.transaction()?;
+        let existing = tx
+            .query_row(
+                "SELECT origins,paths,valid_until_ms,rights_basis,crawl_contact,retention_until_ms,max_requests,min_origin_delay_ms,lifecycle FROM source_policy WHERE source_id=?1",
+                [&policy.id],
+                |row| {
+                    let stored = SourcePolicy::from_db(
+                        policy.id.clone(),
+                        StoredPolicyFields {
+                            origins: row.get(0)?,
+                            paths: row.get(1)?,
+                            valid_until_ms: row.get(2)?,
+                            rights_basis: row.get(3)?,
+                            crawl_contact: row.get(4)?,
+                            retention_until_ms: row.get(5)?,
+                            max_requests: row.get(6)?,
+                            min_origin_delay_ms: row.get(7)?,
+                        },
+                    )
+                    .map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?;
+                    Ok((stored, row.get::<_, String>(8)?))
+                },
+            )
+            .optional()?;
+        let is_existing_source = if let Some((stored, lifecycle)) = existing {
+            if lifecycle != "active" || !stored.same_admission_except_retention_deadline(&policy) {
+                return Err(CrawlError::Policy(
+                    "source ID already has a different or inactive policy; revoke and explicitly readmit it"
+                        .to_owned(),
+                ));
+            }
+            true
+        } else {
+            false
+        };
         let existing_origins: String = tx.query_row(
             "SELECT COALESCE(group_concat(origins,char(10)),'') FROM source_policy",
             [],
@@ -1313,21 +1630,42 @@ where
         }
         let frontier_count: i64 =
             tx.query_row("SELECT COUNT(*) FROM frontier", [], |row| row.get(0))?;
-        if (frontier_count as usize).saturating_add(seeds.len()) > MAX_FRONTIER_ENTRIES {
-            return Err(CrawlError::Capacity("frontier URL count"));
-        }
-        tx.execute(
-            "INSERT INTO source_policy(source_id,origins,paths,valid_until_ms,rights_basis,crawl_contact,retention_until_ms,max_requests,min_origin_delay_ms,lifecycle) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,'active')",
-            params![policy.id, origins, paths, valid_until, rights, contact, retention, max_requests, delay],
-        )?;
+        let mut new_seeds = Vec::new();
         for seed in seeds {
             let url =
                 Url::parse(seed.as_str()).map_err(|error| CrawlError::Url(error.to_string()))?;
             if !policy.allows_url(&url, now) || !self.fetcher.has_capability(&url) {
                 return Err(CrawlError::Policy(format!(
-                    "seed is outside admitted fixture scope: {seed}"
+                    "seed is outside admitted source scope: {seed}"
                 )));
             }
+            let existing_owner: Option<String> = tx
+                .query_row(
+                    "SELECT source_id FROM frontier WHERE url_key=?1",
+                    [seed.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            match existing_owner {
+                Some(owner) if owner == policy.id => {}
+                Some(_) => {
+                    return Err(CrawlError::Policy(format!(
+                        "seed is already owned by another source policy: {seed}"
+                    )));
+                }
+                None => new_seeds.push(seed),
+            }
+        }
+        if (frontier_count as usize).saturating_add(new_seeds.len()) > MAX_FRONTIER_ENTRIES {
+            return Err(CrawlError::Capacity("frontier URL count"));
+        }
+        if !is_existing_source {
+            tx.execute(
+                "INSERT INTO source_policy(source_id,origins,paths,valid_until_ms,rights_basis,crawl_contact,retention_until_ms,max_requests,min_origin_delay_ms,lifecycle) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,'active')",
+                params![policy.id, origins, paths, valid_until, rights, contact, retention, max_requests, delay],
+            )?;
+        }
+        for seed in new_seeds {
             tx.execute(
                 "INSERT INTO frontier(url_key,source_id,fetch_url,state,due_ms,redirect_seen,queued_sequence) VALUES (?1,?2,?1,'ready',?3,?1,?4)",
                 params![seed.as_str(), policy.id, now as i64, now as i64],
@@ -1341,14 +1679,16 @@ where
                 "explicitly admitted seed",
             )?;
         }
-        FrontierDb::event(
-            &tx,
-            now,
-            &policy.id,
-            None,
-            "admitted",
-            "explicit authored fixture policy",
-        )?;
+        if !is_existing_source {
+            FrontierDb::event(
+                &tx,
+                now,
+                &policy.id,
+                None,
+                "admitted",
+                "explicit source policy",
+            )?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -1460,6 +1800,9 @@ where
         &mut self,
         cancellation: &CrawlCancellation,
     ) -> Result<CrawlReport, CrawlError> {
+        self.fetcher.clear_network_evidence();
+        self.pending_failed_pages = 0;
+        self.pending_failure_reasons.clear();
         let started = self.clock.now_ms();
         let deadline = started.saturating_add(self.limits.max_runtime.as_millis() as u64);
         let mut report = CrawlReport {
@@ -1653,6 +1996,15 @@ where
             .rejected_intents
             .saturating_add(self.pending_rejected_count);
         self.pending_rejected_count = 0;
+        report
+            .link_discovery
+            .merge(std::mem::take(&mut self.pending_link_discovery));
+        report.failed_pages = self.pending_failed_pages;
+        report
+            .failure_reasons
+            .append(&mut self.pending_failure_reasons);
+        self.pending_failed_pages = 0;
+        report.network_evidence = self.fetcher.take_network_evidence();
         if runtime_expired || self.clock.now_ms() >= deadline {
             Err(CrawlError::RuntimeLimit)
         } else if cancellation.is_cancelled() {
@@ -1663,6 +2015,195 @@ where
             Ok(report)
         }
     }
+}
+
+pub(crate) fn run_public_crawl(
+    index_path: &Path,
+    frontier_path: &Path,
+    policy: &PublicCrawlPolicy,
+    request_count: usize,
+) -> Result<BoundedCrawlResult, CrawlError> {
+    let now = SystemClock.now_ms();
+    policy
+        .validate_enabled(now)
+        .map_err(|error: PublicPolicyError| CrawlError::Policy(error.to_string()))?;
+    let (max_wire_bytes, max_decoded_bytes) = policy
+        .sources()
+        .iter()
+        .map(PublicSourcePolicy::run_byte_limits)
+        .reduce(|left, right| (left.0.min(right.0), left.1.min(right.1)))
+        .ok_or_else(|| CrawlError::Policy("public source allowlist is empty".to_owned()))?;
+    let limits = CrawlLimits::bounded_public(request_count, max_wire_bytes, max_decoded_bytes)?;
+    let max_runtime = limits.max_runtime;
+    let authorities = policy
+        .sources()
+        .iter()
+        .map(|source| source.authority(policy.identity(), policy.contact()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| CrawlError::Policy(error.to_string()))?;
+    let index = match fs::symlink_metadata(index_path) {
+        Ok(_) => Arc::new(PersistentIndex::open(index_path)?),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Arc::new(PersistentIndex::create(index_path)?)
+        }
+        Err(error) => return Err(CrawlError::Io(error)),
+    };
+    let gate = policy
+        .collection_gate(now)
+        .map_err(|error| CrawlError::Policy(error.to_string()))?;
+    let notice = policy
+        .notice_bytes()
+        .map_err(|error| CrawlError::Policy(error.to_string()))?;
+    index.install_public_collection_gate(&gate, notice, now)?;
+    let mut crawler = ControlledCrawler::<SystemResolver, SystemClock>::open_system_with_public(
+        frontier_path,
+        Arc::clone(&index),
+        Vec::new(),
+        authorities,
+        limits,
+    )?;
+    for source in policy.sources() {
+        let source_policy = source
+            .crawler_policy(policy.contact(), now, &policy.sha256())
+            .map_err(|error| CrawlError::Policy(error.to_string()))?;
+        let seeds = source
+            .seeds()
+            .map_err(|error| CrawlError::Policy(error.to_string()))?;
+        crawler.admit_source(source_policy, &seeds)?;
+    }
+
+    run_bounded_crawl(
+        &mut crawler,
+        request_count,
+        max_wire_bytes,
+        max_decoded_bytes,
+        max_runtime,
+    )
+}
+
+fn run_bounded_crawl<R: DestinationResolver + 'static, C: Clock + 'static>(
+    crawler: &mut ControlledCrawler<R, C>,
+    request_count: usize,
+    max_wire_bytes: usize,
+    max_decoded_bytes: usize,
+    max_runtime: Duration,
+) -> Result<BoundedCrawlResult, CrawlError> {
+    let overall_deadline = Instant::now() + max_runtime;
+    let mut report = CrawlReport::default();
+    let stop_reason;
+    loop {
+        let remaining_runtime = overall_deadline.saturating_duration_since(Instant::now());
+        let remaining_requests = request_count.saturating_sub(report.requests);
+        let remaining_wire = max_wire_bytes.saturating_sub(report.compressed_bytes);
+        let remaining_decoded = max_decoded_bytes.saturating_sub(report.decompressed_bytes);
+        if remaining_runtime.is_zero() {
+            report.failure("overall public crawl runtime limit reached");
+            stop_reason = BoundedStopReason::RuntimeBudget;
+            break;
+        }
+        if remaining_requests == 0 {
+            stop_reason = BoundedStopReason::RequestBudget;
+            break;
+        }
+        if remaining_wire < MAX_COMPRESSED_RESPONSE_BYTES
+            || remaining_decoded < MAX_DECODED_RESPONSE_BYTES
+        {
+            report.failure("public crawl byte budget cannot reserve another bounded response");
+            stop_reason = BoundedStopReason::ByteBudget;
+            break;
+        }
+        crawler.limits.max_requests_per_run = remaining_requests;
+        crawler.limits.max_wire_bytes_per_run = remaining_wire;
+        crawler.limits.max_decompressed_bytes_per_run = remaining_decoded;
+        crawler.limits.max_runtime = remaining_runtime;
+        let batch = crawler.run_until_idle(&CrawlCancellation::default())?;
+        let batch_requests = batch.requests;
+        let batch_bytes = batch
+            .compressed_bytes
+            .saturating_add(batch.decompressed_bytes);
+        report.merge(batch);
+        let now = crawler.clock.now_ms();
+        let next_eligibility = crawler.next_dispatch_eligibility(now)?;
+        let next_due = match next_eligibility {
+            DispatchEligibility::Idle => {
+                stop_reason = BoundedStopReason::FrontierIdle;
+                break;
+            }
+            DispatchEligibility::SourceBudget => {
+                report.failure(
+                    "source lifetime request budget exhausted with admitted URLs remaining",
+                );
+                stop_reason = BoundedStopReason::SourceBudget;
+                break;
+            }
+            DispatchEligibility::SourceDeadline => {
+                report.failure(
+                    "source retention or policy deadline precedes the next eligible request",
+                );
+                stop_reason = BoundedStopReason::SourceDeadline;
+                break;
+            }
+            DispatchEligibility::At(next_due) => next_due,
+        };
+        let delay = Duration::from_millis(next_due.saturating_sub(now));
+        let remaining_requests = request_count.saturating_sub(report.requests);
+        let remaining_wire = max_wire_bytes.saturating_sub(report.compressed_bytes);
+        let remaining_decoded = max_decoded_bytes.saturating_sub(report.decompressed_bytes);
+        if remaining_requests == 0 {
+            stop_reason = BoundedStopReason::RequestBudget;
+            break;
+        }
+        if remaining_wire < MAX_COMPRESSED_RESPONSE_BYTES
+            || remaining_decoded < MAX_DECODED_RESPONSE_BYTES
+        {
+            report.failure("public crawl byte budget cannot reserve another bounded response");
+            stop_reason = BoundedStopReason::ByteBudget;
+            break;
+        }
+        let remaining_runtime = overall_deadline.saturating_duration_since(Instant::now());
+        if delay >= remaining_runtime {
+            report.failure(
+                "next eligible public request is due after the public crawl runtime limit",
+            );
+            stop_reason = BoundedStopReason::RuntimeBudget;
+            break;
+        }
+        if batch_requests == 0 && delay.is_zero() && batch_bytes == 0 {
+            report.failure("public crawl made no progress while an admitted URL was due");
+            stop_reason = BoundedStopReason::NoProgress;
+            break;
+        }
+        if !delay.is_zero() {
+            thread::sleep(delay);
+        }
+    }
+    Ok(BoundedCrawlResult {
+        report,
+        stop_reason,
+    })
+}
+
+pub(crate) fn revoke_public_source(
+    index_path: &Path,
+    frontier_path: &Path,
+    source_id: &str,
+) -> Result<(), CrawlError> {
+    if source_id.is_empty()
+        || source_id.len() > MAX_SOURCE_ID_BYTES
+        || !source_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(CrawlError::Policy("source ID is invalid".to_owned()));
+    }
+    let index = Arc::new(PersistentIndex::open(index_path)?);
+    let mut crawler = ControlledCrawler::<SystemResolver, SystemClock>::open_system(
+        frontier_path,
+        index,
+        Vec::new(),
+        CrawlLimits::default(),
+    )?;
+    crawler.revoke_source(source_id)
 }
 
 fn origin_of_url(url: &Url) -> String {
@@ -1935,7 +2476,7 @@ where
                     &policy.id,
                     "url is outside current admission scope",
                 )?;
-                report.disallowed += 1;
+                report.skipped("page URL outside source path or authority scope");
                 continue;
             }
 
@@ -1956,7 +2497,7 @@ where
                             now.saturating_add(MAX_RETRY_MS),
                             &error.to_string(),
                         )?;
-                        report.disallowed += 1;
+                        report.skipped("robots rules could not be parsed");
                         continue;
                     }
                 };
@@ -1967,7 +2508,7 @@ where
                         now.saturating_add(DEFAULT_RETRY_MS)
                     };
                     self.mark_page_deferred(&candidate.key, retry_at, "robots rule denies path")?;
-                    report.disallowed += 1;
+                    report.skipped("robots rules denied the page path");
                     continue;
                 }
                 let free_run = self
@@ -2044,7 +2585,11 @@ where
 
             if denied_retry > now {
                 self.mark_page_deferred(&candidate.key, denied_retry, &cache_reason)?;
-                report.disallowed += 1;
+                report.skipped(if cache_reason.is_empty() {
+                    "robots policy denied the origin"
+                } else {
+                    cache_reason.as_str()
+                });
                 continue;
             }
             let remaining_source = policy.max_requests.saturating_sub(source_requests) as usize;
@@ -2119,6 +2664,95 @@ where
         })?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(CrawlError::from)
+    }
+
+    fn next_dispatch_eligibility(&self, now: u64) -> Result<DispatchEligibility, CrawlError> {
+        let candidates = {
+            let mut statement = self.db.conn.prepare(
+                "SELECT f.fetch_url,f.due_ms,s.max_requests,s.request_count,s.valid_until_ms,s.retention_until_ms FROM frontier f JOIN source_policy s ON s.source_id=f.source_id WHERE s.lifecycle='active' AND (f.state IN ('ready','deferred') OR (f.state='complete' AND f.due_ms<=?1)) ORDER BY f.due_ms,f.queued_sequence",
+            )?;
+            let rows = statement.query_map([now as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut earliest = None;
+        let mut source_budget_exhausted = false;
+        let mut source_deadline_exhausted = false;
+        for (fetch_url, due_ms, max_requests, request_count, valid_until, retention_until) in
+            candidates
+        {
+            if request_count >= max_requests {
+                source_budget_exhausted = true;
+                continue;
+            }
+            let url = Url::parse(&fetch_url).map_err(|error| CrawlError::Url(error.to_string()))?;
+            let key =
+                UrlKey::parse(&fetch_url).map_err(|error| CrawlError::Url(error.to_string()))?;
+            let origin = origin_of_url(&url);
+            let origin_state = self.origin_state(&origin)?;
+            let mut eligible_ms = u64::try_from(due_ms).unwrap_or_default();
+            eligible_ms = eligible_ms.max(origin_state.0).max(origin_state.1);
+
+            let robot_entry = self
+                .db
+                .conn
+                .query_row(
+                    "SELECT body,expires_ms,denied_retry_ms FROM robots_cache WHERE origin=?1",
+                    [&origin],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<Vec<u8>>>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            if let Some((body, expires_ms, denied_retry_ms)) = robot_entry {
+                let expires_ms = u64::try_from(expires_ms).unwrap_or_default();
+                let denied_retry_ms = u64::try_from(denied_retry_ms).unwrap_or_default();
+                if let Some(body) = body.filter(|_| expires_ms > now) {
+                    match parse_robots(&body) {
+                        Ok(rules) if !rules.fetch_allowed(AGENT_TOKEN, &key) => {
+                            eligible_ms = eligible_ms.max(expires_ms);
+                        }
+                        Err(_) => {
+                            eligible_ms = eligible_ms
+                                .max(denied_retry_ms.max(now.saturating_add(MAX_RETRY_MS)));
+                        }
+                        _ => {}
+                    }
+                } else {
+                    eligible_ms = eligible_ms.max(denied_retry_ms);
+                }
+            }
+
+            let policy_deadline = [valid_until, retention_until]
+                .into_iter()
+                .filter(|deadline| *deadline > 0)
+                .map(|deadline| u64::try_from(deadline).unwrap_or_default())
+                .min()
+                .unwrap_or(u64::MAX);
+            if eligible_ms >= policy_deadline {
+                source_deadline_exhausted = true;
+                continue;
+            }
+            earliest = Some(earliest.map_or(eligible_ms, |current: u64| current.min(eligible_ms)));
+        }
+        Ok(match earliest {
+            Some(eligible_ms) => DispatchEligibility::At(eligible_ms),
+            None if source_budget_exhausted => DispatchEligibility::SourceBudget,
+            None if source_deadline_exhausted => DispatchEligibility::SourceDeadline,
+            None => DispatchEligibility::Idle,
+        })
     }
 
     fn origin_state(&self, origin: &str) -> Result<(u64, u64, u64), CrawlError> {
@@ -2214,11 +2848,30 @@ where
         reason: &str,
     ) -> Result<(), CrawlError> {
         let now = self.clock.now_ms();
+        let matching_keys = {
+            let mut statement = self.db.conn.prepare(
+                "SELECT url_key,fetch_url FROM frontier WHERE state IN ('ready','deferred')",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .filter_map(|(key, fetch_url)| {
+                    Url::parse(&fetch_url)
+                        .ok()
+                        .filter(|url| origin_of_url(url) == origin)
+                        .map(|_| key)
+                })
+                .collect::<Vec<_>>()
+        };
         let tx = self.db.transaction()?;
-        tx.execute(
-            "UPDATE frontier SET state='deferred',due_ms=?2,reason=?3 WHERE state IN ('ready','deferred') AND fetch_url LIKE ?1",
-            params![format!("{origin}%"), due_ms as i64, reason],
-        )?;
+        for key in matching_keys {
+            tx.execute(
+                "UPDATE frontier SET state='deferred',due_ms=?2,reason=?3 WHERE url_key=?1 AND state IN ('ready','deferred') AND due_ms<=?2",
+                params![key, due_ms as i64, reason],
+            )?;
+        }
         FrontierDb::event(&tx, now, "", None, "deferred", reason)?;
         tx.commit()?;
         Ok(())
@@ -2298,6 +2951,7 @@ where
                     }
                     Err(error) => {
                         report.transport_failures += 1;
+                        report.failure(&error.to_string());
                         self.retry_page(&job, &error.to_string(), None, false, report)?;
                     }
                 }
@@ -2383,7 +3037,7 @@ where
                     "redirect loop, limit, or source/network scope denial",
                     true,
                 )?;
-                report.disallowed += 1;
+                report.skipped("page redirect exceeded source, network, or loop bounds");
                 return Ok(());
             }
             let mut chain = job.redirect_seen.clone();
@@ -2636,6 +3290,9 @@ where
         };
         let mut restrictions = header_restrictions;
         restrictions.combine(extracted.restrictions);
+        report.duplicate_urls = report
+            .duplicate_urls
+            .saturating_add(extracted.duplicate_links);
         if restrictions.noindex {
             let links = if restrictions.nofollow {
                 Vec::new()
@@ -2745,6 +3402,13 @@ where
         reason: &str,
         terminal: bool,
     ) -> Result<(), CrawlError> {
+        if terminal {
+            self.pending_failed_pages = self.pending_failed_pages.saturating_add(1);
+            if self.pending_failure_reasons.len() < 64 {
+                self.pending_failure_reasons
+                    .push(reason.chars().take(512).collect());
+            }
+        }
         let now = self.clock.now_ms();
         let tx = self.db.transaction()?;
         tx.execute(
@@ -2771,6 +3435,7 @@ where
         terminal_http: bool,
         report: &mut CrawlReport,
     ) -> Result<(), CrawlError> {
+        report.failure(reason);
         let now = self.clock.now_ms();
         let next_attempt = job.attempt.saturating_add(1);
         if next_attempt > self.limits.max_retries {
@@ -3100,7 +3765,14 @@ where
                 if let Some(policy) = policy.as_ref()
                     && !item.completion.links.is_empty()
                 {
-                    Self::enqueue_outbox_links(&tx, item, policy, &self.fetcher, now)?;
+                    self.pending_link_discovery
+                        .merge(Self::enqueue_outbox_links(
+                            &tx,
+                            item,
+                            policy,
+                            &self.fetcher,
+                            now,
+                        )?);
                 }
             }
             2 => {
@@ -3135,29 +3807,26 @@ where
         policy: &SourcePolicy,
         fetcher: &SafeFetcher<R>,
         now: u64,
-    ) -> Result<(), CrawlError> {
+    ) -> Result<LinkDiscoveryCounts, CrawlError> {
         let mut count: i64 = tx.query_row("SELECT COUNT(*) FROM frontier", [], |row| row.get(0))?;
-        let mut enqueued = 0usize;
-        let mut source_denied = 0usize;
-        let mut deduplicated = 0usize;
-        let mut malformed = 0usize;
-        let mut capacity = 0usize;
+        let mut outcomes = LinkDiscoveryCounts::default();
         for (index, raw) in item.completion.links.iter().enumerate() {
             if count as usize >= MAX_FRONTIER_ENTRIES {
-                capacity =
-                    capacity.saturating_add(item.completion.links.len().saturating_sub(index));
+                outcomes.capacity = outcomes
+                    .capacity
+                    .saturating_add(item.completion.links.len().saturating_sub(index));
                 break;
             }
             let Ok(url) = Url::parse(raw) else {
-                malformed = malformed.saturating_add(1);
+                outcomes.malformed = outcomes.malformed.saturating_add(1);
                 continue;
             };
             let Ok(key) = UrlKey::parse(raw) else {
-                malformed = malformed.saturating_add(1);
+                outcomes.malformed = outcomes.malformed.saturating_add(1);
                 continue;
             };
             if !policy.allows_url(&url, now) || !fetcher.has_capability(&url) {
-                source_denied = source_denied.saturating_add(1);
+                outcomes.source_denied = outcomes.source_denied.saturating_add(1);
                 continue;
             }
             let inserted = tx.execute(
@@ -3165,13 +3834,13 @@ where
                 params![key.as_str(), item.source_id, now as i64],
             )?;
             if inserted == 0 {
-                deduplicated = deduplicated.saturating_add(1);
+                outcomes.duplicates = outcomes.duplicates.saturating_add(1);
             } else {
                 count += inserted as i64;
-                enqueued = enqueued.saturating_add(1);
+                outcomes.enqueued = outcomes.enqueued.saturating_add(1);
             }
         }
-        if enqueued + source_denied + deduplicated + malformed + capacity > 0 {
+        if outcomes.candidates() > 0 {
             FrontierDb::event(
                 tx,
                 now,
@@ -3179,11 +3848,16 @@ where
                 Some(item.key.as_str()),
                 "link_discovery",
                 &format!(
-                    "enqueued={enqueued}; source_denied={source_denied}; duplicate={deduplicated}; malformed={malformed}; capacity={capacity}"
+                    "enqueued={}; source_denied={}; duplicate={}; malformed={}; capacity={}",
+                    outcomes.enqueued,
+                    outcomes.source_denied,
+                    outcomes.duplicates,
+                    outcomes.malformed,
+                    outcomes.capacity,
                 ),
             )?;
         }
-        Ok(())
+        Ok(outcomes)
     }
 
     fn reject_outbox(&mut self, item: &PendingOutbox, reason: &str) -> Result<(), CrawlError> {
@@ -3462,8 +4136,10 @@ where
         &mut self,
         job: RobotsJob,
         failure: RobotsWorkerFailure,
-        _report: &mut CrawlReport,
+        report: &mut CrawlReport,
     ) -> Result<(), CrawlError> {
+        report.skipped(failure.reason.clone());
+        report.failure(&failure.reason);
         let now = self.clock.now_ms();
         let (next_request, backoff, failures) = self.origin_state(&job.origin)?;
         let failure_count = failures.saturating_add(1).min(16);
@@ -3573,6 +4249,32 @@ mod tests {
                 .copied()
                 .ok_or_else(|| std::io::Error::other("sequence has no DNS answers"))?;
             Ok(vec![answer])
+        }
+    }
+
+    #[derive(Clone)]
+    struct AnswerSetResolver {
+        answers: Arc<Vec<Vec<std::net::SocketAddr>>>,
+        next: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl AnswerSetResolver {
+        fn new(answers: Vec<Vec<std::net::SocketAddr>>) -> Self {
+            Self {
+                answers: Arc::new(answers),
+                next: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl DestinationResolver for AnswerSetResolver {
+        fn resolve(&self, _host: &str, _port: u16) -> std::io::Result<Vec<std::net::SocketAddr>> {
+            let index = self.next.fetch_add(1, Ordering::SeqCst);
+            self.answers
+                .get(index)
+                .or_else(|| self.answers.last())
+                .cloned()
+                .ok_or_else(|| std::io::Error::other("DNS fixture has no answer sets"))
         }
     }
 
@@ -3707,6 +4409,934 @@ mod tests {
             clock,
         )
         .unwrap()
+    }
+
+    struct PublicTlsSourceSpec {
+        id: &'static str,
+        seed_path: &'static str,
+        max_requests: u64,
+        min_origin_delay_ms: u64,
+    }
+
+    fn open_public_tls_crawler(
+        temp: &TestDir,
+        fixture: &crate::safe_fetch::tls_test_support::Fixture,
+        answers: Vec<Vec<std::net::SocketAddr>>,
+        limits: CrawlLimits,
+        source: PublicTlsSourceSpec,
+    ) -> (
+        Arc<PersistentIndex>,
+        ControlledCrawler<AnswerSetResolver, SystemClock>,
+    ) {
+        let origin = format!("https://public.example.org:{}", fixture.address.port());
+        open_public_tls_crawler_at_origin(temp, fixture, answers, limits, source, origin)
+    }
+
+    fn open_public_tls_crawler_at_origin(
+        temp: &TestDir,
+        fixture: &crate::safe_fetch::tls_test_support::Fixture,
+        answers: Vec<Vec<std::net::SocketAddr>>,
+        limits: CrawlLimits,
+        source: PublicTlsSourceSpec,
+        origin: String,
+    ) -> (
+        Arc<PersistentIndex>,
+        ControlledCrawler<AnswerSetResolver, SystemClock>,
+    ) {
+        let origin_url = Url::parse(&format!("{origin}/")).unwrap();
+        let canonical_origin = origin_of_url(&origin_url);
+        let authority = crate::safe_fetch::PublicAuthority::from_origin(&origin_url)
+            .unwrap()
+            .with_crawler_identity(
+                concat!("LeyBot/", env!("CARGO_PKG_VERSION")),
+                "https://github.com/Suraj-H675/Ley/issues",
+            );
+        let now = SystemClock.now_ms();
+        let policy = SourcePolicy::public(PublicSourceAdmission {
+            id: source.id.to_owned(),
+            origins: vec![canonical_origin],
+            allowed_path_prefixes: vec!["/".to_owned()],
+            policy_sha256: "a".repeat(64),
+            crawl_contact: "https://github.com/Suraj-H675/Ley/issues".to_owned(),
+            valid_until_ms: now.saturating_add(60_000),
+            retention: RetentionPolicy::Until(now.saturating_add(60_000)),
+            max_requests: source.max_requests,
+            min_origin_delay_ms: source.min_origin_delay_ms,
+        });
+        let index = Arc::new(
+            PersistentIndex::create(temp.path().join(format!("{}-index", source.id))).unwrap(),
+        );
+        let frontier_path = temp.path().join(format!("{}-frontier.sqlite", source.id));
+        let mut crawler = ControlledCrawler::open_with_public(
+            &frontier_path,
+            Arc::clone(&index),
+            AnswerSetResolver::new(answers),
+            Vec::new(),
+            vec![authority],
+            limits,
+            SystemClock,
+        )
+        .unwrap();
+        Arc::get_mut(&mut crawler.fetcher)
+            .unwrap()
+            .set_test_public_tls(
+                "public.example.org",
+                fixture.address,
+                fixture.root_certificate_pem(),
+            );
+        let seed = UrlKey::parse(&format!("{}{}", origin, source.seed_path)).unwrap();
+        crawler.admit_source(policy, &[seed]).unwrap();
+        (index, crawler)
+    }
+
+    #[test]
+    fn bounded_public_crawl_waits_for_default_port_origin_and_fetches_linked_pages() {
+        let host = "public.example.org";
+        let fixture = crate::safe_fetch::tls_test_support::Fixture::start(
+            host,
+            BTreeMap::from([
+                (
+                    "/robots.txt".to_owned(),
+                    crate::safe_fetch::tls_test_support::Response::text(
+                        "User-agent: LeyBot\nAllow: /\n",
+                    ),
+                ),
+                (
+                    "/page".to_owned(),
+                    crate::safe_fetch::tls_test_support::Response::html(
+                        "<title>First page</title><p>first marker</p><a href=\"/second\">Second</a>",
+                    ),
+                ),
+                (
+                    "/second".to_owned(),
+                    crate::safe_fetch::tls_test_support::Response::html(
+                        "<title>Second page</title><p>second marker</p>",
+                    ),
+                ),
+            ]),
+        );
+        let temp = TestDir::new();
+        let origin = format!("https://{host}");
+        let (index, mut crawler) = open_public_tls_crawler_at_origin(
+            &temp,
+            &fixture,
+            vec![vec![fixture.address]],
+            CrawlLimits::default(),
+            PublicTlsSourceSpec {
+                id: "tls-default-port-scheduler",
+                seed_path: "/page",
+                max_requests: 6,
+                min_origin_delay_ms: 80,
+            },
+            origin,
+        );
+
+        let result = run_bounded_crawl(
+            &mut crawler,
+            6,
+            12 * MAX_COMPRESSED_RESPONSE_BYTES,
+            32 * MAX_DECODED_RESPONSE_BYTES,
+            Duration::from_secs(4),
+        )
+        .unwrap();
+        let report = result.report;
+
+        assert_eq!(report.requests, 3);
+        assert_eq!(report.pages_fetched, 2);
+        assert_eq!(report.indexed, 2);
+        assert_eq!(
+            index.query("first marker OR second marker").unwrap().len(),
+            2
+        );
+        assert_eq!(fixture.requests(), ["/robots.txt", "/page", "/second"]);
+        let starts = fixture.request_starts();
+        assert_eq!(starts.len(), 3);
+        assert!(starts[1].duration_since(starts[0]) >= Duration::from_millis(60));
+        assert!(starts[2].duration_since(starts[1]) >= Duration::from_millis(60));
+        assert_eq!(result.stop_reason, BoundedStopReason::FrontierIdle);
+
+        let budget_fixture = crate::safe_fetch::tls_test_support::Fixture::start(
+            host,
+            BTreeMap::from([
+                (
+                    "/robots.txt".to_owned(),
+                    crate::safe_fetch::tls_test_support::Response::text(
+                        "User-agent: LeyBot\nAllow: /\n",
+                    ),
+                ),
+                (
+                    "/page".to_owned(),
+                    crate::safe_fetch::tls_test_support::Response::html(
+                        "<title>Budget page</title><a href=\"/second\">Second</a>",
+                    ),
+                ),
+                (
+                    "/second".to_owned(),
+                    crate::safe_fetch::tls_test_support::Response::html(
+                        "<title>Over budget</title>",
+                    ),
+                ),
+            ]),
+        );
+        let (index, mut budget_crawler) = open_public_tls_crawler_at_origin(
+            &temp,
+            &budget_fixture,
+            vec![vec![budget_fixture.address]],
+            CrawlLimits::default(),
+            PublicTlsSourceSpec {
+                id: "tls-default-port-request-budget",
+                seed_path: "/page",
+                max_requests: 6,
+                min_origin_delay_ms: 80,
+            },
+            format!("https://{host}"),
+        );
+        let budget_result = run_bounded_crawl(
+            &mut budget_crawler,
+            2,
+            12 * MAX_COMPRESSED_RESPONSE_BYTES,
+            32 * MAX_DECODED_RESPONSE_BYTES,
+            Duration::from_secs(4),
+        )
+        .unwrap();
+        assert_eq!(budget_result.report.requests, 2);
+        assert_eq!(budget_result.stop_reason, BoundedStopReason::RequestBudget);
+        assert_eq!(budget_fixture.requests(), ["/robots.txt", "/page"]);
+        assert_eq!(index.query("budget page").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn bounded_dispatch_eligibility_waits_for_origin_backoff_and_robots_retry() {
+        let fixture = LocalFixture::start([(
+            "/robots.txt".to_owned(),
+            FixtureResponse::text("User-agent: LeyBot\nAllow: /\n"),
+        )])
+        .unwrap();
+        let temp = TestDir::new();
+        let index = Arc::new(PersistentIndex::create(temp.path().join("index")).unwrap());
+        let clock = ManualClock::new(10_000);
+        let mut crawler = open_fixture_crawler(
+            &temp.path().join("frontier.sqlite"),
+            index,
+            &fixture,
+            clock.clone(),
+        );
+        let source = policy(&fixture, "scheduler-backoff", clock.now_ms());
+        let seed = fixture_seed(&fixture, "/page");
+        crawler
+            .admit_source(source, std::slice::from_ref(&seed))
+            .unwrap();
+        let origin = origin_of_url(&Url::parse(seed.as_str()).unwrap());
+        crawler
+            .db
+            .conn
+            .execute(
+                "INSERT INTO origin_state(origin,next_request_ms,backoff_until_ms,failures) VALUES (?1,12_000,15_000,2)",
+                [&origin],
+            )
+            .unwrap();
+
+        assert_eq!(
+            crawler.next_dispatch_eligibility(clock.now_ms()).unwrap(),
+            DispatchEligibility::At(15_000)
+        );
+        crawler
+            .db
+            .conn
+            .execute(
+                "INSERT INTO robots_cache(origin,body,expires_ms,denied_retry_ms,reason) VALUES (?1,NULL,0,17_000,'robots retry fixture')",
+                [&origin],
+            )
+            .unwrap();
+        assert_eq!(
+            crawler.next_dispatch_eligibility(clock.now_ms()).unwrap(),
+            DispatchEligibility::At(17_000)
+        );
+        crawler
+            .db
+            .conn
+            .execute(
+                "UPDATE frontier SET state='complete',due_ms=10_000 WHERE url_key=?1",
+                [seed.as_str()],
+            )
+            .unwrap();
+        assert_eq!(
+            crawler.next_dispatch_eligibility(clock.now_ms()).unwrap(),
+            DispatchEligibility::At(17_000)
+        );
+        crawler
+            .db
+            .conn
+            .execute(
+                "UPDATE source_policy SET valid_until_ms=16_000 WHERE source_id='scheduler-backoff'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            crawler.next_dispatch_eligibility(clock.now_ms()).unwrap(),
+            DispatchEligibility::SourceDeadline
+        );
+        crawler
+            .db
+            .conn
+            .execute(
+                "UPDATE source_policy SET request_count=max_requests WHERE source_id='scheduler-backoff'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            crawler.next_dispatch_eligibility(clock.now_ms()).unwrap(),
+            DispatchEligibility::SourceBudget
+        );
+    }
+
+    #[test]
+    fn origin_politeness_deferral_preserves_later_retry_cooldown() {
+        let fixture = LocalFixture::start([
+            (
+                "/robots.txt".to_owned(),
+                FixtureResponse::text("User-agent: LeyBot\nAllow: /\n"),
+            ),
+            (
+                "/a-retry".to_owned(),
+                FixtureResponse::text("retry candidate"),
+            ),
+            (
+                "/z-current".to_owned(),
+                FixtureResponse::text("current candidate"),
+            ),
+        ])
+        .unwrap();
+        let temp = TestDir::new();
+        let index = Arc::new(PersistentIndex::create(temp.path().join("index")).unwrap());
+        let clock = ManualClock::new(10_000);
+        let limits = CrawlLimits {
+            max_retries: 0,
+            ..CrawlLimits::default()
+        };
+        let mut crawler = ControlledCrawler::open(
+            &temp.path().join("frontier.sqlite"),
+            index,
+            SystemResolver,
+            vec![fixture.capability()],
+            limits,
+            clock.clone(),
+        )
+        .unwrap();
+        let mut source = policy(&fixture, "origin-deferral-cooldown", clock.now_ms());
+        source.min_origin_delay_ms = 1_000;
+        let retry_key = fixture_seed(&fixture, "/a-retry");
+        let current_key = fixture_seed(&fixture, "/z-current");
+        crawler
+            .admit_source(source, &[retry_key.clone(), current_key.clone()])
+            .unwrap();
+        let origin = origin_of_url(&Url::parse(retry_key.as_str()).unwrap());
+        crawler
+            .db
+            .conn
+            .execute(
+                "INSERT INTO robots_cache(origin,body,expires_ms,denied_retry_ms,reason) VALUES (?1,?2,?3,0,'')",
+                params![origin, b"User-agent: LeyBot\nAllow: /\n".as_slice(), (clock.now_ms() + 2 * MAX_RETRY_MS) as i64],
+            )
+            .unwrap();
+
+        let mut report = CrawlReport::default();
+        let active_by_origin = HashMap::new();
+        let active_origins = HashSet::new();
+        let Some(WorkerJob::Page(retry_job)) = crawler
+            .next_job(&mut report, 0, 0, 1, &active_by_origin, &active_origins)
+            .unwrap()
+        else {
+            panic!("the first admitted page should be dispatched");
+        };
+        assert_eq!(retry_job.url.path(), "/a-retry");
+        crawler
+            .retry_page(
+                &retry_job,
+                "transport retry limit reached",
+                None,
+                false,
+                &mut report,
+            )
+            .unwrap();
+        let retry_due_ms = clock.now_ms() + MAX_RETRY_MS;
+
+        assert!(
+            crawler
+                .next_job(&mut report, 1, 0, 1, &active_by_origin, &active_origins,)
+                .unwrap()
+                .is_none()
+        );
+        let retry_row = crawler
+            .db
+            .conn
+            .query_row(
+                "SELECT state,due_ms,reason,attempts FROM frontier WHERE url_key=?1",
+                [retry_key.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            retry_row,
+            (
+                "deferred".to_owned(),
+                retry_due_ms as i64,
+                "transport retry limit reached".to_owned(),
+                0,
+            )
+        );
+        let current_row = crawler
+            .db
+            .conn
+            .query_row(
+                "SELECT state,due_ms,reason FROM frontier WHERE url_key=?1",
+                [current_key.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            current_row,
+            (
+                "deferred".to_owned(),
+                (clock.now_ms() + 1_000) as i64,
+                "politeness or backoff delay".to_owned(),
+            )
+        );
+
+        clock.set(clock.now_ms() + 1_000);
+        let Some(WorkerJob::Page(current_job)) = crawler
+            .next_job(&mut report, 1, 0, 1, &active_by_origin, &active_origins)
+            .unwrap()
+        else {
+            panic!("the postponed current page should be dispatched");
+        };
+        assert_eq!(current_job.url.path(), "/z-current");
+
+        clock.set(retry_due_ms);
+        let Some(WorkerJob::Page(eligible_retry)) = crawler
+            .next_job(&mut report, 2, 0, 1, &active_by_origin, &active_origins)
+            .unwrap()
+        else {
+            panic!("the retry should become dispatchable at its cooldown deadline");
+        };
+        assert_eq!(eligible_retry.url.path(), "/a-retry");
+    }
+
+    #[test]
+    fn public_tls_crawler_fetches_page_with_pinned_peer_and_origin_rate_limit() {
+        let host = "public.example.org";
+        let fixture = crate::safe_fetch::tls_test_support::Fixture::start(
+            host,
+            BTreeMap::from([
+                (
+                    "/robots.txt".to_owned(),
+                    crate::safe_fetch::tls_test_support::Response::text(
+                        "User-agent: LeyBot\nAllow: /\n",
+                    ),
+                ),
+                (
+                    "/page".to_owned(),
+                    crate::safe_fetch::tls_test_support::Response::html(
+                        "<title>Owned public TLS fixture</title><p>pinned transport marker</p>",
+                    ),
+                ),
+            ]),
+        );
+        let temp = TestDir::new();
+        let (index, mut crawler) = open_public_tls_crawler(
+            &temp,
+            &fixture,
+            vec![vec![fixture.address]],
+            CrawlLimits::default(),
+            PublicTlsSourceSpec {
+                id: "tls-success",
+                seed_path: "/page",
+                max_requests: 6,
+                min_origin_delay_ms: 1000,
+            },
+        );
+
+        let result = run_bounded_crawl(
+            &mut crawler,
+            6,
+            12 * MAX_COMPRESSED_RESPONSE_BYTES,
+            32 * MAX_DECODED_RESPONSE_BYTES,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let report = result.report;
+
+        assert_eq!(report.requests, 2);
+        assert_eq!(report.indexed, 1);
+        assert_eq!(index.query("pinned transport").unwrap().len(), 1);
+        assert_eq!(fixture.requests(), ["/robots.txt", "/page"]);
+        assert_eq!(
+            fixture.user_agents(),
+            [
+                concat!(
+                    "LeyBot/",
+                    env!("CARGO_PKG_VERSION"),
+                    " (+https://github.com/Suraj-H675/Ley/issues)"
+                ),
+                concat!(
+                    "LeyBot/",
+                    env!("CARGO_PKG_VERSION"),
+                    " (+https://github.com/Suraj-H675/Ley/issues)"
+                )
+            ]
+        );
+        assert_eq!(report.network_evidence.len(), 2);
+        assert!(report.network_evidence.iter().all(|item| {
+            item.connected_peer == fixture.address
+                && item.resolved_addresses == [fixture.address]
+                && !item.proxy_used
+        }));
+        let request_starts = fixture.request_starts();
+        assert_eq!(request_starts.len(), 2);
+        assert!(request_starts[1].duration_since(request_starts[0]) >= Duration::from_millis(950));
+    }
+
+    #[test]
+    fn public_tls_page_and_robots_redirects_revalidate_changed_and_mixed_dns() {
+        let host = "public.example.org";
+        let page_fixture = crate::safe_fetch::tls_test_support::Fixture::start(
+            host,
+            BTreeMap::from([
+                (
+                    "/robots.txt".to_owned(),
+                    crate::safe_fetch::tls_test_support::Response::text(
+                        "User-agent: LeyBot\nAllow: /\n",
+                    ),
+                ),
+                (
+                    "/page".to_owned(),
+                    crate::safe_fetch::tls_test_support::Response::redirect("/next"),
+                ),
+                (
+                    "/next".to_owned(),
+                    crate::safe_fetch::tls_test_support::Response::html(
+                        "<title>Must not connect</title><p>unsafe redirect target</p>",
+                    ),
+                ),
+            ]),
+        );
+        let temp = TestDir::new();
+        let changed_page_answers = vec![
+            vec![page_fixture.address],
+            vec![page_fixture.address],
+            vec![std::net::SocketAddr::new(
+                "127.0.0.2".parse().unwrap(),
+                page_fixture.address.port(),
+            )],
+        ];
+        let limits = CrawlLimits {
+            max_requests_per_run: 3,
+            max_retries: 0,
+            ..CrawlLimits::default()
+        };
+        let (index, mut changed_page) = open_public_tls_crawler(
+            &temp,
+            &page_fixture,
+            changed_page_answers,
+            limits.clone(),
+            PublicTlsSourceSpec {
+                id: "tls-page-changed",
+                seed_path: "/page",
+                max_requests: 3,
+                min_origin_delay_ms: 0,
+            },
+        );
+        let changed_report = changed_page
+            .run_until_idle(&CrawlCancellation::default())
+            .unwrap();
+        assert_eq!(page_fixture.requests(), ["/robots.txt", "/page"]);
+        assert_eq!(changed_report.network_evidence.len(), 2);
+        assert!(index.query("unsafe redirect").unwrap().is_empty());
+
+        let mixed_page_answers = vec![
+            vec![page_fixture.address],
+            vec![page_fixture.address],
+            vec![
+                page_fixture.address,
+                std::net::SocketAddr::new("fd00::9".parse().unwrap(), page_fixture.address.port()),
+            ],
+        ];
+        let (index, mut mixed_page) = open_public_tls_crawler(
+            &temp,
+            &page_fixture,
+            mixed_page_answers,
+            limits,
+            PublicTlsSourceSpec {
+                id: "tls-page-mixed",
+                seed_path: "/page",
+                max_requests: 3,
+                min_origin_delay_ms: 0,
+            },
+        );
+        let mixed_report = mixed_page
+            .run_until_idle(&CrawlCancellation::default())
+            .unwrap();
+        assert_eq!(
+            page_fixture.requests(),
+            ["/robots.txt", "/page", "/robots.txt", "/page"]
+        );
+        assert_eq!(mixed_report.network_evidence.len(), 2);
+        assert!(index.query("unsafe redirect").unwrap().is_empty());
+
+        let robots_fixture = crate::safe_fetch::tls_test_support::Fixture::start(
+            host,
+            BTreeMap::from([
+                (
+                    "/robots.txt".to_owned(),
+                    crate::safe_fetch::tls_test_support::Response::redirect("/robots-next"),
+                ),
+                (
+                    "/robots-next".to_owned(),
+                    crate::safe_fetch::tls_test_support::Response::text(
+                        "User-agent: LeyBot\nAllow: /\n",
+                    ),
+                ),
+                (
+                    "/page".to_owned(),
+                    crate::safe_fetch::tls_test_support::Response::html(
+                        "<title>Robots redirect must deny</title><p>never indexed</p>",
+                    ),
+                ),
+            ]),
+        );
+        let changed_robots_answers = vec![
+            vec![robots_fixture.address],
+            vec![std::net::SocketAddr::new(
+                "127.0.0.2".parse().unwrap(),
+                robots_fixture.address.port(),
+            )],
+        ];
+        let limits = CrawlLimits {
+            max_requests_per_run: 2,
+            max_retries: 0,
+            ..CrawlLimits::default()
+        };
+        let (index, mut changed_robots) = open_public_tls_crawler(
+            &temp,
+            &robots_fixture,
+            changed_robots_answers,
+            limits.clone(),
+            PublicTlsSourceSpec {
+                id: "tls-robots-changed",
+                seed_path: "/page",
+                max_requests: 2,
+                min_origin_delay_ms: 0,
+            },
+        );
+        let changed_robots_report = changed_robots
+            .run_until_idle(&CrawlCancellation::default())
+            .unwrap();
+        assert_eq!(robots_fixture.requests(), ["/robots.txt"]);
+        assert_eq!(changed_robots_report.network_evidence.len(), 1);
+        assert!(index.query("never indexed").unwrap().is_empty());
+
+        let mixed_robots_answers = vec![
+            vec![robots_fixture.address],
+            vec![
+                robots_fixture.address,
+                std::net::SocketAddr::new(
+                    "fd00::9".parse().unwrap(),
+                    robots_fixture.address.port(),
+                ),
+            ],
+        ];
+        let (index, mut mixed_robots) = open_public_tls_crawler(
+            &temp,
+            &robots_fixture,
+            mixed_robots_answers,
+            limits,
+            PublicTlsSourceSpec {
+                id: "tls-robots-mixed",
+                seed_path: "/page",
+                max_requests: 2,
+                min_origin_delay_ms: 0,
+            },
+        );
+        let mixed_robots_report = mixed_robots
+            .run_until_idle(&CrawlCancellation::default())
+            .unwrap();
+        assert_eq!(robots_fixture.requests(), ["/robots.txt", "/robots.txt"]);
+        assert_eq!(mixed_robots_report.network_evidence.len(), 1);
+        assert!(index.query("never indexed").unwrap().is_empty());
+    }
+
+    #[test]
+    fn public_tls_enforces_request_redirect_and_overall_deadline_budgets() {
+        let host = "public.example.org";
+        let mut robot_routes = BTreeMap::from([(
+            "/robots.txt".to_owned(),
+            crate::safe_fetch::tls_test_support::Response::redirect("/hop1"),
+        )]);
+        for index in 1..=6 {
+            robot_routes.insert(
+                format!("/hop{index}"),
+                crate::safe_fetch::tls_test_support::Response::redirect(&format!(
+                    "/hop{}",
+                    index + 1
+                )),
+            );
+        }
+        let robots_fixture =
+            crate::safe_fetch::tls_test_support::Fixture::start(host, robot_routes);
+        let temp = TestDir::new();
+
+        let request_limited = CrawlLimits {
+            max_requests_per_run: 2,
+            max_retries: 0,
+            ..CrawlLimits::default()
+        };
+        let (_, mut request_crawler) = open_public_tls_crawler(
+            &temp,
+            &robots_fixture,
+            vec![vec![robots_fixture.address]],
+            request_limited,
+            PublicTlsSourceSpec {
+                id: "tls-request-budget",
+                seed_path: "/page",
+                max_requests: 2,
+                min_origin_delay_ms: 0,
+            },
+        );
+        let request_report = request_crawler
+            .run_until_idle(&CrawlCancellation::default())
+            .unwrap();
+        assert_eq!(request_report.requests, 2);
+        assert_eq!(robots_fixture.requests(), ["/robots.txt", "/hop1"]);
+
+        let redirect_limited = CrawlLimits {
+            max_requests_per_run: 12,
+            max_retries: 0,
+            ..CrawlLimits::default()
+        };
+        let (_, mut redirect_crawler) = open_public_tls_crawler(
+            &temp,
+            &robots_fixture,
+            vec![vec![robots_fixture.address]],
+            redirect_limited,
+            PublicTlsSourceSpec {
+                id: "tls-robot-redirect-budget",
+                seed_path: "/page",
+                max_requests: 12,
+                min_origin_delay_ms: 0,
+            },
+        );
+        let redirect_report = redirect_crawler
+            .run_until_idle(&CrawlCancellation::default())
+            .unwrap();
+        assert_eq!(redirect_report.requests, 6);
+        assert_eq!(
+            robots_fixture.requests(),
+            [
+                "/robots.txt",
+                "/hop1",
+                "/robots.txt",
+                "/hop1",
+                "/hop2",
+                "/hop3",
+                "/hop4",
+                "/hop5"
+            ]
+        );
+
+        let page_fixture = crate::safe_fetch::tls_test_support::Fixture::start(
+            host,
+            BTreeMap::from([
+                (
+                    "/robots.txt".to_owned(),
+                    crate::safe_fetch::tls_test_support::Response::text(
+                        "User-agent: LeyBot\nAllow: /\n",
+                    ),
+                ),
+                (
+                    "/page".to_owned(),
+                    crate::safe_fetch::tls_test_support::Response::redirect("/p1"),
+                ),
+                (
+                    "/p1".to_owned(),
+                    crate::safe_fetch::tls_test_support::Response::redirect("/p2"),
+                ),
+                (
+                    "/p2".to_owned(),
+                    crate::safe_fetch::tls_test_support::Response::redirect("/p3"),
+                ),
+                (
+                    "/p3".to_owned(),
+                    crate::safe_fetch::tls_test_support::Response::html(
+                        "<title>Page redirect bound</title><p>must not connect</p>",
+                    ),
+                ),
+            ]),
+        );
+        let page_limited = CrawlLimits {
+            page_redirects: 2,
+            max_retries: 0,
+            ..CrawlLimits::default()
+        };
+        let (_, mut page_crawler) = open_public_tls_crawler(
+            &temp,
+            &page_fixture,
+            vec![vec![page_fixture.address]],
+            page_limited,
+            PublicTlsSourceSpec {
+                id: "tls-page-redirect-budget",
+                seed_path: "/page",
+                max_requests: 8,
+                min_origin_delay_ms: 0,
+            },
+        );
+        let page_report = page_crawler
+            .run_until_idle(&CrawlCancellation::default())
+            .unwrap();
+        assert_eq!(
+            page_fixture.requests(),
+            ["/robots.txt", "/page", "/p1", "/p2"]
+        );
+        assert!(page_report.disallowed > 0);
+
+        let deadline_fixture = crate::safe_fetch::tls_test_support::Fixture::start(
+            host,
+            BTreeMap::from([
+                (
+                    "/robots.txt".to_owned(),
+                    crate::safe_fetch::tls_test_support::Response::text(
+                        "User-agent: LeyBot\nAllow: /\n",
+                    ),
+                ),
+                (
+                    "/page".to_owned(),
+                    crate::safe_fetch::tls_test_support::Response::html(
+                        "<title>Overall deadline</title><p>deadline marker</p>",
+                    ),
+                ),
+            ]),
+        );
+        let deadline_limited = CrawlLimits {
+            max_runtime: Duration::from_millis(300),
+            max_retries: 0,
+            ..CrawlLimits::default()
+        };
+        let (_, mut deadline_crawler) = open_public_tls_crawler(
+            &temp,
+            &deadline_fixture,
+            vec![vec![deadline_fixture.address]],
+            deadline_limited,
+            PublicTlsSourceSpec {
+                id: "tls-overall-deadline",
+                seed_path: "/page",
+                max_requests: 6,
+                min_origin_delay_ms: 1000,
+            },
+        );
+        let started = Instant::now();
+        let deadline_result = run_bounded_crawl(
+            &mut deadline_crawler,
+            6,
+            12 * MAX_COMPRESSED_RESPONSE_BYTES,
+            32 * MAX_DECODED_RESPONSE_BYTES,
+            Duration::from_millis(300),
+        )
+        .unwrap();
+        let deadline_report = deadline_result.report;
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(deadline_report.requests, 1);
+        assert_eq!(
+            deadline_result.stop_reason,
+            BoundedStopReason::RuntimeBudget
+        );
+        assert!(
+            deadline_report
+                .failure_reasons
+                .iter()
+                .any(|reason| { reason.contains("due after the public crawl runtime limit") })
+        );
+        assert_eq!(deadline_fixture.requests(), ["/robots.txt"]);
+    }
+
+    #[test]
+    fn repeated_identical_source_admission_is_idempotent_and_keeps_budget_state() {
+        let fixture = LocalFixture::start([(
+            "/robots.txt".to_owned(),
+            FixtureResponse::text("User-agent: LeyBot\nAllow: /\n"),
+        )])
+        .unwrap();
+        let temp = TestDir::new();
+        let index = Arc::new(PersistentIndex::create(temp.path().join("index")).unwrap());
+        let clock = ManualClock::new(10_000);
+        let mut crawler = open_fixture_crawler(
+            &temp.path().join("frontier.sqlite"),
+            index,
+            &fixture,
+            clock.clone(),
+        );
+        let mut source = policy(&fixture, "repeat-admission", clock.now_ms());
+        source.retention = RetentionPolicy::Until(clock.now_ms() + 5_000);
+        let source_request_limit = source.max_requests as i64;
+        let seed = fixture_seed(&fixture, "/");
+        crawler
+            .admit_source(source.clone(), std::slice::from_ref(&seed))
+            .unwrap();
+        crawler
+            .db
+            .conn
+            .execute(
+                "UPDATE source_policy SET request_count=7 WHERE source_id='repeat-admission'",
+                [],
+            )
+            .unwrap();
+
+        let mut later_retention_deadline = source.clone();
+        later_retention_deadline.retention = RetentionPolicy::Until(clock.now_ms() + 20_000);
+        crawler
+            .admit_source(later_retention_deadline, std::slice::from_ref(&seed))
+            .unwrap();
+
+        let mut changed_policy = source;
+        changed_policy.max_requests += 1;
+        assert!(matches!(
+            crawler.admit_source(changed_policy, std::slice::from_ref(&seed)),
+            Err(CrawlError::Policy(_))
+        ));
+
+        let (sources, frontier, candidates, request_count, retention, max_requests):
+            (i64, i64, i64, i64, i64, i64) = crawler
+            .db
+            .conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM source_policy WHERE source_id='repeat-admission'), (SELECT COUNT(*) FROM frontier WHERE source_id='repeat-admission'), (SELECT COUNT(*) FROM crawl_event WHERE source_id='repeat-admission' AND state='candidate'), (SELECT request_count FROM source_policy WHERE source_id='repeat-admission'), (SELECT retention_until_ms FROM source_policy WHERE source_id='repeat-admission'), (SELECT max_requests FROM source_policy WHERE source_id='repeat-admission')",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!((sources, frontier, candidates, request_count), (1, 1, 1, 7));
+        assert_eq!(retention, 15_000);
+        assert_eq!(max_requests, source_request_limit);
     }
 
     #[test]
@@ -3874,7 +5504,13 @@ mod tests {
         assert_eq!(observed_headers.len(), 3);
         assert!(observed_headers.iter().all(|headers| {
             headers.iter().any(|(name, value)| {
-                name == "user-agent" && value == concat!("LeyBot/", env!("CARGO_PKG_VERSION"))
+                name == "user-agent"
+                    && value
+                        == concat!(
+                            "LeyBot/",
+                            env!("CARGO_PKG_VERSION"),
+                            " (+https://github.com/Suraj-H675/Ley/issues)"
+                        )
             })
         }));
         let urls = vec![
@@ -3980,7 +5616,13 @@ mod tests {
         assert_eq!(observed_headers.len(), 6);
         assert!(observed_headers.iter().all(|headers| {
             headers.iter().any(|(name, value)| {
-                name == "user-agent" && value == concat!("LeyBot/", env!("CARGO_PKG_VERSION"))
+                name == "user-agent"
+                    && value
+                        == concat!(
+                            "LeyBot/",
+                            env!("CARGO_PKG_VERSION"),
+                            " (+https://github.com/Suraj-H675/Ley/issues)"
+                        )
             })
         }));
         assert_eq!(report.indexed, 0);
@@ -4431,7 +6073,7 @@ mod tests {
             )
             .unwrap();
 
-        crawler
+        let report = crawler
             .run_until_idle(&CrawlCancellation::default())
             .unwrap();
 
@@ -4447,6 +6089,17 @@ mod tests {
         assert!(counts.contains("enqueued=0"), "{counts}");
         assert!(counts.contains("source_denied=1"), "{counts}");
         assert!(counts.contains("duplicate=1"), "{counts}");
+        assert_eq!(report.duplicate_urls, 1);
+        assert_eq!(report.link_discovery.candidates(), 2);
+        assert_eq!(report.link_discovery.enqueued, 0);
+        assert_eq!(report.link_discovery.source_denied, 1);
+        assert_eq!(report.link_discovery.duplicates, 1);
+        assert_eq!(report.link_discovery.malformed, 0);
+        assert_eq!(report.link_discovery.capacity, 0);
+        let replay = crawler
+            .run_until_idle(&CrawlCancellation::default())
+            .unwrap();
+        assert_eq!(replay.link_discovery, LinkDiscoveryCounts::default());
         assert_eq!(fixture.accepted_connections(), 3);
         assert_eq!(denied.accepted_connections(), 0);
     }
@@ -6737,6 +8390,56 @@ mod tests {
         assert_eq!(after_readmission.indexed, 1);
         assert_eq!(index.query("renewed").unwrap().len(), 1);
         assert_eq!(fixture.accepted_connections(), 3);
+    }
+
+    #[test]
+    fn local_source_revocation_command_tombstones_without_network_access() {
+        let fixture = LocalFixture::start([
+            (
+                "/robots.txt".to_owned(),
+                FixtureResponse::text("User-agent: LeyBot\nAllow: /\n"),
+            ),
+            (
+                "/".to_owned(),
+                FixtureResponse::html("<title>Local removal</title><p>withdrawal marker</p>"),
+            ),
+        ])
+        .unwrap();
+        let temp = TestDir::new();
+        let index_path = temp.path().join("index");
+        let frontier_path = temp.path().join("frontier.sqlite");
+        let index = Arc::new(PersistentIndex::create(&index_path).unwrap());
+        let now = SystemClock.now_ms();
+        let clock = ManualClock::new(now);
+        let mut crawler =
+            open_fixture_crawler(&frontier_path, Arc::clone(&index), &fixture, clock.clone());
+        crawler
+            .admit_source(
+                policy(&fixture, "local-removal", clock.now_ms()),
+                &[fixture_seed(&fixture, "/")],
+            )
+            .unwrap();
+        assert_eq!(
+            crawler
+                .run_until_idle(&CrawlCancellation::default())
+                .unwrap()
+                .indexed,
+            1
+        );
+        let requests_before_revoke = fixture.request_log();
+        assert_eq!(index.query("withdrawal").unwrap().len(), 1);
+        drop(crawler);
+
+        revoke_public_source(&index_path, &frontier_path, "local-removal").unwrap();
+
+        assert!(
+            PersistentIndex::open(&index_path)
+                .unwrap()
+                .query("withdrawal")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(fixture.request_log(), requests_before_revoke);
     }
 
     #[test]

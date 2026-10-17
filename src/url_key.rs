@@ -3,6 +3,60 @@ use url::Url;
 
 pub const MAX_URL_KEY_BYTES: usize = 2048;
 
+/// Returns whether an encoded URL path falls within a slash-delimited scope.
+/// Encoded separators, encoded percent signs, and encoded dot segments are
+/// rejected so server-side decoding cannot widen the reviewed path scope.
+pub(crate) fn path_is_within_prefix(path: &str, prefix: &str) -> bool {
+    if !path.starts_with('/')
+        || !prefix.starts_with('/')
+        || has_ambiguous_path_encoding(path)
+        || has_ambiguous_path_encoding(prefix)
+    {
+        return false;
+    }
+    if prefix == "/" || prefix.ends_with('/') {
+        return path.starts_with(prefix);
+    }
+    path == prefix
+        || path
+            .strip_prefix(prefix)
+            .is_some_and(|remainder| remainder.starts_with('/'))
+}
+
+fn has_ambiguous_path_encoding(path: &str) -> bool {
+    for segment in path.split('/') {
+        let mut decoded = Vec::with_capacity(segment.len());
+        let bytes = segment.as_bytes();
+        let mut cursor = 0;
+        while cursor < bytes.len() {
+            if bytes[cursor] == b'%' {
+                let Some(pair) = bytes.get(cursor + 1..cursor + 3) else {
+                    return true;
+                };
+                let Some(high) = (pair[0] as char).to_digit(16) else {
+                    return true;
+                };
+                let Some(low) = (pair[1] as char).to_digit(16) else {
+                    return true;
+                };
+                let value = ((high << 4) | low) as u8;
+                if matches!(value, b'/' | b'\\' | b'%') {
+                    return true;
+                }
+                decoded.push(value);
+                cursor += 3;
+            } else {
+                decoded.push(bytes[cursor]);
+                cursor += 1;
+            }
+        }
+        if decoded == b"." || decoded == b".." {
+            return true;
+        }
+    }
+    false
+}
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Hash)]
 pub struct UrlKey(String);
 
@@ -271,6 +325,27 @@ mod tests {
                 bytes: MAX_URL_KEY_BYTES + 1
             })
         );
+    }
+
+    #[test]
+    fn path_scopes_require_segment_boundaries_and_reject_ambiguous_escapes() {
+        for (path, prefix, expected) in [
+            ("/public", "/public", true),
+            ("/public/article", "/public", true),
+            ("/public/article", "/public/", true),
+            ("/publicity/article", "/public", false),
+            ("/public%2fsecret", "/public", false),
+            ("/public/%2e%2e/private", "/public/", false),
+            ("/public/%252fsecret", "/public/", false),
+            ("/private", "/public/", false),
+            ("/private", "/", true),
+        ] {
+            assert_eq!(
+                path_is_within_prefix(path, prefix),
+                expected,
+                "{path} under {prefix}"
+            );
+        }
     }
 
     #[test]

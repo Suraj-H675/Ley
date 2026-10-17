@@ -5,6 +5,7 @@ use std::io::{self, Read, Write};
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
@@ -18,6 +19,10 @@ const STORE_NAME: &str = "STORE";
 const LEASE_KEY_NAME: &str = "LEASE_KEY";
 const LOCK_NAME: &str = "LOCK";
 const CURRENT_NAME: &str = "CURRENT";
+const PUBLIC_COLLECTION_NAME: &str = "PUBLIC_COLLECTION";
+const PUBLIC_NOTICE_NAME: &str = "rust-stdlib-documentation-MIT.txt";
+const MAX_PUBLIC_COLLECTION_BYTES: usize = 16 * 1024;
+const MAX_PUBLIC_NOTICE_BYTES: usize = 16 * 1024;
 const STORE_MAGIC: &[u8; 8] = b"LEYSTOR3";
 const LEASE_KEY_MAGIC: &[u8; 8] = b"LEYMACK3";
 const CURRENT_MAGIC: &[u8; 8] = b"LEYHEAD3";
@@ -27,6 +32,8 @@ const LEASE_DOMAIN: &[u8] = b"ley-fence-lease-v1\0";
 const LEASE_VERSION: u16 = 1;
 const FORMAT_MAJOR: u16 = 0;
 const FORMAT_MINOR: u16 = 3;
+const PUBLIC_STORE_MINOR: u16 = 4;
+const PUBLIC_STORE_FLAG: u32 = 1;
 const STORE_BYTES: usize = 64;
 const LEASE_KEY_BYTES: usize = 96;
 const CURRENT_BYTES: usize = 112;
@@ -43,6 +50,7 @@ const MAX_EFFECTIVE_URL_BYTES: usize = 2048;
 const LEASE_HEADER_BYTES: usize = 38;
 const LEASE_TAG_BYTES: usize = 32;
 const MAX_LEASE_TOKEN_BYTES: usize = LEASE_HEADER_BYTES + MAX_URL_KEY_BYTES + LEASE_TAG_BYTES;
+const PUBLIC_COLLECTION_DOMAIN: &[u8] = b"ley-public-collection-v1\0";
 
 type StoreId = [u8; 16];
 type VersionId = [u8; 32];
@@ -85,6 +93,9 @@ pub enum StorageError {
     NotRevoked,
     CapacityExceeded(&'static str),
     UnsupportedPlatform,
+    PublicCollectionExpired,
+    PublicCollectionConflict,
+    ClockUnavailable,
 }
 
 impl fmt::Display for StorageError {
@@ -115,6 +126,15 @@ impl fmt::Display for StorageError {
             Self::CapacityExceeded(limit) => write!(f, "storage capacity exceeded: {limit}"),
             Self::UnsupportedPlatform => {
                 f.write_str("the storage adapter currently supports Linux only")
+            }
+            Self::PublicCollectionExpired => {
+                f.write_str("public collection retention or policy deadline has expired")
+            }
+            Self::PublicCollectionConflict => {
+                f.write_str("public collection policy conflicts with this index store")
+            }
+            Self::ClockUnavailable => {
+                f.write_str("system clock is unavailable for public collection checks")
             }
         }
     }
@@ -162,6 +182,44 @@ impl FenceLease {
 #[derive(Clone)]
 pub struct ReadView {
     generation: Arc<Generation>,
+    public_visible_until_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PublicCollectionGate {
+    pub policy_sha256: String,
+    pub source_id: String,
+    pub origin: String,
+    pub path_prefixes: Vec<String>,
+    pub installed_at_ms: u64,
+    pub visible_until_ms: u64,
+    pub license: String,
+    pub source_version: String,
+    pub notice_file: String,
+    pub notice_sha256: String,
+}
+
+impl PublicCollectionGate {
+    fn same_admission(&self, other: &Self) -> bool {
+        self.policy_sha256 == other.policy_sha256
+            && self.source_id == other.source_id
+            && self.origin == other.origin
+            && self.path_prefixes == other.path_prefixes
+            && self.license == other.license
+            && self.source_version == other.source_version
+            && self.notice_file == other.notice_file
+            && self.notice_sha256 == other.notice_sha256
+    }
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct PublicCollectionRecord {
+    schema: String,
+    store_id: [u8; 16],
+    gate: PublicCollectionGate,
+    mac: String,
 }
 
 impl ReadView {
@@ -169,7 +227,21 @@ impl ReadView {
         self.generation.id
     }
 
+    pub fn document_count(&self) -> usize {
+        self.generation.index.len()
+    }
+
     pub fn query(&self, expression: &str) -> Result<Vec<SearchResult>, StorageError> {
+        self.query_at(expression, system_time_ms()?)
+    }
+
+    fn query_at(&self, expression: &str, now_ms: u64) -> Result<Vec<SearchResult>, StorageError> {
+        if self
+            .public_visible_until_ms
+            .is_some_and(|deadline| now_ms >= deadline)
+        {
+            return Err(StorageError::PublicCollectionExpired);
+        }
         let mut results = self
             .generation
             .index
@@ -269,7 +341,7 @@ impl PersistentIndex {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
         let path = path.as_ref().to_path_buf();
         validate_store_directory(&path)?;
-        let store_id = decode_store(&read_bounded_file(&path.join(STORE_NAME), STORE_BYTES)?)?;
+        let (store_id, _) = decode_store(&read_bounded_file(&path.join(STORE_NAME), STORE_BYTES)?)?;
         let store = Self {
             path: fs::canonicalize(path)?,
             store_id,
@@ -450,11 +522,76 @@ impl PersistentIndex {
         Ok(ApplyOutcome::Applied)
     }
 
+    pub(crate) fn install_public_collection_gate(
+        &self,
+        gate: &PublicCollectionGate,
+        notice: &[u8],
+        now_ms: u64,
+    ) -> Result<(), StorageError> {
+        validate_public_collection_gate(gate)?;
+        if notice.is_empty()
+            || notice.len() > MAX_PUBLIC_NOTICE_BYTES
+            || sha256(notice) != decode_sha256(&gate.notice_sha256)?
+            || gate.installed_at_ms > now_ms
+        {
+            return Err(StorageError::PublicCollectionConflict);
+        }
+
+        let _writer = self
+            .writer
+            .lock()
+            .map_err(|_| StorageError::CorruptCommitted("writer mutex was poisoned".to_owned()))?;
+        let _lock = self.lock_exclusive()?;
+        let current = self.load_committed_locked()?;
+        if let Some(existing) = self.load_public_collection_locked()? {
+            if !existing.same_admission(gate) {
+                return Err(StorageError::PublicCollectionConflict);
+            }
+            if now_ms >= existing.visible_until_ms {
+                return Err(StorageError::PublicCollectionExpired);
+            }
+            let stored_notice =
+                read_bounded_file(&self.path.join(PUBLIC_NOTICE_NAME), MAX_PUBLIC_NOTICE_BYTES)?;
+            if stored_notice != notice {
+                return Err(corrupt(
+                    "public source notice differs from its admitted copy",
+                ));
+            }
+            self.mark_store_as_public_collection()?;
+            return Ok(());
+        }
+        if current.id != 1 || !current.index.is_empty() || gate.visible_until_ms <= now_ms {
+            return Err(StorageError::PublicCollectionConflict);
+        }
+
+        self.install_public_notice(notice)?;
+        let mac_key = self.ensure_lease_mac_key_locked()?;
+        let record = encode_public_collection_record(self.store_id, gate, &mac_key)?;
+        write_private_file_atomically(
+            &self.path.join(PUBLIC_COLLECTION_NAME),
+            &self.path.join(".PUBLIC_COLLECTION.tmp"),
+            &record,
+        )?;
+        self.mark_store_as_public_collection()?;
+        Ok(())
+    }
+
     pub fn read_view(&self) -> Result<ReadView, StorageError> {
+        self.read_view_at(system_time_ms()?)
+    }
+
+    pub(crate) fn read_view_at(&self, now_ms: u64) -> Result<ReadView, StorageError> {
         let _lock = self.lock_shared()?;
+        let public_visible_until_ms = self
+            .load_public_collection_locked()?
+            .map(|gate| gate.visible_until_ms);
+        if public_visible_until_ms.is_some_and(|deadline| now_ms >= deadline) {
+            return Err(StorageError::PublicCollectionExpired);
+        }
         let generation = self.load_committed_locked()?;
         Ok(ReadView {
             generation: Arc::new(generation),
+            public_visible_until_ms,
         })
     }
 
@@ -565,6 +702,73 @@ impl PersistentIndex {
         decode_lease_key(&bytes, self.store_id)
     }
 
+    fn load_public_collection_locked(&self) -> Result<Option<PublicCollectionGate>, StorageError> {
+        let store_bytes = read_bounded_file(&self.path.join(STORE_NAME), STORE_BYTES)?;
+        let (store_id, requires_public_gate) = decode_store(&store_bytes)?;
+        if store_id != self.store_id {
+            return Err(corrupt("STORE identity changed while open"));
+        }
+        let path = self.path.join(PUBLIC_COLLECTION_NAME);
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if requires_public_gate {
+                    return Err(corrupt("public collection metadata is missing"));
+                }
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+            Ok(metadata) if !metadata.file_type().is_file() => {
+                return Err(corrupt("public collection metadata is not a regular file"));
+            }
+            Ok(_) => {}
+        }
+        let bytes = read_bounded_file(&path, MAX_PUBLIC_COLLECTION_BYTES)?;
+        let mac_key = self.read_lease_mac_key_locked()?;
+        let gate = decode_public_collection_record(&bytes, self.store_id, &mac_key)?;
+        let notice =
+            read_bounded_file(&self.path.join(PUBLIC_NOTICE_NAME), MAX_PUBLIC_NOTICE_BYTES)?;
+        if sha256(&notice) != decode_sha256(&gate.notice_sha256)? {
+            return Err(corrupt("public source notice checksum mismatch"));
+        }
+        Ok(Some(gate))
+    }
+
+    fn mark_store_as_public_collection(&self) -> Result<(), StorageError> {
+        let path = self.path.join(STORE_NAME);
+        let store_bytes = read_bounded_file(&path, STORE_BYTES)?;
+        let (store_id, requires_public_gate) = decode_store(&store_bytes)?;
+        if store_id != self.store_id {
+            return Err(corrupt("STORE identity changed while open"));
+        }
+        if !requires_public_gate {
+            write_private_file_atomically(
+                &path,
+                &self.path.join(".STORE.tmp"),
+                &encode_public_store(self.store_id),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn install_public_notice(&self, notice: &[u8]) -> Result<(), StorageError> {
+        let path = self.path.join(PUBLIC_NOTICE_NAME);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_file() => {
+                if read_bounded_file(&path, MAX_PUBLIC_NOTICE_BYTES)? != notice {
+                    return Err(StorageError::PublicCollectionConflict);
+                }
+                Ok(())
+            }
+            Ok(_) => Err(corrupt("public source notice path is not a regular file")),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => write_private_file_atomically(
+                &path,
+                &self.path.join(".rust-stdlib-documentation-MIT.txt.tmp"),
+                notice,
+            ),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     fn ensure_lease_mac_key_locked(&self) -> Result<LeaseMacKey, StorageError> {
         let path = self.path.join(LEASE_KEY_NAME);
         match read_bounded_file(&path, LEASE_KEY_BYTES) {
@@ -618,17 +822,132 @@ fn is_revoked(control: &DocumentControl) -> bool {
 }
 
 fn encode_store(store_id: StoreId) -> Vec<u8> {
+    encode_store_version(store_id, FORMAT_MINOR, 0)
+}
+
+fn encode_public_store(store_id: StoreId) -> Vec<u8> {
+    encode_store_version(store_id, PUBLIC_STORE_MINOR, PUBLIC_STORE_FLAG)
+}
+
+fn encode_store_version(store_id: StoreId, minor: u16, flags: u32) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(STORE_BYTES);
     bytes.extend_from_slice(STORE_MAGIC);
     put_u16(&mut bytes, FORMAT_MAJOR);
-    put_u16(&mut bytes, FORMAT_MINOR);
-    put_u32(&mut bytes, 0);
+    put_u16(&mut bytes, minor);
+    put_u32(&mut bytes, flags);
     bytes.extend_from_slice(&store_id);
     bytes.extend_from_slice(&sha256(&bytes));
     bytes
 }
 
-fn decode_store(bytes: &[u8]) -> Result<StoreId, StorageError> {
+fn validate_public_collection_gate(gate: &PublicCollectionGate) -> Result<(), StorageError> {
+    let origin =
+        url::Url::parse(&gate.origin).map_err(|_| StorageError::PublicCollectionConflict)?;
+    if !is_lower_sha256(&gate.policy_sha256)
+        || gate.source_id.is_empty()
+        || gate.source_id.len() > 128
+        || !gate
+            .source_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        || origin.scheme() != "https"
+        || !origin.username().is_empty()
+        || origin.password().is_some()
+        || origin.path() != "/"
+        || origin.query().is_some()
+        || origin.fragment().is_some()
+        || origin.origin().ascii_serialization() != gate.origin
+        || gate.path_prefixes.is_empty()
+        || gate.path_prefixes.len() > 64
+        || gate.path_prefixes.iter().any(|path| {
+            path.len() > MAX_URL_KEY_BYTES
+                || !crate::url_key::path_is_within_prefix(path, path)
+                || path.contains(['?', '#', '\\', '\r', '\n'])
+        })
+        || gate.installed_at_ms == 0
+        || gate.visible_until_ms <= gate.installed_at_ms
+        || gate.license != "MIT"
+        || gate.source_version.is_empty()
+        || gate.source_version.len() > 200
+        || gate.source_version.chars().any(char::is_control)
+        || gate.notice_file != PUBLIC_NOTICE_NAME
+        || !is_lower_sha256(&gate.notice_sha256)
+    {
+        return Err(StorageError::PublicCollectionConflict);
+    }
+    Ok(())
+}
+
+fn is_lower_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn decode_sha256(value: &str) -> Result<[u8; 32], StorageError> {
+    if !is_lower_sha256(value) {
+        return Err(corrupt("SHA-256 value has an invalid encoding"));
+    }
+    let mut decoded = [0; 32];
+    for (index, byte) in decoded.iter_mut().enumerate() {
+        *byte = (hex_nibble(value.as_bytes()[index * 2])? << 4)
+            | hex_nibble(value.as_bytes()[index * 2 + 1])?;
+    }
+    Ok(decoded)
+}
+
+fn encode_public_collection_record(
+    store_id: StoreId,
+    gate: &PublicCollectionGate,
+    mac_key: &LeaseMacKey,
+) -> Result<Vec<u8>, StorageError> {
+    validate_public_collection_gate(gate)?;
+    let payload = serde_json::to_vec(gate)
+        .map_err(|_| corrupt("public collection metadata could not be encoded"))?;
+    let mut mac = HmacSha256::new_from_slice(mac_key)
+        .map_err(|_| corrupt("public collection authentication key is invalid"))?;
+    mac.update(PUBLIC_COLLECTION_DOMAIN);
+    mac.update(&store_id);
+    mac.update(&payload);
+    let tag = mac.finalize().into_bytes();
+    let record = PublicCollectionRecord {
+        schema: "ley-public-collection-v1".to_owned(),
+        store_id,
+        gate: gate.clone(),
+        mac: tag.iter().map(|byte| format!("{byte:02x}")).collect(),
+    };
+    serde_json::to_vec(&record)
+        .map_err(|_| corrupt("public collection record could not be encoded"))
+}
+
+fn decode_public_collection_record(
+    bytes: &[u8],
+    expected_store_id: StoreId,
+    mac_key: &LeaseMacKey,
+) -> Result<PublicCollectionGate, StorageError> {
+    let record: PublicCollectionRecord = serde_json::from_slice(bytes)
+        .map_err(|_| corrupt("public collection record is invalid"))?;
+    validate_public_collection_gate(&record.gate)?;
+    if record.schema != "ley-public-collection-v1" || record.store_id != expected_store_id {
+        return Err(corrupt(
+            "public collection record belongs to a different store",
+        ));
+    }
+    let payload = serde_json::to_vec(&record.gate)
+        .map_err(|_| corrupt("public collection metadata could not be encoded"))?;
+    let tag = decode_sha256(&record.mac)?;
+    let mut mac = HmacSha256::new_from_slice(mac_key)
+        .map_err(|_| corrupt("public collection authentication key is invalid"))?;
+    mac.update(PUBLIC_COLLECTION_DOMAIN);
+    mac.update(&expected_store_id);
+    mac.update(&payload);
+    mac.verify_slice(&tag)
+        .map_err(|_| corrupt("public collection authentication failed"))?;
+    Ok(record.gate)
+}
+
+fn decode_store(bytes: &[u8]) -> Result<(StoreId, bool), StorageError> {
     if bytes.len() != STORE_BYTES {
         return Err(corrupt("STORE has an invalid length"));
     }
@@ -637,18 +956,21 @@ fn decode_store(bytes: &[u8]) -> Result<StoreId, StorageError> {
     }
     let major = get_u16(bytes, 8)?;
     let minor = get_u16(bytes, 10)?;
-    if major != FORMAT_MAJOR || minor != FORMAT_MINOR {
-        return Err(StorageError::UnsupportedFormat { major, minor });
-    }
-    if get_u32(bytes, 12)? != 0 {
-        return Err(corrupt("STORE reserved flags are nonzero"));
-    }
+    let flags = get_u32(bytes, 12)?;
+    let requires_public_gate = match (major, minor, flags) {
+        (FORMAT_MAJOR, FORMAT_MINOR, 0) => false,
+        (FORMAT_MAJOR, PUBLIC_STORE_MINOR, PUBLIC_STORE_FLAG) => true,
+        (FORMAT_MAJOR, version, _) if version == FORMAT_MINOR || version == PUBLIC_STORE_MINOR => {
+            return Err(corrupt("STORE flags do not match its version"));
+        }
+        _ => return Err(StorageError::UnsupportedFormat { major, minor }),
+    };
     if sha256(&bytes[..32]) != bytes[32..64] {
         return Err(corrupt("STORE checksum mismatch"));
     }
     let mut id = [0; 16];
     id.copy_from_slice(&bytes[16..32]);
-    Ok(id)
+    Ok((id, requires_public_gate))
 }
 
 fn encode_lease_key(store_id: StoreId, lease_mac_key: LeaseMacKey) -> Vec<u8> {
@@ -1808,6 +2130,31 @@ fn create_private_file(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
     Ok(())
 }
 
+fn write_private_file_atomically(
+    destination: &Path,
+    temporary: &Path,
+    bytes: &[u8],
+) -> Result<(), StorageError> {
+    match fs::symlink_metadata(temporary) {
+        Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => {
+            fs::remove_file(temporary)?;
+        }
+        Ok(_) => return Err(corrupt("public collection temporary path is not a file")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let mut file = create_private_file_handle(temporary)?;
+    file.write_all(bytes)?;
+    file.flush()?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(temporary, destination)?;
+    let directory = destination
+        .parent()
+        .ok_or_else(|| corrupt("public collection file has no parent directory"))?;
+    sync_directory(directory)
+}
+
 fn create_private_file_handle(path: &Path) -> Result<File, StorageError> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -1929,6 +2276,14 @@ fn hex_nibble(byte: u8) -> Result<u8, StorageError> {
 
 fn sha256(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
+}
+
+fn system_time_ms() -> Result<u64, StorageError> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| StorageError::ClockUnavailable)?
+        .as_millis()
+        .min(u64::MAX as u128) as u64)
 }
 
 fn to_u16(value: usize, label: &'static str) -> Result<u16, StorageError> {
@@ -2175,6 +2530,119 @@ mod tests {
 
     fn key(path: &str) -> UrlKey {
         UrlKey::parse(&format!("https://example.test/{path}")).unwrap()
+    }
+
+    fn public_gate(
+        notice: &[u8],
+        installed_at_ms: u64,
+        visible_until_ms: u64,
+    ) -> PublicCollectionGate {
+        PublicCollectionGate {
+            policy_sha256: "a".repeat(64),
+            source_id: "rust-stdlib-docs-candidate".to_owned(),
+            origin: "https://doc.rust-lang.org".to_owned(),
+            path_prefixes: vec!["/stable/std/string/struct.String.html".to_owned()],
+            installed_at_ms,
+            visible_until_ms,
+            license: "MIT".to_owned(),
+            source_version: "rustdoc test fixture".to_owned(),
+            notice_file: PUBLIC_NOTICE_NAME.to_owned(),
+            notice_sha256: sha256(notice)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn public_collection_expiry_is_durable_and_repeated_install_does_not_extend_it() {
+        let temp = TempStore::new();
+        let store = PersistentIndex::create(temp.path()).unwrap();
+        let notice = b"full source license notice";
+        let gate = public_gate(notice, 10, 40);
+        store
+            .install_public_collection_gate(&gate, notice, 10)
+            .unwrap();
+
+        let document =
+            UrlKey::parse("https://doc.rust-lang.org/stable/std/string/struct.String.html")
+                .unwrap();
+        let lease = store.issue_fence(&document).unwrap();
+        store
+            .apply(
+                &lease,
+                Intent::Upsert {
+                    effective_url: document.as_str().to_owned(),
+                    title: "Rust string".to_owned(),
+                    body: "rust collection retention".to_owned(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            fs::read(store.path.join(PUBLIC_NOTICE_NAME)).unwrap(),
+            notice
+        );
+        assert_eq!(
+            store
+                .read_view_at(39)
+                .unwrap()
+                .query_at("rust", 39)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let reopened = PersistentIndex::open(store.path.clone()).unwrap();
+        let proposed_later_deadline = public_gate(notice, 20, 50);
+        reopened
+            .install_public_collection_gate(&proposed_later_deadline, notice, 20)
+            .unwrap();
+        assert_eq!(
+            reopened
+                .read_view_at(39)
+                .unwrap()
+                .query_at("rust", 39)
+                .unwrap()
+                .len(),
+            1
+        );
+        let pinned_before_expiry = reopened.read_view_at(39).unwrap();
+        assert!(matches!(
+            pinned_before_expiry.query_at("rust", 40),
+            Err(StorageError::PublicCollectionExpired)
+        ));
+        assert!(matches!(
+            reopened.read_view_at(40),
+            Err(StorageError::PublicCollectionExpired)
+        ));
+        fs::remove_file(reopened.path.join(PUBLIC_COLLECTION_NAME)).unwrap();
+        assert!(matches!(
+            reopened.read_view_at(39),
+            Err(StorageError::CorruptCommitted(_))
+        ));
+    }
+
+    #[test]
+    fn public_collection_gate_cannot_be_added_after_documents_are_visible() {
+        let temp = TempStore::new();
+        let store = PersistentIndex::create(temp.path()).unwrap();
+        let document = key("fixture");
+        let lease = store.issue_fence(&document).unwrap();
+        store
+            .apply(
+                &lease,
+                Intent::Upsert {
+                    effective_url: document.as_str().to_owned(),
+                    title: "local fixture".to_owned(),
+                    body: "local content".to_owned(),
+                },
+            )
+            .unwrap();
+        let notice = b"full source license notice";
+        assert!(matches!(
+            store.install_public_collection_gate(&public_gate(notice, 10, 40), notice, 10),
+            Err(StorageError::PublicCollectionConflict)
+        ));
     }
 
     fn write_lease_bundle(root: &Path, leases: &[Vec<u8>]) {

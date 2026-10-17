@@ -1,0 +1,57 @@
+{
+  "schema": "ley-public-sources-v1",
+  "enabled": false,
+  "identity": "LeyBot/0.1.0",
+  "contact": "https://github.com/Suraj-H675/Ley/issues",
+  "sources": [
+    {
+      "id": "rust-stdlib-docs-candidate",
+      "origin": "https://doc.rust-lang.org",
+      "path_prefixes": [
+        "/stable/std/string/struct.String.html",
+        "/stable/std/collections/struct.HashMap.html",
+        "/stable/std/iter/trait.Iterator.html"
+      ],
+      "seeds": [
+        "https://doc.rust-lang.org/stable/std/string/struct.String.html",
+        "https://doc.rust-lang.org/stable/std/collections/struct.HashMap.html",
+        "https://doc.rust-lang.org/stable/std/iter/trait.Iterator.html"
+      ],
+      "fetch_permission": {
+        "granted": true,
+        "basis": "MIT license basis for fetching the reviewed plain-text standard-library documentation. Rust's official licensing page says official Rust projects, including its website, are generally Apache-2.0 OR MIT. This is a copyright-license basis, not a signed permission statement. Robots and exact path scope remain mandatory.",
+        "evidence": "Work read-only review 2026-10-14 inspected the three exact seeds and https://rust-lang.org/policies/licenses/, linked from https://rust-lang.org/policies/. Hosted std pages report rustdoc 1.99.0 (b940084d7, 2026-09-28).",
+        "reviewed_at_ms": 1791966032000
+      },
+      "storage_permission": {
+        "granted": true,
+        "basis": "MIT permits copying and distribution when the copyright and permission notices travel with copies. Retain the full notice beside private corpus data and expose it beside displayed excerpts. A removal request stops current display; immutable historical bytes remain private under the license.",
+        "evidence": "Work read-only review 2026-10-14 inspected the three exact seeds and the official Rust licensing page. Retained notice: notices/rust-stdlib-documentation-MIT.txt. Local COPYRIGHT-library.html SHA-256 0a65bb747c49c7bb816cbc7188319bd6e4e8d08091c1190b8a3c0971c47968ed supports Rust attribution and notes contributor copyright and file exceptions.",
+        "reviewed_at_ms": 1791966032000
+      },
+      "index_permission": {
+        "granted": true,
+        "basis": "MIT permits use, modification, and distribution of copies or substantial portions with the required notices. Ley indexes only the admitted plain-text fields and keeps source links and the full MIT notice with results.",
+        "evidence": "Work read-only review 2026-10-14 inspected the three exact standard-library pages, their hosted rustdoc 1.99.0 (b940084d7, 2026-09-28) identity, and https://rust-lang.org/policies/licenses/. Images, logos, and third-party material are excluded.",
+        "reviewed_at_ms": 1791966032000
+      },
+      "display_permission": {
+        "granted": true,
+        "basis": "MIT permits distribution of the reviewed plain-text documentation with its copyright and permission notices. Each displayed result links to its source and the UI provides the full local notice. Images, logos, and other third-party material are excluded.",
+        "evidence": "Work read-only review 2026-10-14 inspected the three exact hosted pages and https://rust-lang.org/policies/licenses/. The official Rust policy describes official Rust projects, including the website, as generally dual-licensed Apache-2.0 OR MIT.",
+        "reviewed_at_ms": 1791966032000
+      },
+      "license": "MIT",
+      "source_version": "rustdoc 1.99.0 (b940084d7, 2026-09-28)",
+      "notice_file": "rust-stdlib-documentation-MIT.txt",
+      "robots": "obey",
+      "removal_contact": "https://github.com/Suraj-H675/Ley/issues",
+      "retention_days": 30,
+      "expires_at_ms": 1795845032000,
+      "max_requests": 6,
+      "min_origin_delay_ms": 1000,
+      "max_wire_bytes": 12582912,
+      "max_decoded_bytes": 33554432
+    }
+  ]
+}

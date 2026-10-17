@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::io::{self, Read};
-use std::net::{IpAddr, SocketAddr, TcpListener, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak, mpsc};
 use std::thread;
@@ -20,7 +20,11 @@ pub const MAX_ROBOTS_REDIRECTS: usize = 5;
 pub const MAX_RESPONSE_HEADER_BYTES: usize = 32 * 1024;
 pub const MAX_RESPONSE_HEADER_VALUES: usize = 128;
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
-const CRAWL_USER_AGENT: &str = concat!("LeyBot/", env!("CARGO_PKG_VERSION"));
+const CRAWL_USER_AGENT: &str = concat!(
+    "LeyBot/",
+    env!("CARGO_PKG_VERSION"),
+    " (+https://github.com/Suraj-H675/Ley/issues)"
+);
 const RESOLVER_WORKERS: usize = 4;
 const RESOLVER_QUEUE: usize = 16;
 
@@ -32,6 +36,8 @@ pub enum SafeFetchError {
     EmptyResolution,
     TooManyAddresses,
     UnsafeAddress(String),
+    ConnectedAddressUnavailable,
+    ConnectedAddressMismatch(String),
     Request(String),
     ResponseBody(String),
     CompressedBodyTooLarge,
@@ -46,8 +52,10 @@ pub enum SafeFetchError {
 impl fmt::Display for SafeFetchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidUrl => f.write_str("only credential-free HTTP URLs are supported"),
-            Self::UnadmittedAuthority => f.write_str("authority has no owned fixture capability"),
+            Self::InvalidUrl => {
+                f.write_str("only credential-free HTTP or admitted HTTPS URLs are supported")
+            }
+            Self::UnadmittedAuthority => f.write_str("authority has no active source grant"),
             Self::Resolution(message) => write!(f, "destination resolution failed: {message}"),
             Self::EmptyResolution => f.write_str("destination resolver returned no addresses"),
             Self::TooManyAddresses => {
@@ -55,8 +63,17 @@ impl fmt::Display for SafeFetchError {
             }
             Self::UnsafeAddress(address) => write!(
                 f,
-                "destination answer is outside the owned fixture: {address}"
+                "destination answer is not permitted by the active address policy: {address}"
             ),
+            Self::ConnectedAddressUnavailable => {
+                f.write_str("HTTP transport did not expose its connected destination")
+            }
+            Self::ConnectedAddressMismatch(address) => {
+                write!(
+                    f,
+                    "connected destination was not in the validated DNS set: {address}"
+                )
+            }
             Self::Request(message) => write!(f, "HTTP request failed: {message}"),
             Self::ResponseBody(message) => write!(f, "HTTP response body failed: {message}"),
             Self::CompressedBodyTooLarge => write!(
@@ -207,6 +224,62 @@ impl FixtureCapability {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct PublicAuthority {
+    host: String,
+    port: u16,
+    origin: String,
+    user_agent: String,
+}
+
+impl PublicAuthority {
+    pub(crate) fn from_origin(origin: &Url) -> Option<Self> {
+        let host = origin.host_str()?;
+        let port = origin.port_or_known_default()?;
+        if origin.scheme() != "https"
+            || !origin.username().is_empty()
+            || origin.password().is_some()
+            || origin.path() != "/"
+            || origin.query().is_some()
+            || origin.fragment().is_some()
+            || host.parse::<IpAddr>().is_ok()
+            || !host.contains('.')
+        {
+            return None;
+        }
+        Some(Self {
+            host: host.to_ascii_lowercase(),
+            port,
+            origin: origin_of_url(origin),
+            user_agent: CRAWL_USER_AGENT.to_owned(),
+        })
+    }
+
+    pub(crate) fn with_crawler_identity(mut self, identity: &str, contact: &str) -> Self {
+        self.user_agent = format!("{identity} (+{contact})");
+        self
+    }
+
+    fn allows(&self, url: &Url) -> bool {
+        url.scheme() == "https"
+            && url
+                .host_str()
+                .is_some_and(|host| self.host.eq_ignore_ascii_case(host))
+            && url.port_or_known_default() == Some(self.port)
+            && origin_of_url(url) == self.origin
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DestinationEvidence {
+    pub requested_url: String,
+    pub resolved_addresses: Vec<SocketAddr>,
+    pub connected_peer: SocketAddr,
+    pub response_status: u16,
+    pub proxy_used: bool,
+}
+
+#[derive(Clone, Debug)]
 pub struct HttpResponse {
     pub status: u16,
     pub headers: HeaderMap,
@@ -244,16 +317,61 @@ impl HttpResponse {
 pub struct SafeFetcher<R> {
     resolver: Arc<R>,
     capabilities: Vec<FixtureCapability>,
+    public_authorities: Vec<PublicAuthority>,
+    network_evidence: Mutex<Vec<DestinationEvidence>>,
     request_timeout: Duration,
+    #[cfg(test)]
+    test_public_transport: Option<TestPublicTransport>,
+}
+
+#[cfg(test)]
+struct TestPublicTransport {
+    host: String,
+    endpoint: SocketAddr,
+    root_certificate_pem: Vec<u8>,
 }
 
 impl<R: DestinationResolver + 'static> SafeFetcher<R> {
+    #[cfg(test)]
     pub(crate) fn new(resolver: R, capabilities: Vec<FixtureCapability>) -> Self {
         Self {
             resolver: Arc::new(resolver),
             capabilities,
+            public_authorities: Vec::new(),
+            network_evidence: Mutex::new(Vec::new()),
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            test_public_transport: None,
         }
+    }
+
+    pub(crate) fn new_with_public(
+        resolver: R,
+        capabilities: Vec<FixtureCapability>,
+        public_authorities: Vec<PublicAuthority>,
+    ) -> Self {
+        Self {
+            resolver: Arc::new(resolver),
+            capabilities,
+            public_authorities,
+            network_evidence: Mutex::new(Vec::new()),
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            #[cfg(test)]
+            test_public_transport: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_public_tls(
+        &mut self,
+        host: &str,
+        endpoint: SocketAddr,
+        root_certificate_pem: Vec<u8>,
+    ) {
+        self.test_public_transport = Some(TestPublicTransport {
+            host: host.to_ascii_lowercase(),
+            endpoint,
+            root_certificate_pem,
+        });
     }
 
     pub(crate) fn with_timeout(mut self, timeout: Duration) -> Self {
@@ -262,6 +380,10 @@ impl<R: DestinationResolver + 'static> SafeFetcher<R> {
     }
 
     pub(crate) fn has_capability(&self, url: &Url) -> bool {
+        self.has_fixture_capability(url) || self.has_public_authority(url)
+    }
+
+    pub(crate) fn has_fixture_capability(&self, url: &Url) -> bool {
         let Some(host) = url.host_str() else {
             return false;
         };
@@ -275,6 +397,25 @@ impl<R: DestinationResolver + 'static> SafeFetcher<R> {
         })
     }
 
+    pub(crate) fn has_public_authority(&self, url: &Url) -> bool {
+        self.public_authorities
+            .iter()
+            .any(|authority| authority.allows(url))
+    }
+
+    pub(crate) fn clear_network_evidence(&self) {
+        if let Ok(mut evidence) = self.network_evidence.lock() {
+            evidence.clear();
+        }
+    }
+
+    pub(crate) fn take_network_evidence(&self) -> Vec<DestinationEvidence> {
+        self.network_evidence
+            .lock()
+            .map(|mut evidence| std::mem::take(&mut *evidence))
+            .unwrap_or_default()
+    }
+
     #[cfg(test)]
     pub fn fetch(&self, url: &Url) -> Result<HttpResponse, SafeFetchError> {
         self.fetch_with_headers(url, &HeaderMap::new())
@@ -286,7 +427,7 @@ impl<R: DestinationResolver + 'static> SafeFetcher<R> {
         request_headers: &HeaderMap,
     ) -> Result<HttpResponse, SafeFetchError> {
         let deadline = Instant::now() + self.request_timeout;
-        if url.scheme() != "http"
+        if !matches!(url.scheme(), "http" | "https")
             || !url.username().is_empty()
             || url.password().is_some()
             || url.host_str().is_none()
@@ -297,15 +438,26 @@ impl<R: DestinationResolver + 'static> SafeFetcher<R> {
         let port = url
             .port_or_known_default()
             .ok_or(SafeFetchError::InvalidUrl)?;
-        let capability = self
-            .capabilities
+        let fixture = self.capabilities.iter().find(|capability| {
+            capability.is_alive()
+                && capability.host.eq_ignore_ascii_case(host)
+                && capability.port == port
+        });
+        let public = self
+            .public_authorities
             .iter()
-            .find(|capability| {
-                capability.is_alive()
-                    && capability.host.eq_ignore_ascii_case(host)
-                    && capability.port == port
-            })
-            .ok_or(SafeFetchError::UnadmittedAuthority)?;
+            .find(|authority| authority.allows(url));
+        if (fixture.is_none() && public.is_none())
+            || (fixture.is_some() && url.scheme() != "http")
+            || (public.is_some() && url.scheme() != "https")
+        {
+            return Err(SafeFetchError::UnadmittedAuthority);
+        }
+        #[cfg(test)]
+        let test_public_transport = self
+            .test_public_transport
+            .as_ref()
+            .filter(|transport| public.is_some() && transport.host == host.to_ascii_lowercase());
 
         let resolve_timeout = deadline.saturating_duration_since(Instant::now());
         if resolve_timeout.is_zero() {
@@ -326,20 +478,56 @@ impl<R: DestinationResolver + 'static> SafeFetcher<R> {
         let mut pinned_ips = BTreeSet::new();
         for answer in answers {
             let ip = answer.ip();
-            if ip != capability.endpoint.ip() || !is_loopback(ip) {
+            let permitted = if let Some(capability) = fixture {
+                ip == capability.endpoint.ip()
+                    && answer.port() == capability.endpoint.port()
+                    && is_loopback(ip)
+            } else {
+                #[cfg(test)]
+                if let Some(transport) = test_public_transport {
+                    answer == transport.endpoint
+                } else {
+                    answer.port() == port && is_public_unicast(ip)
+                }
+                #[cfg(not(test))]
+                {
+                    answer.port() == port && is_public_unicast(ip)
+                }
+            };
+            if !permitted {
                 return Err(SafeFetchError::UnsafeAddress(answer.to_string()));
             }
             pinned_ips.insert(ip);
         }
-        if pinned_ips.len() != 1 {
+        if pinned_ips.is_empty() || (fixture.is_some() && pinned_ips.len() != 1) {
             return Err(SafeFetchError::UnsafeAddress(
-                "fixture answer set is not a single owned endpoint".to_owned(),
+                "validated destination set is empty or violates fixture isolation".to_owned(),
             ));
         }
-        let pinned: Vec<SocketAddr> = pinned_ips
-            .into_iter()
-            .map(|ip| SocketAddr::new(ip, 0))
-            .collect();
+        #[cfg(test)]
+        let test_endpoint = test_public_transport.map(|transport| transport.endpoint);
+        #[cfg(not(test))]
+        let test_endpoint = None::<SocketAddr>;
+        let resolved_addresses = test_endpoint.map_or_else(
+            || {
+                pinned_ips
+                    .iter()
+                    .copied()
+                    .map(|ip| SocketAddr::new(ip, port))
+                    .collect::<Vec<_>>()
+            },
+            |endpoint| vec![endpoint],
+        );
+        let pinned: Vec<SocketAddr> = test_endpoint.map_or_else(
+            || {
+                pinned_ips
+                    .iter()
+                    .copied()
+                    .map(|ip| SocketAddr::new(ip, 0))
+                    .collect()
+            },
+            |endpoint| vec![endpoint],
+        );
 
         // A new client per request prevents pooled connections from bypassing
         // the just-validated DNS answer set. Automatic redirects and proxies
@@ -348,12 +536,21 @@ impl<R: DestinationResolver + 'static> SafeFetcher<R> {
         if remaining.is_zero() {
             return Err(SafeFetchError::ResolverTimeout);
         }
-        let client = Client::builder()
+        let client_builder = Client::builder()
             .no_proxy()
             .redirect(Policy::none())
             .connect_timeout(remaining.min(Duration::from_secs(5)))
             .timeout(remaining)
-            .pool_max_idle_per_host(0)
+            .pool_max_idle_per_host(0);
+        #[cfg(test)]
+        let client_builder = if let Some(transport) = test_public_transport {
+            let certificate = reqwest::Certificate::from_pem(&transport.root_certificate_pem)
+                .map_err(|error| SafeFetchError::Request(error.to_string()))?;
+            client_builder.add_root_certificate(certificate)
+        } else {
+            client_builder
+        };
+        let client = client_builder
             .resolve_to_addrs(host, &pinned)
             .build()
             .map_err(|error| SafeFetchError::Request(error.to_string()))?;
@@ -361,11 +558,48 @@ impl<R: DestinationResolver + 'static> SafeFetcher<R> {
         for (name, value) in request_headers {
             request = request.header(name, value);
         }
-        request = request.header(USER_AGENT, CRAWL_USER_AGENT);
+        let user_agent = public.map_or(CRAWL_USER_AGENT, |authority| authority.user_agent.as_str());
+        request = request.header(USER_AGENT, user_agent);
         let mut response = request
             .send()
             .map_err(|error| SafeFetchError::Request(error.to_string()))?;
+        let connected_peer = response
+            .remote_addr()
+            .ok_or(SafeFetchError::ConnectedAddressUnavailable)?;
+        #[cfg(test)]
+        let connected_to_validated_destination = test_endpoint
+            .map(|endpoint| connected_peer == endpoint)
+            .unwrap_or_else(|| {
+                connected_peer.port() == port && pinned_ips.contains(&connected_peer.ip())
+            });
+        #[cfg(not(test))]
+        let connected_to_validated_destination =
+            connected_peer.port() == port && pinned_ips.contains(&connected_peer.ip());
+        if !connected_to_validated_destination {
+            return Err(SafeFetchError::ConnectedAddressMismatch(
+                connected_peer.to_string(),
+            ));
+        }
         let status = response.status().as_u16();
+        let destination = DestinationEvidence {
+            requested_url: url.to_string(),
+            resolved_addresses,
+            connected_peer,
+            response_status: status,
+            proxy_used: false,
+        };
+        if let Ok(mut evidence) = self.network_evidence.lock() {
+            if evidence.len() >= 10_000 {
+                return Err(SafeFetchError::Request(
+                    "per-run destination evidence limit exhausted".to_owned(),
+                ));
+            }
+            evidence.push(destination.clone());
+        } else {
+            return Err(SafeFetchError::Request(
+                "destination evidence lock is unavailable".to_owned(),
+            ));
+        }
         let headers = response.headers().clone();
         check_response_header_bounds(&headers)?;
         let mut wire = Vec::with_capacity(4096);
@@ -465,6 +699,425 @@ fn is_loopback(address: IpAddr) -> bool {
     }
 }
 
+fn origin_of_url(url: &Url) -> String {
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    let port = url.port_or_known_default().unwrap_or(0);
+    format!("{}://{}:{}", url.scheme().to_ascii_lowercase(), host, port)
+}
+
+fn is_public_unicast(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(ip) => is_public_ipv4(ip),
+        IpAddr::V6(ip) => is_public_ipv6(ip),
+    }
+}
+
+fn is_public_ipv4(ip: Ipv4Addr) -> bool {
+    let value = u32::from(ip);
+    const DENIED: &[(u32, u8)] = &[
+        (u32::from_be_bytes([0, 0, 0, 0]), 8),
+        (u32::from_be_bytes([10, 0, 0, 0]), 8),
+        (u32::from_be_bytes([100, 64, 0, 0]), 10),
+        (u32::from_be_bytes([127, 0, 0, 0]), 8),
+        (u32::from_be_bytes([169, 254, 0, 0]), 16),
+        (u32::from_be_bytes([172, 16, 0, 0]), 12),
+        (u32::from_be_bytes([192, 0, 0, 0]), 24),
+        (u32::from_be_bytes([192, 0, 2, 0]), 24),
+        (u32::from_be_bytes([192, 88, 99, 0]), 24),
+        (u32::from_be_bytes([192, 168, 0, 0]), 16),
+        (u32::from_be_bytes([198, 18, 0, 0]), 15),
+        (u32::from_be_bytes([198, 51, 100, 0]), 24),
+        (u32::from_be_bytes([203, 0, 113, 0]), 24),
+        (u32::from_be_bytes([224, 0, 0, 0]), 4),
+        (u32::from_be_bytes([240, 0, 0, 0]), 4),
+    ];
+    !DENIED.iter().any(|(network, prefix)| {
+        let mask = u32::MAX << (32 - prefix);
+        value & mask == *network & mask
+    })
+}
+
+fn is_public_ipv6(ip: Ipv6Addr) -> bool {
+    let value = u128::from(ip);
+    let prefix_matches = |network: u128, prefix: u32| {
+        let mask = u128::MAX << (128 - prefix);
+        value & mask == network & mask
+    };
+    prefix_matches(u128::from(Ipv6Addr::new(0x2000, 0, 0, 0, 0, 0, 0, 0)), 3)
+        && !prefix_matches(u128::from(Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 0)), 23)
+        && !prefix_matches(
+            u128::from(Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0)),
+            32,
+        )
+        && !prefix_matches(u128::from(Ipv6Addr::new(0x2002, 0, 0, 0, 0, 0, 0, 0)), 16)
+        && !prefix_matches(u128::from(Ipv6Addr::new(0x3ffe, 0, 0, 0, 0, 0, 0, 0)), 16)
+        && !prefix_matches(u128::from(Ipv6Addr::new(0x3fff, 0, 0, 0, 0, 0, 0, 0)), 20)
+}
+
+#[cfg(test)]
+pub(crate) mod tls_test_support {
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::path::PathBuf;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::thread::{self, JoinHandle};
+    use std::time::Duration;
+
+    #[derive(Clone)]
+    pub(crate) struct Response {
+        pub(crate) status: u16,
+        pub(crate) headers: Vec<(String, String)>,
+        pub(crate) body: Vec<u8>,
+        delay: Duration,
+    }
+
+    impl Response {
+        pub(crate) fn text(body: &str) -> Self {
+            Self::body(200, "text/plain", body.as_bytes().to_vec())
+        }
+
+        pub(crate) fn html(body: &str) -> Self {
+            Self::body(200, "text/html; charset=utf-8", body.as_bytes().to_vec())
+        }
+
+        pub(crate) fn body(status: u16, content_type: &str, body: Vec<u8>) -> Self {
+            Self {
+                status,
+                headers: vec![("content-type".to_owned(), content_type.to_owned())],
+                body,
+                delay: Duration::ZERO,
+            }
+        }
+
+        pub(crate) fn redirect(location: &str) -> Self {
+            Self {
+                status: 302,
+                headers: vec![("location".to_owned(), location.to_owned())],
+                body: Vec::new(),
+                delay: Duration::ZERO,
+            }
+        }
+
+        pub(crate) fn delayed(mut self, delay: Duration) -> Self {
+            self.delay = delay;
+            self
+        }
+    }
+
+    pub(crate) type Routes = BTreeMap<String, Response>;
+
+    pub(crate) struct Fixture {
+        pub(crate) address: SocketAddr,
+        root_certificate_pem: Vec<u8>,
+        accepts: Arc<AtomicUsize>,
+        requests: Arc<Mutex<Vec<String>>>,
+        user_agents: Arc<Mutex<Vec<String>>>,
+        request_starts: Arc<Mutex<Vec<std::time::Instant>>>,
+        stop: Arc<AtomicBool>,
+        thread: Option<JoinHandle<()>>,
+        directory: TempDirectory,
+    }
+
+    impl Fixture {
+        pub(crate) fn start(certificate_host: &str, routes: Routes) -> Self {
+            let directory = TempDirectory::new();
+            create_certificates(&directory.path, certificate_host);
+            let root_certificate_pem = fs::read(directory.path.join("ca.pem")).unwrap();
+            let certificate = rustls::pki_types::CertificateDer::from(
+                fs::read(directory.path.join("server.der")).unwrap(),
+            );
+            let key = rustls::pki_types::PrivateKeyDer::try_from(
+                fs::read(directory.path.join("server.pk8")).unwrap(),
+            )
+            .unwrap();
+            let config = Arc::new(
+                rustls::ServerConfig::builder()
+                    .with_no_client_auth()
+                    .with_single_cert(vec![certificate], key)
+                    .unwrap(),
+            );
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let accepts = Arc::new(AtomicUsize::new(0));
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let user_agents = Arc::new(Mutex::new(Vec::new()));
+            let request_starts = Arc::new(Mutex::new(Vec::new()));
+            let stop = Arc::new(AtomicBool::new(false));
+            let thread_accepts = Arc::clone(&accepts);
+            let thread_requests = Arc::clone(&requests);
+            let thread_user_agents = Arc::clone(&user_agents);
+            let thread_request_starts = Arc::clone(&request_starts);
+            let thread_stop = Arc::clone(&stop);
+            let thread = thread::spawn(move || {
+                while !thread_stop.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            thread_accepts.fetch_add(1, Ordering::SeqCst);
+                            serve(
+                                stream,
+                                &config,
+                                &routes,
+                                &thread_requests,
+                                &thread_user_agents,
+                                &thread_request_starts,
+                            );
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            Self {
+                address,
+                root_certificate_pem,
+                accepts,
+                requests,
+                user_agents,
+                request_starts,
+                stop,
+                thread: Some(thread),
+                directory,
+            }
+        }
+
+        pub(crate) fn root_certificate_pem(&self) -> Vec<u8> {
+            self.root_certificate_pem.clone()
+        }
+
+        pub(crate) fn accepts(&self) -> usize {
+            self.accepts.load(Ordering::SeqCst)
+        }
+
+        pub(crate) fn requests(&self) -> Vec<String> {
+            self.requests.lock().unwrap().clone()
+        }
+
+        pub(crate) fn user_agents(&self) -> Vec<String> {
+            self.user_agents.lock().unwrap().clone()
+        }
+
+        pub(crate) fn request_starts(&self) -> Vec<std::time::Instant> {
+            self.request_starts.lock().unwrap().clone()
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+            let _ = &self.directory;
+        }
+    }
+
+    struct TempDirectory {
+        path: PathBuf,
+    }
+
+    impl TempDirectory {
+        fn new() -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(1);
+            let id = NEXT.fetch_add(1, Ordering::Relaxed);
+            let path =
+                std::env::temp_dir().join(format!("ley-owned-tls-{}-{id}", std::process::id()));
+            fs::create_dir(&path).unwrap();
+            Self { path }
+        }
+    }
+
+    impl Drop for TempDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn create_certificates(directory: &PathBuf, certificate_host: &str) {
+        run_openssl(
+            directory,
+            &[
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-sha256",
+                "-days",
+                "2",
+                "-keyout",
+                "ca.key",
+                "-out",
+                "ca.pem",
+                "-subj",
+                "/CN=Ley Owned Test Root",
+                "-addext",
+                "basicConstraints=critical,CA:TRUE",
+                "-addext",
+                "keyUsage=critical,keyCertSign,cRLSign",
+            ],
+        );
+        run_openssl(
+            directory,
+            &[
+                "req",
+                "-new",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-sha256",
+                "-keyout",
+                "server.key",
+                "-out",
+                "server.csr",
+                "-subj",
+                &format!("/CN={certificate_host}"),
+            ],
+        );
+        fs::write(
+            directory.join("server.ext"),
+            format!(
+                "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=DNS:{certificate_host}\n"
+            ),
+        )
+        .unwrap();
+        run_openssl(
+            directory,
+            &[
+                "x509",
+                "-req",
+                "-sha256",
+                "-days",
+                "2",
+                "-in",
+                "server.csr",
+                "-CA",
+                "ca.pem",
+                "-CAkey",
+                "ca.key",
+                "-CAcreateserial",
+                "-out",
+                "server.pem",
+                "-extfile",
+                "server.ext",
+            ],
+        );
+        run_openssl(
+            directory,
+            &[
+                "x509",
+                "-in",
+                "server.pem",
+                "-outform",
+                "DER",
+                "-out",
+                "server.der",
+            ],
+        );
+        run_openssl(
+            directory,
+            &[
+                "pkcs8",
+                "-topk8",
+                "-nocrypt",
+                "-in",
+                "server.key",
+                "-outform",
+                "DER",
+                "-out",
+                "server.pk8",
+            ],
+        );
+    }
+
+    fn run_openssl(directory: &PathBuf, arguments: &[&str]) {
+        let output = Command::new("openssl")
+            .current_dir(directory)
+            .args(arguments)
+            .output()
+            .expect("OpenSSL is required for owned TLS fixtures");
+        assert!(
+            output.status.success(),
+            "OpenSSL fixture command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn serve(
+        stream: TcpStream,
+        config: &Arc<rustls::ServerConfig>,
+        routes: &Routes,
+        requests: &Mutex<Vec<String>>,
+        user_agents: &Mutex<Vec<String>>,
+        request_starts: &Mutex<Vec<std::time::Instant>>,
+    ) {
+        let connection = match rustls::ServerConnection::new(Arc::clone(config)) {
+            Ok(connection) => connection,
+            Err(_) => return,
+        };
+        let mut stream = rustls::StreamOwned::new(connection, stream);
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        while request.len() < 32 * 1024 {
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => return,
+                Ok(count) => request.extend_from_slice(&chunk[..count]),
+            }
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let text = String::from_utf8_lossy(&request);
+        let mut lines = text.lines();
+        let target = lines
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or("/")
+            .to_owned();
+        request_starts
+            .lock()
+            .unwrap()
+            .push(std::time::Instant::now());
+        for line in lines {
+            if let Some((name, value)) = line.split_once(':')
+                && name.eq_ignore_ascii_case("user-agent")
+            {
+                user_agents.lock().unwrap().push(value.trim().to_owned());
+            }
+        }
+        requests.lock().unwrap().push(target.clone());
+        let response = routes
+            .get(target.split('?').next().unwrap_or("/"))
+            .cloned()
+            .unwrap_or_else(|| Response {
+                status: 404,
+                headers: Vec::new(),
+                body: b"missing".to_vec(),
+                delay: Duration::ZERO,
+            });
+        thread::sleep(response.delay);
+        let mut headers = format!(
+            "HTTP/1.1 {} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n",
+            response.status,
+            response.body.len()
+        );
+        for (name, value) in response.headers {
+            headers.push_str(&format!("{name}: {value}\r\n"));
+        }
+        headers.push_str("\r\n");
+        if stream.write_all(headers.as_bytes()).is_ok() {
+            let _ = stream.write_all(&response.body);
+            let _ = stream.flush();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use flate2::Compression;
@@ -472,6 +1125,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::io::{BufRead, BufReader, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::process::Command;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread::{self, JoinHandle};
@@ -653,6 +1307,11 @@ mod tests {
         .unwrap();
         let response = fetcher.fetch(&url).unwrap();
         assert_eq!(response.status, 404);
+        let evidence = fetcher.take_network_evidence();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].connected_peer, fixture.address);
+        assert_eq!(evidence[0].resolved_addresses, vec![fixture.address]);
+        assert!(!evidence[0].proxy_used);
         assert_eq!(fixture.accepts(), 1);
         assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
         assert_eq!(
@@ -945,5 +1604,492 @@ mod tests {
             ["LeyBot: noindex"]
         );
         assert_eq!(compressed_fixture.accepts(), 1);
+    }
+
+    #[test]
+    fn public_address_filter_accepts_global_unicast_and_rejects_special_ranges() {
+        for address in ["8.8.8.8", "1.1.1.1", "2001:4860:4860::8888"] {
+            assert!(
+                is_public_unicast(address.parse().unwrap()),
+                "expected globally routable address {address}"
+            );
+        }
+        for address in [
+            "0.0.0.1",
+            "10.1.2.3",
+            "100.64.0.1",
+            "127.0.0.1",
+            "169.254.10.1",
+            "172.20.0.1",
+            "192.0.2.1",
+            "192.168.1.1",
+            "198.18.0.1",
+            "198.51.100.2",
+            "203.0.113.9",
+            "224.0.0.1",
+            "240.0.0.1",
+            "::1",
+            "fc00::1",
+            "fe80::1",
+            "2001:db8::1",
+            "2002::1",
+            "3fff::1",
+            "::ffff:8.8.8.8",
+        ] {
+            assert!(
+                !is_public_unicast(address.parse().unwrap()),
+                "expected non-public address {address} to be denied"
+            );
+        }
+    }
+
+    #[test]
+    fn public_address_filter_checks_local_registry_boundary_vectors() {
+        for (address, expected) in [
+            ("0.255.255.255", false),
+            ("1.0.0.0", true),
+            ("100.63.255.255", true),
+            ("100.64.0.0", false),
+            ("100.127.255.255", false),
+            ("100.128.0.0", true),
+            ("192.0.0.8", false),
+            ("192.0.0.9", false),
+            ("192.0.0.10", false),
+            ("192.0.0.255", false),
+            ("192.0.1.0", true),
+            ("192.88.98.255", true),
+            ("192.88.99.0", false),
+            ("192.88.99.255", false),
+            ("192.88.100.0", true),
+            ("198.17.255.255", true),
+            ("198.18.0.0", false),
+            ("198.19.255.255", false),
+            ("198.20.0.0", true),
+            ("223.255.255.255", true),
+            ("224.0.0.0", false),
+            ("239.255.255.255", false),
+            ("240.0.0.0", false),
+            ("255.255.255.255", false),
+            ("1fff:ffff::", false),
+            ("2000::", true),
+            ("2001::", false),
+            ("2001:1ff:ffff:ffff:ffff:ffff:ffff:ffff", false),
+            ("2001:200::", true),
+            ("2001:db8::", false),
+            ("2001:db9::", true),
+            ("2002::", false),
+            ("3ffe::", false),
+            ("3fff::", false),
+            ("3fff:fff:ffff::", false),
+            ("3fff:1000::", true),
+            ("4000::", false),
+            ("::ffff:8.8.8.8", false),
+            ("2001:4860:4860::8888", true),
+        ] {
+            assert_eq!(
+                is_public_unicast(address.parse().unwrap()),
+                expected,
+                "unexpected public-address classification for {address}"
+            );
+        }
+    }
+
+    #[test]
+    fn public_fetch_rejects_private_or_mixed_dns_answers_before_connecting() {
+        let fixture = SocketFixture::start(BTreeMap::from([(
+            "/".to_owned(),
+            (200, Vec::new(), b"must not be reached".to_vec()),
+        )]));
+        let host = "public.example.org";
+        let url = Url::parse(&format!("https://{host}:{}/", fixture.address.port())).unwrap();
+        let origin = Url::parse(&format!("https://{host}:{}/", fixture.address.port())).unwrap();
+        let authority = PublicAuthority::from_origin(&origin)
+            .unwrap()
+            .with_crawler_identity(
+                concat!("LeyBot/", env!("CARGO_PKG_VERSION")),
+                "https://github.com/Suraj-H675/Ley/issues",
+            );
+        let resolver = Arc::new(MutableResolver {
+            answers: Mutex::new(BTreeMap::from([(host.to_owned(), vec![fixture.address])])),
+            calls: AtomicUsize::new(0),
+        });
+        let fetcher =
+            SafeFetcher::new_with_public(Arc::clone(&resolver), Vec::new(), vec![authority]);
+        assert!(matches!(
+            fetcher.fetch(&url),
+            Err(SafeFetchError::UnsafeAddress(_))
+        ));
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.accepts(), 0);
+
+        let default_port_url = Url::parse("https://public.example.org/").unwrap();
+        let default_origin = Url::parse("https://public.example.org/").unwrap();
+        let default_authority = PublicAuthority::from_origin(&default_origin)
+            .unwrap()
+            .with_crawler_identity(
+                concat!("LeyBot/", env!("CARGO_PKG_VERSION")),
+                "https://github.com/Suraj-H675/Ley/issues",
+            );
+        let resolver2 = Arc::new(MutableResolver {
+            answers: Mutex::new(BTreeMap::from([(
+                host.to_owned(),
+                vec![
+                    "8.8.8.8:443".parse().unwrap(),
+                    "10.0.0.7:443".parse().unwrap(),
+                ],
+            )])),
+            calls: AtomicUsize::new(0),
+        });
+        let mixed = SafeFetcher::new_with_public(
+            Arc::clone(&resolver2),
+            Vec::new(),
+            vec![default_authority],
+        );
+        assert!(matches!(
+            mixed.fetch(&default_port_url),
+            Err(SafeFetchError::UnsafeAddress(_))
+        ));
+        assert_eq!(resolver2.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.accepts(), 0);
+
+        let dual_stack_resolver = Arc::new(MutableResolver {
+            answers: Mutex::new(BTreeMap::from([(
+                "public.example.org".to_owned(),
+                vec![
+                    "8.8.8.8:443".parse().unwrap(),
+                    "[fd00::9]:443".parse().unwrap(),
+                ],
+            )])),
+            calls: AtomicUsize::new(0),
+        });
+        let dual_stack = SafeFetcher::new_with_public(
+            Arc::clone(&dual_stack_resolver),
+            Vec::new(),
+            vec![PublicAuthority::from_origin(&default_origin).unwrap()],
+        );
+        assert!(matches!(
+            dual_stack.fetch(&default_port_url),
+            Err(SafeFetchError::UnsafeAddress(_))
+        ));
+        assert_eq!(dual_stack_resolver.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.accepts(), 0);
+    }
+
+    #[test]
+    fn public_https_transport_validates_tls_pins_peer_and_bypasses_poisoned_proxies() {
+        if std::env::var("LEY_PROXY_CHILD").as_deref() != Ok("1") {
+            let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
+            let proxy_port = reservation.local_addr().unwrap().port();
+            drop(reservation);
+            let proxy = format!("http://127.0.0.1:{proxy_port}");
+            let output = Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg(
+                    "safe_fetch::tests::public_https_transport_validates_tls_pins_peer_and_bypasses_poisoned_proxies",
+                )
+                .arg("--test-threads=1")
+                .env("LEY_PROXY_CHILD", "1")
+                .env("LEY_PROXY_SENTINEL_PORT", proxy_port.to_string())
+                .env("HTTP_PROXY", &proxy)
+                .env("HTTPS_PROXY", &proxy)
+                .env("ALL_PROXY", &proxy)
+                .env("http_proxy", &proxy)
+                .env("https_proxy", &proxy)
+                .env("all_proxy", &proxy)
+                .env("NO_PROXY", "")
+                .env("no_proxy", "")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated public TLS child failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let proxy_port = std::env::var("LEY_PROXY_SENTINEL_PORT")
+            .unwrap()
+            .parse::<u16>()
+            .unwrap();
+        let proxy_sentinel = TcpListener::bind(("127.0.0.1", proxy_port)).unwrap();
+        proxy_sentinel.set_nonblocking(true).unwrap();
+        let host = "public.example.org";
+        let fixture = tls_test_support::Fixture::start(
+            host,
+            BTreeMap::from([(
+                String::from("/"),
+                tls_test_support::Response::text("pinned tls fixture"),
+            )]),
+        );
+        let origin = Url::parse(&format!("https://{host}:{}/", fixture.address.port())).unwrap();
+        let authority = PublicAuthority::from_origin(&origin)
+            .unwrap()
+            .with_crawler_identity(
+                concat!("LeyBot/", env!("CARGO_PKG_VERSION")),
+                "https://github.com/Suraj-H675/Ley/issues",
+            );
+        let resolver = Arc::new(MutableResolver {
+            answers: Mutex::new(BTreeMap::from([(host.to_owned(), vec![fixture.address])])),
+            calls: AtomicUsize::new(0),
+        });
+        let mut fetcher =
+            SafeFetcher::new_with_public(Arc::clone(&resolver), Vec::new(), vec![authority]);
+        fetcher.set_test_public_tls(host, fixture.address, fixture.root_certificate_pem());
+
+        let response = fetcher.fetch(&origin).unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body.unwrap(), b"pinned tls fixture");
+        let evidence = fetcher.take_network_evidence();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].connected_peer, fixture.address);
+        assert_eq!(evidence[0].resolved_addresses, [fixture.address]);
+        assert!(!evidence[0].proxy_used);
+        assert_eq!(fixture.requests(), ["/"]);
+        assert_eq!(
+            fixture.user_agents(),
+            [concat!(
+                "LeyBot/",
+                env!("CARGO_PKG_VERSION"),
+                " (+https://github.com/Suraj-H675/Ley/issues)"
+            )]
+        );
+
+        let mut proxy_requests = Vec::new();
+        loop {
+            match proxy_sentinel.accept() {
+                Ok((stream, _)) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_millis(100)))
+                        .unwrap();
+                    let mut first_line = String::new();
+                    let _ = BufReader::new(stream).read_line(&mut first_line);
+                    proxy_requests.push(first_line);
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("proxy sentinel failed: {error}"),
+            }
+        }
+        assert!(
+            proxy_requests.is_empty(),
+            "proxy received {proxy_requests:?}"
+        );
+
+        let calls = resolver.calls.load(Ordering::SeqCst);
+        for unexpected in [
+            Url::parse(&format!("http://{host}:{}/", fixture.address.port())).unwrap(),
+            Url::parse(&format!(
+                "https://other.example.org:{}/",
+                fixture.address.port()
+            ))
+            .unwrap(),
+            Url::parse(&format!("https://{host}:{}/", fixture.address.port() + 1)).unwrap(),
+        ] {
+            assert!(matches!(
+                fetcher.fetch(&unexpected),
+                Err(SafeFetchError::InvalidUrl | SafeFetchError::UnadmittedAuthority)
+            ));
+        }
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), calls);
+        assert_eq!(fixture.accepts(), 1);
+
+        resolver.answers.lock().unwrap().insert(
+            host.to_owned(),
+            vec![
+                fixture.address,
+                format!("10.0.0.9:{}", fixture.address.port())
+                    .parse()
+                    .unwrap(),
+            ],
+        );
+        assert!(matches!(
+            fetcher.fetch(&origin),
+            Err(SafeFetchError::UnsafeAddress(_))
+        ));
+        resolver.answers.lock().unwrap().insert(
+            host.to_owned(),
+            vec![
+                format!("127.0.0.2:{}", fixture.address.port())
+                    .parse()
+                    .unwrap(),
+            ],
+        );
+        assert!(matches!(
+            fetcher.fetch(&origin),
+            Err(SafeFetchError::UnsafeAddress(_))
+        ));
+        assert_eq!(fixture.accepts(), 1);
+
+        let wrong_host = "other.example.org";
+        let wrong_fixture = tls_test_support::Fixture::start(
+            wrong_host,
+            BTreeMap::from([(
+                String::from("/"),
+                tls_test_support::Response::text("must not be read"),
+            )]),
+        );
+        let wrong_origin =
+            Url::parse(&format!("https://{host}:{}/", wrong_fixture.address.port())).unwrap();
+        let wrong_authority = PublicAuthority::from_origin(&wrong_origin).unwrap();
+        let wrong_resolver = Arc::new(MutableResolver {
+            answers: Mutex::new(BTreeMap::from([(
+                host.to_owned(),
+                vec![wrong_fixture.address],
+            )])),
+            calls: AtomicUsize::new(0),
+        });
+        let mut wrong_fetcher = SafeFetcher::new_with_public(
+            Arc::clone(&wrong_resolver),
+            Vec::new(),
+            vec![wrong_authority],
+        );
+        wrong_fetcher.set_test_public_tls(
+            host,
+            wrong_fixture.address,
+            wrong_fixture.root_certificate_pem(),
+        );
+        assert!(matches!(
+            wrong_fetcher.fetch(&wrong_origin),
+            Err(SafeFetchError::Request(_))
+        ));
+        assert_eq!(wrong_fixture.accepts(), 1);
+        assert!(wrong_fixture.requests().is_empty());
+    }
+
+    #[test]
+    fn public_https_enforces_wire_byte_and_request_deadline_bounds() {
+        let host = "public.example.org";
+        let large_fixture = tls_test_support::Fixture::start(
+            host,
+            BTreeMap::from([(
+                "/large".to_owned(),
+                tls_test_support::Response::body(
+                    200,
+                    "text/plain",
+                    vec![b'x'; MAX_COMPRESSED_RESPONSE_BYTES + 1],
+                ),
+            )]),
+        );
+        let large_url = Url::parse(&format!(
+            "https://{host}:{}/large",
+            large_fixture.address.port()
+        ))
+        .unwrap();
+        let authority = PublicAuthority::from_origin(
+            &Url::parse(&format!("https://{host}:{}/", large_fixture.address.port())).unwrap(),
+        )
+        .unwrap();
+        let resolver = Arc::new(MutableResolver {
+            answers: Mutex::new(BTreeMap::from([(
+                host.to_owned(),
+                vec![large_fixture.address],
+            )])),
+            calls: AtomicUsize::new(0),
+        });
+        let mut fetcher =
+            SafeFetcher::new_with_public(Arc::clone(&resolver), Vec::new(), vec![authority]);
+        fetcher.set_test_public_tls(
+            host,
+            large_fixture.address,
+            large_fixture.root_certificate_pem(),
+        );
+
+        let response = fetcher.fetch(&large_url).unwrap();
+        assert_eq!(response.body, Err(SafeFetchError::CompressedBodyTooLarge));
+        assert_eq!(response.wire_bytes, MAX_COMPRESSED_RESPONSE_BYTES);
+        assert_eq!(large_fixture.requests(), ["/large"]);
+        assert_eq!(fetcher.take_network_evidence().len(), 1);
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder
+            .write_all(&vec![b'x'; MAX_DECODED_RESPONSE_BYTES + 1])
+            .unwrap();
+        let mut gzip_response =
+            tls_test_support::Response::body(200, "text/plain", encoder.finish().unwrap());
+        gzip_response
+            .headers
+            .push(("content-encoding".to_owned(), "gzip".to_owned()));
+        let gzip_fixture = tls_test_support::Fixture::start(
+            host,
+            BTreeMap::from([(String::from("/gzip"), gzip_response)]),
+        );
+        let gzip_url = Url::parse(&format!(
+            "https://{host}:{}/gzip",
+            gzip_fixture.address.port()
+        ))
+        .unwrap();
+        let gzip_authority = PublicAuthority::from_origin(
+            &Url::parse(&format!("https://{host}:{}/", gzip_fixture.address.port())).unwrap(),
+        )
+        .unwrap();
+        let gzip_resolver = Arc::new(MutableResolver {
+            answers: Mutex::new(BTreeMap::from([(
+                host.to_owned(),
+                vec![gzip_fixture.address],
+            )])),
+            calls: AtomicUsize::new(0),
+        });
+        let mut gzip_fetcher = SafeFetcher::new_with_public(
+            Arc::clone(&gzip_resolver),
+            Vec::new(),
+            vec![gzip_authority],
+        );
+        gzip_fetcher.set_test_public_tls(
+            host,
+            gzip_fixture.address,
+            gzip_fixture.root_certificate_pem(),
+        );
+        let gzip_response = gzip_fetcher.fetch(&gzip_url).unwrap();
+        assert_eq!(
+            gzip_response.body,
+            Err(SafeFetchError::DecompressedBodyTooLarge)
+        );
+        assert!(gzip_response.wire_bytes < MAX_COMPRESSED_RESPONSE_BYTES);
+        assert_eq!(gzip_response.decoded_bytes, MAX_DECODED_RESPONSE_BYTES);
+        assert_eq!(gzip_fixture.requests(), ["/gzip"]);
+
+        let slow_fixture = tls_test_support::Fixture::start(
+            host,
+            BTreeMap::from([(
+                "/slow".to_owned(),
+                tls_test_support::Response::text("too late").delayed(Duration::from_millis(300)),
+            )]),
+        );
+        let slow_url = Url::parse(&format!(
+            "https://{host}:{}/slow",
+            slow_fixture.address.port()
+        ))
+        .unwrap();
+        let slow_authority = PublicAuthority::from_origin(
+            &Url::parse(&format!("https://{host}:{}/", slow_fixture.address.port())).unwrap(),
+        )
+        .unwrap();
+        let slow_resolver = Arc::new(MutableResolver {
+            answers: Mutex::new(BTreeMap::from([(
+                host.to_owned(),
+                vec![slow_fixture.address],
+            )])),
+            calls: AtomicUsize::new(0),
+        });
+        let mut slow_fetcher = SafeFetcher::new_with_public(
+            Arc::clone(&slow_resolver),
+            Vec::new(),
+            vec![slow_authority],
+        )
+        .with_timeout(Duration::from_millis(100));
+        slow_fetcher.set_test_public_tls(
+            host,
+            slow_fixture.address,
+            slow_fixture.root_certificate_pem(),
+        );
+        let started = Instant::now();
+        assert!(matches!(
+            slow_fetcher.fetch(&slow_url),
+            Err(SafeFetchError::Request(_))
+        ));
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert_eq!(slow_fixture.accepts(), 1);
+        assert_eq!(slow_fixture.requests(), ["/slow"]);
     }
 }

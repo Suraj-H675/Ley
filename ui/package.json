@@ -1,0 +1,23 @@
+{
+  "name": "ley-search-ui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "npm run build && node scripts/dev-server.mjs",
+    "build": "tsc --noEmit -p tsconfig.json && node scripts/build.mjs",
+    "verify:browser": "node scripts/verify-browser.mjs",
+    "verify:e2e": "npm run build && node scripts/verify-http-e2e.mjs"
+  },
+  "dependencies": {
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "18.3.29",
+    "@types/react-dom": "18.3.7",
+    "esbuild": "0.28.2",
+    "playwright": "1.62.1",
+    "typescript": "5.9.3"
+  }
+}

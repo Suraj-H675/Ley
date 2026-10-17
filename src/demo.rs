@@ -275,6 +275,71 @@ pub fn run_controlled_fixture_demo() -> Result<String, DemoError> {
     Ok(output)
 }
 
+/// Create a new persistent index containing only authored synthetic search
+/// documents. The fixture URLs are identifiers; this function performs no
+/// network requests and refuses to replace an existing store.
+pub fn create_search_fixture_index(path: impl AsRef<Path>) -> Result<(usize, u64), DemoError> {
+    let index = PersistentIndex::create(path)
+        .map_err(|error| DemoError::Proof(format!("could not create fixture index: {error}")))?;
+    let documents = [
+        (
+            "https://fixtures.ley.test/guide/rust",
+            "Rust in Ley: retrieval notes",
+            "Rust retrieval uses a Ley-owned inverted index. A small local corpus keeps ranking transparent.",
+        ),
+        (
+            "https://fixtures.ley.test/notes/bm25",
+            "Search score <img src=x onerror=alert(1)> explanations",
+            "Ley ranks documents with BM25 and exposes a score explanation from one durable generation. <img src=x onerror=alert(1)>",
+        ),
+    ];
+    for (url, title, body) in documents {
+        let key = crate::url_key::UrlKey::parse(url)
+            .map_err(|error| DemoError::Proof(format!("invalid fixture URL: {error}")))?;
+        let lease = index.issue_fence(&key).map_err(|error| {
+            DemoError::Proof(format!("could not register fixture URL: {error}"))
+        })?;
+        index
+            .apply(
+                &lease,
+                crate::storage::Intent::Upsert {
+                    effective_url: url.to_owned(),
+                    title: title.to_owned(),
+                    body: body.to_owned(),
+                },
+            )
+            .map_err(|error| {
+                DemoError::Proof(format!("could not index fixture document: {error}"))
+            })?;
+    }
+    let long_url = format!("https://fixtures.ley.test/long/{}", "u".repeat(160));
+    let long_key = crate::url_key::UrlKey::parse(&long_url)
+        .map_err(|error| DemoError::Proof(format!("invalid adversarial fixture URL: {error}")))?;
+    let long_lease = index.issue_fence(&long_key).map_err(|error| {
+        DemoError::Proof(format!(
+            "could not register adversarial fixture URL: {error}"
+        ))
+    })?;
+    index
+        .apply(
+            &long_lease,
+            crate::storage::Intent::Upsert {
+                effective_url: long_url,
+                title: format!("adversarial {}", vec!["T".repeat(30); 6].join(" ")),
+                body: format!("adversarial {}", vec!["S".repeat(40); 9].join(" ")),
+            },
+        )
+        .map_err(|error| {
+            DemoError::Proof(format!(
+                "could not index adversarial fixture document: {error}"
+            ))
+        })?;
+    let view = index
+        .read_view()
+        .map_err(|error| DemoError::Proof(format!("could not read fixture generation: {error}")))?;
+    Ok((view.document_count(), view.generation_id()))
+}
+
 struct Gate4TempDir(PathBuf);
 
 impl Gate4TempDir {
