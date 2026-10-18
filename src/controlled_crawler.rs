@@ -1716,6 +1716,7 @@ where
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn enqueue_seed(&mut self, source_id: &str, seed: UrlKey) -> Result<(), CrawlError> {
         let (policy, lifecycle, _) = self.db.source(source_id)?;
         if lifecycle != "active" {
@@ -2470,175 +2471,176 @@ where
                 continue;
             }
 
-            let candidate = candidates
-                .iter()
-                .find(|candidate| {
-                    Url::parse(&candidate.fetch_url)
-                        .ok()
-                        .is_some_and(|url| origin_of_url(&url) == origin)
-                })
-                .expect("candidate origin was collected from a candidate");
-            let (policy, lifecycle, source_requests) = self.db.source(&candidate.source_id)?;
-            if lifecycle != "active" {
-                continue;
-            }
-            if now >= policy.valid_until_ms
-                || matches!(policy.retention, RetentionPolicy::Until(deadline) if now >= deadline)
-            {
-                self.revoke_source(&policy.id)?;
-                continue;
-            }
-            let fetch_key = UrlKey::parse(&candidate.fetch_url)
-                .map_err(|error| CrawlError::Url(error.to_string()))?;
-            let url = fetch_key
-                .to_url()
-                .map_err(|error| CrawlError::Url(error.to_string()))?;
-            if !policy.allows_url(&url, now) || !self.fetcher.has_capability(&url) {
-                self.mark_page_blocked(
-                    &candidate.key,
-                    &policy.id,
-                    "url is outside current admission scope",
-                )?;
-                report.skipped("page URL outside source path or authority scope");
-                continue;
-            }
+            for candidate in candidates.iter().filter(|candidate| {
+                Url::parse(&candidate.fetch_url)
+                    .ok()
+                    .is_some_and(|url| origin_of_url(&url) == origin)
+            }) {
+                let (policy, lifecycle, source_requests) = self.db.source(&candidate.source_id)?;
+                if lifecycle != "active" {
+                    continue;
+                }
+                if now >= policy.valid_until_ms
+                    || matches!(policy.retention, RetentionPolicy::Until(deadline) if now >= deadline)
+                {
+                    self.revoke_source(&policy.id)?;
+                    continue;
+                }
+                let fetch_key = UrlKey::parse(&candidate.fetch_url)
+                    .map_err(|error| CrawlError::Url(error.to_string()))?;
+                let url = fetch_key
+                    .to_url()
+                    .map_err(|error| CrawlError::Url(error.to_string()))?;
+                if !policy.allows_url(&url, now) || !self.fetcher.has_capability(&url) {
+                    self.mark_page_blocked(
+                        &candidate.key,
+                        &policy.id,
+                        "url is outside current admission scope",
+                    )?;
+                    report.skipped("page URL outside source path or authority scope");
+                    continue;
+                }
 
-            let (cache, denied_retry, cache_reason) =
-                self.robot_entry(&candidate.key, &origin, now)?;
-            if let Some(cache) = cache {
-                let rules = match parse_robots(&cache.body) {
-                    Ok(rules) => rules,
-                    Err(error) => {
-                        self.set_robot_denied(
-                            &origin,
-                            now,
-                            now.saturating_add(MAX_RETRY_MS),
-                            &error.to_string(),
+                let (cache, denied_retry, cache_reason) =
+                    self.robot_entry(&candidate.key, &origin, now)?;
+                if let Some(cache) = cache {
+                    let rules = match parse_robots(&cache.body) {
+                        Ok(rules) => rules,
+                        Err(error) => {
+                            self.set_robot_denied(
+                                &origin,
+                                now,
+                                now.saturating_add(MAX_RETRY_MS),
+                                &error.to_string(),
+                            )?;
+                            self.mark_page_deferred(
+                                &candidate.key,
+                                now.saturating_add(MAX_RETRY_MS),
+                                &error.to_string(),
+                            )?;
+                            report.skipped("robots rules could not be parsed");
+                            continue;
+                        }
+                    };
+                    if !rules.fetch_allowed(AGENT_TOKEN, &fetch_key) {
+                        let retry_at = if cache.expires_ms > now {
+                            cache.expires_ms
+                        } else {
+                            now.saturating_add(DEFAULT_RETRY_MS)
+                        };
+                        self.mark_page_deferred(
+                            &candidate.key,
+                            retry_at,
+                            "robots rule denies path",
                         )?;
+                        report.skipped("robots rules denied the page path");
+                        continue;
+                    }
+                    let free_run = self
+                        .limits
+                        .max_requests_per_run
+                        .saturating_sub(actual_requests.saturating_add(reserved_requests));
+                    if free_run == 0 || source_requests >= policy.max_requests {
                         self.mark_page_deferred(
                             &candidate.key,
                             now.saturating_add(MAX_RETRY_MS),
-                            &error.to_string(),
+                            "request budget exhausted",
                         )?;
-                        report.skipped("robots rules could not be parsed");
                         continue;
                     }
-                };
-                if !rules.fetch_allowed(AGENT_TOKEN, &fetch_key) {
-                    let retry_at = if cache.expires_ms > now {
-                        cache.expires_ms
-                    } else {
-                        now.saturating_add(DEFAULT_RETRY_MS)
-                    };
-                    self.mark_page_deferred(&candidate.key, retry_at, "robots rule denies path")?;
-                    report.skipped("robots rules denied the page path");
-                    continue;
-                }
-                let free_run = self
-                    .limits
-                    .max_requests_per_run
-                    .saturating_sub(actual_requests.saturating_add(reserved_requests));
-                if free_run == 0 || source_requests >= policy.max_requests {
-                    self.mark_page_deferred(
-                        &candidate.key,
-                        now.saturating_add(MAX_RETRY_MS),
-                        "request budget exhausted",
-                    )?;
-                    continue;
-                }
-                let schedule_id = candidate.schedule_id.unwrap_or_else(|| now.max(1));
-                let mut token = self.current_lease_token(&candidate.key)?;
-                if token.is_none() {
-                    let lease = self.index.issue_fence(&candidate.key)?;
-                    token = Some(self.index.export_lease(&lease)?);
-                }
-                let token = token.expect("lease token was issued or retained");
-                let mut redirect_seen = candidate.redirect_seen.clone();
-                if candidate.schedule_id.is_none() {
-                    redirect_seen = url.to_string();
-                }
-                let min_delay = policy.min_origin_delay_ms.min(MAX_RETRY_MS) as i64;
-                let tx = self.db.transaction()?;
-                tx.execute(
+                    let schedule_id = candidate.schedule_id.unwrap_or_else(|| now.max(1));
+                    let mut token = self.current_lease_token(&candidate.key)?;
+                    if token.is_none() {
+                        let lease = self.index.issue_fence(&candidate.key)?;
+                        token = Some(self.index.export_lease(&lease)?);
+                    }
+                    let token = token.expect("lease token was issued or retained");
+                    let mut redirect_seen = candidate.redirect_seen.clone();
+                    if candidate.schedule_id.is_none() {
+                        redirect_seen = url.to_string();
+                    }
+                    let min_delay = policy.min_origin_delay_ms.min(MAX_RETRY_MS) as i64;
+                    let tx = self.db.transaction()?;
+                    tx.execute(
                     "UPDATE frontier SET state='inflight',schedule_id=?2,lease_token=?3,redirect_seen=?4,reason='' WHERE url_key=?1",
                     params![candidate.key.as_str(), schedule_id as i64, token, redirect_seen],
                 )?;
-                tx.execute(
-                    "UPDATE source_policy SET request_count=request_count+1 WHERE source_id=?1",
-                    [&policy.id],
-                )?;
-                tx.execute(
+                    tx.execute(
+                        "UPDATE source_policy SET request_count=request_count+1 WHERE source_id=?1",
+                        [&policy.id],
+                    )?;
+                    tx.execute(
                     "INSERT INTO origin_state(origin,next_request_ms,backoff_until_ms,failures) VALUES (?1,?2,0,0) ON CONFLICT(origin) DO UPDATE SET next_request_ms=MAX(next_request_ms,excluded.next_request_ms)",
                     params![origin, now.saturating_add(min_delay as u64) as i64],
                 )?;
-                FrontierDb::event(
-                    &tx,
-                    now,
-                    &policy.id,
-                    Some(candidate.key.as_str()),
-                    "inflight",
-                    "scheduled page request",
-                )?;
-                tx.commit()?;
-
-                let mut headers = HeaderMap::new();
-                if !candidate.unconditional {
-                    insert_header(&mut headers, IF_NONE_MATCH, candidate.etag.as_deref())?;
-                    insert_header(
-                        &mut headers,
-                        IF_MODIFIED_SINCE,
-                        candidate.last_modified.as_deref(),
+                    FrontierDb::event(
+                        &tx,
+                        now,
+                        &policy.id,
+                        Some(candidate.key.as_str()),
+                        "inflight",
+                        "scheduled page request",
                     )?;
-                }
-                self.last_origin = origin;
-                return Ok(Some(WorkerJob::Page(PageJob {
-                    key: candidate.key.clone(),
-                    source: policy,
-                    url,
-                    lease_token: token,
-                    schedule_id,
-                    redirect_count: candidate.redirect_count,
-                    redirect_seen,
-                    unconditional: candidate.unconditional,
-                    etag: candidate.etag.clone(),
-                    last_modified: candidate.last_modified.clone(),
-                    attempt: candidate.attempts,
-                })));
-            }
+                    tx.commit()?;
 
-            if denied_retry > now {
-                self.mark_page_deferred(&candidate.key, denied_retry, &cache_reason)?;
-                report.skipped(if cache_reason.is_empty() {
-                    "robots policy denied the origin"
-                } else {
-                    cache_reason.as_str()
-                });
-                continue;
-            }
-            let remaining_source = policy.max_requests.saturating_sub(source_requests) as usize;
-            let remaining_run = self
-                .limits
-                .max_requests_per_run
-                .saturating_sub(actual_requests.saturating_add(reserved_requests));
-            let request_budget = 7usize
-                .min(remaining_source)
-                .min(remaining_run)
-                .min(response_slots);
-            if request_budget == 0 {
-                self.mark_page_deferred(
-                    &candidate.key,
-                    now.saturating_add(MAX_RETRY_MS),
-                    "robots request budget exhausted",
+                    let mut headers = HeaderMap::new();
+                    if !candidate.unconditional {
+                        insert_header(&mut headers, IF_NONE_MATCH, candidate.etag.as_deref())?;
+                        insert_header(
+                            &mut headers,
+                            IF_MODIFIED_SINCE,
+                            candidate.last_modified.as_deref(),
+                        )?;
+                    }
+                    self.last_origin = origin;
+                    return Ok(Some(WorkerJob::Page(PageJob {
+                        key: candidate.key.clone(),
+                        source: policy,
+                        url,
+                        lease_token: token,
+                        schedule_id,
+                        redirect_count: candidate.redirect_count,
+                        redirect_seen,
+                        unconditional: candidate.unconditional,
+                        etag: candidate.etag.clone(),
+                        last_modified: candidate.last_modified.clone(),
+                        attempt: candidate.attempts,
+                    })));
+                }
+
+                if denied_retry > now {
+                    self.mark_page_deferred(&candidate.key, denied_retry, &cache_reason)?;
+                    report.skipped(if cache_reason.is_empty() {
+                        "robots policy denied the origin"
+                    } else {
+                        cache_reason.as_str()
+                    });
+                    continue;
+                }
+                let remaining_source = policy.max_requests.saturating_sub(source_requests) as usize;
+                let remaining_run = self
+                    .limits
+                    .max_requests_per_run
+                    .saturating_sub(actual_requests.saturating_add(reserved_requests));
+                let request_budget = 7usize
+                    .min(remaining_source)
+                    .min(remaining_run)
+                    .min(response_slots);
+                if request_budget == 0 {
+                    self.mark_page_deferred(
+                        &candidate.key,
+                        now.saturating_add(MAX_RETRY_MS),
+                        "robots request budget exhausted",
+                    )?;
+                    continue;
+                }
+                let cached = self.stale_robot_cache(&origin)?;
+                let tx = self.db.transaction()?;
+                tx.execute(
+                    "UPDATE source_policy SET request_count=request_count+?2 WHERE source_id=?1",
+                    params![policy.id, request_budget as i64],
                 )?;
-                continue;
-            }
-            let cached = self.stale_robot_cache(&origin)?;
-            let tx = self.db.transaction()?;
-            tx.execute(
-                "UPDATE source_policy SET request_count=request_count+?2 WHERE source_id=?1",
-                params![policy.id, request_budget as i64],
-            )?;
-            tx.execute(
+                tx.execute(
                 "INSERT INTO robots_inflight(candidate_key,origins,min_origin_delay_ms) VALUES (?1,?2,?3)",
                 params![
                     candidate.key.as_str(),
@@ -2646,23 +2648,24 @@ where
                     policy.min_origin_delay_ms.min(MAX_RETRY_MS) as i64,
                 ],
             )?;
-            FrontierDb::event(
-                &tx,
-                now,
-                &policy.id,
-                None,
-                "robots_inflight",
-                "refresh robots for original authority",
-            )?;
-            tx.commit()?;
-            self.last_origin = origin.clone();
-            return Ok(Some(WorkerJob::Robots(RobotsJob {
-                candidate_key: candidate.key.clone(),
-                origin,
-                source: policy,
-                cached,
-                request_budget,
-            })));
+                FrontierDb::event(
+                    &tx,
+                    now,
+                    &policy.id,
+                    None,
+                    "robots_inflight",
+                    "refresh robots for original authority",
+                )?;
+                tx.commit()?;
+                self.last_origin = origin.clone();
+                return Ok(Some(WorkerJob::Robots(RobotsJob {
+                    candidate_key: candidate.key.clone(),
+                    origin,
+                    source: policy,
+                    cached,
+                    request_budget,
+                })));
+            }
         }
         Ok(None)
     }

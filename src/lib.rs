@@ -16,9 +16,12 @@ pub mod url_key;
 #[cfg(test)]
 mod reference;
 
+#[cfg(test)]
+mod gate7_benchmark;
+
 pub use demo::{
     DemoError, DemoOutput, DemoStats, create_search_fixture_index, run_controlled_fixture_demo,
-    run_demo, run_demo_with_options,
+    run_controlled_fixture_demo_retained, run_demo, run_demo_with_options,
 };
 
 #[derive(Debug, Eq, PartialEq)]

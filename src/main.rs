@@ -14,12 +14,28 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     if command == "controlled-demo" {
-        if args.next().is_some() {
-            eprintln!("controlled-demo does not accept arguments");
-            print_usage();
-            return ExitCode::from(2);
+        let mut retain_dir = None;
+        while let Some(argument) = args.next() {
+            match argument.as_str() {
+                "--retain-dir" if retain_dir.is_none() => {
+                    let Some(value) = args.next() else {
+                        eprintln!("--retain-dir requires a new directory path");
+                        return ExitCode::from(2);
+                    };
+                    retain_dir = Some(value);
+                }
+                _ => {
+                    eprintln!("unknown or repeated controlled-demo argument: {argument:?}");
+                    print_usage();
+                    return ExitCode::from(2);
+                }
+            }
         }
-        return match ley::run_controlled_fixture_demo() {
+        let result = match retain_dir {
+            Some(path) => ley::run_controlled_fixture_demo_retained(path),
+            None => ley::run_controlled_fixture_demo(),
+        };
+        return match result {
             Ok(output) => {
                 print!("{output}");
                 ExitCode::SUCCESS
@@ -370,6 +386,6 @@ fn main() -> ExitCode {
 
 fn print_usage() {
     println!(
-        "Ley Search Engine\n\nUsage:\n  cargo run --locked -- demo [--query EXPR] [--explain]\n  cargo run --locked -- controlled-demo\n  cargo run --locked -- fixture-index --store PATH\n  cargo run --locked -- search --store PATH --query EXPR\n  cargo run --locked -- serve --store PATH [--bind 127.0.0.1:7331]\n  cargo run --locked -- compact --store PATH\n  cargo run --locked -- reindex-gate3 --source OLD --destination NEW\n  cargo run --locked -- revoke-source --store PATH --frontier PATH --source-id ID\n  cargo run --locked -- crawl-public --policy PATH --store PATH --frontier PATH --requests 1..12 --approved-policy-sha256 HASH --allow-public-requests\n\nThe controlled demo uses its owned loopback fixture. fixture-index creates authored synthetic documents without network access. search opens a persistent store and prints the current generation's ordered results and full score explanations as bounded JSON. serve binds to loopback and exposes read-only health and search routes. The Gate 6 store appends immutable segments and compacts them explicitly; some aggregate segment limits recommend `compact` when merging can help, while live-corpus and retained lifecycle-history limits do not because compaction cannot reduce them. reindex-gate3 copies a stopped Gate 3 store to a separate destination and preserves the source bytes. Public crawling requires an enabled reviewed policy and an explicit hash approval. Search queries support terms, phrases, AND, OR, and implicit AND."
+        "Ley Search Engine\n\nUsage:\n  cargo run --locked -- demo [--query EXPR] [--explain]\n  cargo run --locked -- controlled-demo [--retain-dir NEW_PATH]\n  cargo run --locked -- fixture-index --store PATH\n  cargo run --locked -- search --store PATH --query EXPR\n  cargo run --locked -- serve --store PATH [--bind 127.0.0.1:7331]\n  cargo run --locked -- compact --store PATH\n  cargo run --locked -- reindex-gate3 --source OLD --destination NEW\n  cargo run --locked -- revoke-source --store PATH --frontier PATH --source-id ID\n  cargo run --locked -- crawl-public --policy PATH --store PATH --frontier PATH --requests 1..12 --approved-policy-sha256 HASH --allow-public-requests\n\nThe controlled demo uses an owned loopback fixture; --retain-dir keeps its persistent index and frontier under a new directory. fixture-index creates authored synthetic documents without network access. search opens a persistent store and prints the current generation's ordered results and full score explanations as bounded JSON. serve binds to loopback and exposes read-only health and search routes. The Gate 6 store appends immutable segments and compacts them explicitly; some aggregate segment limits recommend `compact` when merging can help, while live-corpus and retained lifecycle-history limits do not because compaction cannot reduce them. reindex-gate3 copies a stopped Gate 3 store to a separate destination and preserves the source bytes. Public crawling requires an enabled reviewed policy and an explicit hash approval. Search queries support terms, phrases, AND, OR, and implicit AND."
     );
 }

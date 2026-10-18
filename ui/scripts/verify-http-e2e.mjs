@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { access, mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { connect, createServer } from "node:net";
 import { once } from "node:events";
 import { PassThrough } from "node:stream";
@@ -17,10 +17,10 @@ const scratch = process.env.LEY_E2E_STORE_PATH
 const storePath = process.env.LEY_E2E_STORE_PATH
   ? path.resolve(process.env.LEY_E2E_STORE_PATH)
   : path.join(scratch, "index");
-const artifacts = process.env.LEY_E2E_ARTIFACT_DIR
+const artifactDirectoryProvided = process.env.LEY_E2E_ARTIFACT_DIR !== undefined;
+const artifacts = artifactDirectoryProvided
   ? path.resolve(process.env.LEY_E2E_ARTIFACT_DIR)
   : await mkdtemp(path.join(tmpdir(), "ley-http-e2e-browser-"));
-await mkdir(artifacts, { recursive: true });
 const children = [];
 let browser;
 const RAW_HTTP_TIMEOUT_MS = 4000;
@@ -246,9 +246,19 @@ async function stopChildren() {
 }
 
 try {
+  if (artifactDirectoryProvided) await mkdir(artifacts);
   await verifyRawReaderFailures();
   await run("cargo", ["build", "--locked", "--offline", "--bin", "ley"], { cwd: repoRoot });
   const ley = path.join(repoRoot, "target", "debug", "ley");
+  assert.ok(
+    process.env.LEY_E2E_CORPUS === undefined || process.env.LEY_E2E_CORPUS === "gate7-loopback-v1",
+    "LEY_E2E_CORPUS must be gate7-loopback-v1 when set",
+  );
+  const gate7Corpus = process.env.LEY_E2E_CORPUS === "gate7-loopback-v1";
+  const loopbackManifest = gate7Corpus
+    ? JSON.parse(await readFile(path.join(repoRoot, "fixtures/gate7-loopback-v1.json"), "utf8"))
+    : undefined;
+  const queries = gate7Corpus ? loopbackManifest.queries : ["rust", "bm25", "adversarial"];
   let storeExists = true;
   try {
     await access(storePath);
@@ -258,10 +268,18 @@ try {
   if (storeExists) {
     assert.equal(process.env.LEY_E2E_REUSE_STORE, "1", "refusing to overwrite an existing fixture index");
   } else {
+    assert.ok(!gate7Corpus, "Gate 7 corpus mode requires the retained controlled-demo index");
     await run(ley, ["fixture-index", "--store", storePath], { cwd: repoRoot });
   }
-  const cli = JSON.parse(await run(ley, ["search", "--store", storePath, "--query", "rust"], { cwd: repoRoot }));
-  assert.equal(cli.corpusSize, 3);
+  const cliByQuery = new Map();
+  for (const query of queries) {
+    const response = JSON.parse(await run(ley, ["search", "--store", storePath, "--query", query], { cwd: repoRoot }));
+    assert.ok(response.results.length > 0, `fixture query ${JSON.stringify(query)} has results`);
+    if (gate7Corpus) assert.equal(response.corpusSize, loopbackManifest.expectedIndexedPaths.length);
+    else assert.equal(response.corpusSize, 3);
+    cliByQuery.set(query, response);
+  }
+  const cli = cliByQuery.get(queries[0]);
 
   const apiPort = await selectedPort("LEY_E2E_API_PORT");
   const uiPort = await selectedPort("LEY_E2E_UI_PORT");
@@ -275,10 +293,28 @@ try {
   await waitForHttp(`${apiOrigin}/api/health`);
   await waitForHttp(uiOrigin);
 
-  const apiResponse = await fetch(`${apiOrigin}/api/search?q=rust`);
-  assert.equal(apiResponse.status, 200);
-  const apiRustSearch = await apiResponse.json();
-  assert.deepEqual(apiRustSearch, cli, "persistent CLI and HTTP API JSON must match");
+  const apiByQuery = new Map();
+  for (const query of queries) {
+    const apiResponse = await fetch(`${apiOrigin}/api/search?q=${encodeURIComponent(query)}`);
+    assert.equal(apiResponse.status, 200);
+    const apiResult = await apiResponse.json();
+    assert.deepEqual(apiResult, cliByQuery.get(query), `persistent CLI and HTTP API JSON must match for ${query}`);
+    apiByQuery.set(query, apiResult);
+  }
+  if (gate7Corpus) {
+    const actualPaths = new Set(
+      [...apiByQuery.values()].flatMap((response) => response.results.map((result) => new URL(result.id).pathname)),
+    );
+    assert.deepEqual(
+      [...actualPaths].sort(),
+      [...loopbackManifest.expectedIndexedPaths].sort(),
+      "manifest queries must reach every document in the retained crawler index",
+    );
+    const redirectHits = apiByQuery.get(loopbackManifest.redirectIdentityQuery).results;
+    assert.equal(redirectHits.length, 1);
+    assert.ok(redirectHits[0].id.endsWith(loopbackManifest.redirectRequestedPath));
+    assert.ok(redirectHits[0].versionId.length > 10);
+  }
 
   for (const [port, target] of [[apiPort, "/api/search?q=rust"], [uiPort, "/api/search?q=rust"]]) {
     for (const headers of [
@@ -290,7 +326,7 @@ try {
         socket.socket.write(`GET ${target} HTTP/1.1\r\n${headers}\r\nConnection: close\r\n\r\n`);
         const denied = await socket.readResponse();
         assert.equal(denied.status, 403);
-        assert.doesNotMatch(denied.body, /fixtures\.ley\.test|Rust in Ley/);
+        assert.doesNotMatch(denied.body, /fixtures\.ley\.test|Rust in Ley|Controlled Ley fixture|Redirect target record/);
       } finally {
         socket.dispose();
       }
@@ -323,17 +359,75 @@ try {
   page.on("pageerror", (error) => browserErrors.push(error.message));
   await page.goto(uiOrigin);
   const input = page.getByRole("textbox", { name: "Search indexed documents" });
-  for (const query of ["rust", "bm25", "adversarial"]) {
-    const responsePromise = page.waitForResponse((response) => response.url().includes(`/api/search?q=${query}`));
+  for (const [queryIndex, query] of queries.entries()) {
+    const expected = apiByQuery.get(query);
+    const responsePromise = page.waitForResponse((response) => {
+      if (!response.url().includes("/api/search?")) return false;
+      return new URL(response.url()).searchParams.get("q") === query;
+    });
     await input.fill(query);
     await input.press("Enter");
     const response = await responsePromise;
     assert.equal(response.status(), 200, `${query} API response`);
     const body = await response.json();
-    await page.locator(".result-card").first().waitFor();
-    assert.ok((await page.locator(".result-title").allTextContents()).includes(body.results[0].title));
+    assert.deepEqual(body, expected, `browser API response matches CLI response for ${query}`);
+    await page.waitForFunction((expectedIds) => {
+      const currentIds = [...document.querySelectorAll(".result-url")].map((element) => element.textContent);
+      return currentIds.length === expectedIds.length && currentIds.every((id, index) => id === expectedIds[index]);
+    }, body.results.map((result) => result.id));
+    const cards = page.locator(".result-card");
+    assert.equal(await cards.count(), body.results.length, `${query} rendered result count`);
+    assert.deepEqual(
+      await page.locator(".result-url").allTextContents(),
+      body.results.map((result) => result.id),
+      `${query} rendered result IDs and order`,
+    );
     assert.equal(body.generation, body.results[0].explanation.statisticsSource.generation);
     assert.equal(body.results[0].score, body.results[0].explanation.totalScore);
+    for (const [resultIndex, result] of body.results.entries()) {
+      const card = cards.nth(resultIndex);
+      assert.equal((await card.locator(".result-title").textContent()).trim(), result.title);
+      const scoreText = (await card.locator(".score-pill").textContent()).trim();
+      assert.ok(scoreText.startsWith(result.score.toFixed(3)), `${query} UI score for ${result.id}`);
+      const explanation = card.locator("details");
+      await explanation.locator("summary").click();
+      assert.equal(
+        (await explanation.locator(".explanation-total strong").textContent()).trim(),
+        result.explanation.totalScore.toFixed(6),
+        `${query} UI explanation total for ${result.id}`,
+      );
+      assert.equal(
+        (await explanation.locator(".version-id").textContent()).trim(),
+        `Version ${result.versionId}`,
+        `${query} UI version identity for ${result.id}`,
+      );
+      assert.deepEqual(
+        await explanation.locator(".term-breakdown h4").allTextContents(),
+        result.explanation.terms.map((term) => term.term),
+        `${query} UI explanation terms for ${result.id}`,
+      );
+      for (const [termIndex, term] of result.explanation.terms.entries()) {
+        const breakdown = explanation.locator(".term-breakdown").nth(termIndex);
+        const expectedFields = [term.title, term.body];
+        const rows = breakdown.locator(".field-row");
+        assert.equal(await rows.count(), expectedFields.length);
+        for (const [fieldIndex, field] of expectedFields.entries()) {
+          const spans = rows.nth(fieldIndex).locator("span");
+          assert.equal(
+            (await spans.nth(0).textContent()).trim(),
+            `tf ${field.termFrequency} / df ${field.documentFrequency}`,
+          );
+          assert.equal(
+            (await spans.nth(1).textContent()).trim(),
+            `len ${field.documentLength} · idf ${field.idf.toFixed(4)}`,
+          );
+          assert.equal(
+            (await rows.nth(fieldIndex).locator(".contribution").textContent()).trim(),
+            `+${field.contribution.toFixed(6)}`,
+          );
+        }
+      }
+    }
     browserResults.push({
       query,
       generation: body.generation,
@@ -348,7 +442,8 @@ try {
       await page.setViewportSize({ width, height: 900 });
       const scrollWidth = await page.evaluate(() => document.documentElement.scrollWidth);
       assert.ok(scrollWidth <= width, `${query} at ${width}px has horizontal overflow (${scrollWidth}px)`);
-      const screenshot = path.join(artifacts, `${query}-${width}.png`);
+      const querySlug = query.replace(/[^a-zA-Z0-9_-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40) || `query-${queryIndex + 1}`;
+      const screenshot = path.join(artifacts, `${querySlug}-${width}.png`);
       await page.screenshot({ path: screenshot, fullPage: true });
       screenshotPaths.push(screenshot);
     }
@@ -366,19 +461,26 @@ try {
   assert.equal(uiServer.child.exitCode, null);
   await writeFile(path.join(artifacts, "results.json"), JSON.stringify({
     storePath,
+    uiOrigin,
+    apiOrigin,
+    browserVersion: browser.version(),
+    browserUserAgent: await page.evaluate(() => navigator.userAgent),
     generation: cli.generation,
-    cliRustSearch: cli,
-    apiRustSearch,
+    corpusMode: gate7Corpus ? "gate7-loopback-v1 retained crawler store" : "legacy authored fixture-index store",
+    cliResponses: Object.fromEntries(cliByQuery),
+    apiResponses: Object.fromEntries(apiByQuery),
     browserResults,
     viewportWidths: [1280, 700, 390, 320],
     malformedQueryStatus: "alert shown",
     browserRequests,
     browserErrors,
+    apiServerStderr: apiServer.stderr,
+    uiServerStderr: uiServer.stderr,
     noticeStatus: notice.status,
     screenshots: screenshotPaths,
   }, null, 2));
   console.log(`Real Chromium HTTP path passed: UI ${uiOrigin} -> API ${apiOrigin} -> generation ${cli.generation}.`);
-  console.log(`Queries rust, bm25, adversarial, and malformed-query error passed. Screenshots and results: ${artifacts}`);
+  console.log(`Queries ${queries.map((query) => JSON.stringify(query)).join(", ")} and malformed-query error passed. Screenshots and results: ${artifacts}`);
 } catch (error) {
   console.error(`Real browser HTTP verification failed. UI and API use only 127.0.0.1. ${error.message}`);
   throw error;

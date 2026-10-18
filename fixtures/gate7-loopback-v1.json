@@ -1,0 +1,61 @@
+{
+  "schema": "ley-loopback-fixture-v1",
+  "sourceId": "gate7-loopback-v1",
+  "seedPath": "/",
+  "privatePath": "/private/denied",
+  "redirectRequestedPath": "/redirect/requested",
+  "redirectEffectivePath": "/redirect/effective",
+  "redirectIdentityQuery": "requested AND identity",
+  "expectedIndexedPaths": ["/", "/docs", "/redirect/requested"],
+  "queries": [
+    "controlled",
+    "durable",
+    "\"durable crawler\"",
+    "requested AND identity",
+    "Rust OR recovery"
+  ],
+  "routes": [
+    {
+      "path": "/robots.txt",
+      "status": 200,
+      "contentType": "text/plain; charset=utf-8",
+      "headers": [],
+      "body": "User-agent: LeyBot\nDisallow: /private\n"
+    },
+    {
+      "path": "/",
+      "status": 200,
+      "contentType": "text/html; charset=utf-8",
+      "headers": [],
+      "body": "<!doctype html><html><head><title>Controlled Ley fixture</title></head><body><p>controlled frontier durable index positional retrieval</p><a href=\"/docs\">documentation</a><a href=\"/redirect/requested\">redirect identity</a><a href=\"/private/denied\">private route</a></body></html>"
+    },
+    {
+      "path": "/docs",
+      "status": 200,
+      "contentType": "text/html; charset=utf-8",
+      "headers": [],
+      "body": "<title>Durable crawler recovery</title><p>The controlled crawler persists frontier and search intent with Rust parsing and BM25 ranking.</p>"
+    },
+    {
+      "path": "/redirect/requested",
+      "status": 302,
+      "contentType": "text/plain; charset=utf-8",
+      "headers": [["Location", "/redirect/effective"]],
+      "body": ""
+    },
+    {
+      "path": "/redirect/effective",
+      "status": 200,
+      "contentType": "text/html; charset=utf-8",
+      "headers": [],
+      "body": "<title>Redirect target record</title><p>The requested URL identity keeps its version while the effective URL records this target.</p>"
+    },
+    {
+      "path": "/private/denied",
+      "status": 200,
+      "contentType": "text/html; charset=utf-8",
+      "headers": [],
+      "body": "<title>This robots-disallowed route must not be fetched</title>"
+    }
+  ]
+}

@@ -51,6 +51,11 @@ impl FixtureResponse {
         response
     }
 
+    pub(super) fn with_header(mut self, name: &str, value: &str) -> Self {
+        self.headers.push((name.to_owned(), value.to_owned()));
+        self
+    }
+
     #[cfg(test)]
     pub(super) fn delayed(mut self, delay: Duration) -> Self {
         self.delay = delay;
@@ -65,12 +70,6 @@ impl FixtureResponse {
             body: body.as_ref().to_vec(),
             delay: Duration::ZERO,
         }
-    }
-
-    #[cfg(test)]
-    pub(super) fn with_header(mut self, name: &str, value: &str) -> Self {
-        self.headers.push((name.to_owned(), value.to_owned()));
-        self
     }
 }
 

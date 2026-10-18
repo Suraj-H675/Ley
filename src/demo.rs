@@ -12,7 +12,32 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct LoopbackManifest {
+    schema: String,
+    source_id: String,
+    seed_path: String,
+    private_path: String,
+    redirect_requested_path: String,
+    redirect_effective_path: String,
+    redirect_identity_query: String,
+    expected_indexed_paths: Vec<String>,
+    queries: Vec<String>,
+    routes: Vec<LoopbackRoute>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct LoopbackRoute {
+    path: String,
+    status: u16,
+    content_type: String,
+    headers: Vec<[String; 2]>,
+    body: String,
+}
 
 #[derive(Clone, Debug)]
 pub struct DemoOutput {
@@ -133,42 +158,83 @@ pub fn run_demo_with_options(query: &str, explain: bool) -> Result<DemoOutput, D
     })
 }
 
-/// Run the Gate 4 crawler against a process-owned local fixture, persist the
-/// frontier and index under a unique temporary directory, then reopen the
-/// index and verify the fixture-only query result survives recovery.
+/// Run the controlled crawler against the authored loopback corpus, keeping
+/// its paired index and frontier under a temporary directory.
 pub fn run_controlled_fixture_demo() -> Result<String, DemoError> {
-    let fixture = LocalFixture::start(vec![
-        (
-            "/robots.txt".to_owned(),
-            FixtureResponse::text("User-agent: LeyBot\nDisallow: /private\n"),
-        ),
-        (
-            "/".to_owned(),
-            FixtureResponse::html(
-                "<title>Controlled Ley fixture</title><p>controlled frontier durable index</p><a href=\"/docs\">documentation</a><a href=\"/private/denied\">private route</a>",
-            ),
-        ),
-        (
-            "/docs".to_owned(),
-            FixtureResponse::html(
-                "<title>Durable crawler recovery</title><p>the controlled crawler persists the frontier and search intent</p>",
-            ),
-        ),
-        (
-            "/private/denied".to_owned(),
-            FixtureResponse::html("<title>This must not be fetched</title>"),
-        ),
-    ])?;
-    let root = Gate4TempDir::create()?;
-    let index_path = root.path().join("index");
-    let frontier_path = root.path().join("frontier.sqlite");
+    run_controlled_fixture_demo_at(None)
+}
+
+/// Run the same owned loopback crawl while retaining the paired index and
+/// frontier under a new directory. The destination must not already exist.
+pub fn run_controlled_fixture_demo_retained(path: impl AsRef<Path>) -> Result<String, DemoError> {
+    run_controlled_fixture_demo_at(Some(path.as_ref()))
+}
+
+fn run_controlled_fixture_demo_at(retain_dir: Option<&Path>) -> Result<String, DemoError> {
+    let manifest: LoopbackManifest = serde_json::from_str(include_str!(
+        "../fixtures/gate7-loopback-v1.json"
+    ))
+    .map_err(|error| DemoError::Proof(format!("invalid Gate 7 loopback manifest: {error}")))?;
+    if manifest.schema != "ley-loopback-fixture-v1"
+        || manifest.queries.is_empty()
+        || !manifest.queries.contains(&manifest.redirect_identity_query)
+    {
+        return Err(DemoError::Proof(
+            "Gate 7 loopback manifest has an unsupported schema or no queries".to_owned(),
+        ));
+    }
+    let routes: Vec<(String, FixtureResponse)> = manifest
+        .routes
+        .iter()
+        .map(|route| {
+            let response = route.headers.iter().fold(
+                FixtureResponse::new(route.status, &route.content_type, &route.body),
+                |response, [name, value]| response.with_header(name, value),
+            );
+            (route.path.clone(), response)
+        })
+        .collect();
+    let fixture = LocalFixture::start(routes)?;
+    let temporary_root = if retain_dir.is_none() {
+        Some(Gate4TempDir::create()?)
+    } else {
+        None
+    };
+    let root_path = if let Some(path) = retain_dir {
+        match fs::symlink_metadata(path) {
+            Ok(_) => {
+                return Err(DemoError::Proof(format!(
+                    "refusing to replace existing retained demo directory: {}",
+                    path.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(DemoError::Proof(format!(
+                    "could not inspect retained demo directory: {error}"
+                )));
+            }
+        }
+        fs::create_dir(path).map_err(|error| {
+            DemoError::Proof(format!("could not create retained demo directory: {error}"))
+        })?;
+        path.to_path_buf()
+    } else {
+        temporary_root
+            .as_ref()
+            .expect("temporary root was created")
+            .path()
+            .to_path_buf()
+    };
+    let index_path = root_path.join("index");
+    let frontier_path = root_path.join("frontier.sqlite");
     let index = Arc::new(PersistentIndex::create(&index_path).map_err(|error| {
-        DemoError::Proof(format!("could not create Gate 4 demo index: {error}"))
+        DemoError::Proof(format!("could not create Gate 7 demo index: {error}"))
     })?);
     let origin = fixture.base_url().origin().ascii_serialization();
     let now = SystemClock.now_ms();
     let policy = SourcePolicy::owned_fixture(
-        "gate4-local-demo",
+        manifest.source_id.clone(),
         vec![origin],
         vec!["/".to_owned()],
         now.saturating_add(60_000),
@@ -179,69 +245,123 @@ pub fn run_controlled_fixture_demo() -> Result<String, DemoError> {
         vec![fixture.capability()],
         CrawlLimits::default(),
     )
-    .map_err(|error| DemoError::Proof(format!("could not open Gate 4 demo crawler: {error}")))?;
-    let seed = crate::url_key::UrlKey::parse(fixture.base_url().as_str())
-        .map_err(|error| DemoError::Proof(format!("invalid Gate 4 fixture URL: {error}")))?;
+    .map_err(|error| DemoError::Proof(format!("could not open Gate 7 demo crawler: {error}")))?;
+    let seed_url = fixture
+        .base_url()
+        .join(&manifest.seed_path)
+        .map_err(|error| DemoError::Proof(format!("invalid Gate 7 fixture seed URL: {error}")))?;
+    let seed = crate::url_key::UrlKey::parse(seed_url.as_str())
+        .map_err(|error| DemoError::Proof(format!("invalid Gate 7 fixture URL: {error}")))?;
     crawler
         .admit_source(policy, &[seed])
-        .map_err(|error| DemoError::Proof(format!("could not admit Gate 4 fixture: {error}")))?;
-    let docs_url = fixture.base_url().join("docs").unwrap();
-    let docs = crate::url_key::UrlKey::parse(docs_url.as_str())
-        .map_err(|error| DemoError::Proof(format!("invalid Gate 4 fixture URL: {error}")))?;
-    crawler
-        .enqueue_seed("gate4-local-demo", docs)
-        .map_err(|error| {
-            DemoError::Proof(format!("could not enqueue Gate 4 fixture page: {error}"))
-        })?;
+        .map_err(|error| DemoError::Proof(format!("could not admit Gate 7 fixture: {error}")))?;
+    let first_crawl_started = Instant::now();
     let first_report = crawler
         .run_until_idle(&CrawlCancellation::default())
-        .map_err(|error| DemoError::Proof(format!("Gate 4 fixture crawl failed: {error}")))?;
+        .map_err(|error| DemoError::Proof(format!("Gate 7 fixture crawl failed: {error}")))?;
+    let first_crawl_elapsed = first_crawl_started.elapsed();
     let request_log = fixture.request_log();
-    if request_log.iter().any(|path| path.starts_with("/private/")) {
+    if request_log
+        .iter()
+        .any(|path| path.starts_with(&manifest.private_path))
+    {
         return Err(DemoError::Proof(
-            "Gate 4 fixture fetched a robots-disallowed path".to_owned(),
+            "Gate 7 fixture fetched a robots-disallowed path".to_owned(),
         ));
     }
-    let before = index
-        .query("controlled")
-        .map_err(|error| DemoError::Proof(format!("Gate 4 query failed: {error}")))?;
-    if before.is_empty() || first_report.indexed != 2 {
+    if first_report.indexed != manifest.expected_indexed_paths.len() {
         return Err(DemoError::Proof(format!(
-            "Gate 4 fixture result mismatch: indexed={}, query hits={}",
+            "Gate 7 fixture indexed {} pages, expected {}; report={first_report:?}, log={request_log:?}",
             first_report.indexed,
-            before.len()
+            manifest.expected_indexed_paths.len()
         )));
     }
+    for required_path in [
+        "/robots.txt",
+        manifest.seed_path.as_str(),
+        manifest.redirect_effective_path.as_str(),
+    ] {
+        if !request_log.iter().any(|path| path == required_path) {
+            return Err(DemoError::Proof(format!(
+                "Gate 7 fixture did not request required route {required_path:?}: {request_log:?}"
+            )));
+        }
+    }
+    for indexed_path in &manifest.expected_indexed_paths {
+        if !request_log.iter().any(|path| path == indexed_path) {
+            return Err(DemoError::Proof(format!(
+                "Gate 7 fixture did not fetch expected indexed route {indexed_path:?}"
+            )));
+        }
+    }
+    let requested_url = fixture
+        .base_url()
+        .join(&manifest.redirect_requested_path)
+        .map_err(|error| DemoError::Proof(format!("invalid redirect URL: {error}")))?;
+    let effective_url = fixture
+        .base_url()
+        .join(&manifest.redirect_effective_path)
+        .map_err(|error| DemoError::Proof(format!("invalid redirect URL: {error}")))?;
+    let requested_key = crate::url_key::UrlKey::parse(requested_url.as_str())
+        .map_err(|error| DemoError::Proof(format!("invalid requested URL key: {error}")))?;
+    let initial_view = index.read_view().map_err(|error| {
+        DemoError::Proof(format!("could not read initial Gate 7 generation: {error}"))
+    })?;
+    let redirect_document = initial_view.document(&requested_key).ok_or_else(|| {
+        DemoError::Proof("redirected page lost its requested URL identity".to_owned())
+    })?;
+    if redirect_document.id != requested_url.as_str()
+        || redirect_document.effective_url != effective_url.as_str()
+        || redirect_document.version_id.is_empty()
+    {
+        return Err(DemoError::Proof(format!(
+            "redirect identity mismatch: id={}, effective={}, version={}",
+            redirect_document.id, redirect_document.effective_url, redirect_document.version_id
+        )));
+    }
+    let mut before = Vec::with_capacity(manifest.queries.len());
+    for query in &manifest.queries {
+        let results = initial_view.query(query).map_err(|error| {
+            DemoError::Proof(format!("Gate 7 query failed for {query:?}: {error}"))
+        })?;
+        before.push((query.clone(), results));
+    }
+    if !before.iter().any(|(_, results)| !results.is_empty()) {
+        return Err(DemoError::Proof(
+            "Gate 7 query manifest produced no results".to_owned(),
+        ));
+    }
     crawler
-        .revoke_source("gate4-local-demo")
-        .map_err(|error| DemoError::Proof(format!("could not revoke Gate 4 fixture: {error}")))?;
+        .revoke_source(&manifest.source_id)
+        .map_err(|error| DemoError::Proof(format!("could not revoke Gate 7 fixture: {error}")))?;
     if !index
         .query("controlled")
         .map_err(|error| DemoError::Proof(format!("revocation query failed: {error}")))?
         .is_empty()
     {
         return Err(DemoError::Proof(
-            "revoked Gate 4 fixture remained searchable".to_owned(),
+            "revoked Gate 7 fixture remained searchable".to_owned(),
         ));
     }
     let renewed_policy = SourcePolicy::owned_fixture(
-        "gate4-local-demo",
+        manifest.source_id.clone(),
         vec![fixture.base_url().origin().ascii_serialization()],
         vec!["/".to_owned()],
         SystemClock.now_ms().saturating_add(60_000),
     );
     crawler.readmit_source(renewed_policy).map_err(|error| {
         DemoError::Proof(format!(
-            "could not explicitly readmit Gate 4 fixture: {error}"
+            "could not explicitly readmit Gate 7 fixture: {error}"
         ))
     })?;
     let recovery_report = crawler
         .run_until_idle(&CrawlCancellation::default())
-        .map_err(|error| DemoError::Proof(format!("Gate 4 recovery crawl failed: {error}")))?;
-    if recovery_report.indexed != 2 {
+        .map_err(|error| DemoError::Proof(format!("Gate 7 recovery crawl failed: {error}")))?;
+    if recovery_report.indexed != manifest.expected_indexed_paths.len() {
         return Err(DemoError::Proof(format!(
-            "explicit Gate 4 readmission indexed {} pages instead of 2 (requests={}, log={:?})",
+            "explicit Gate 7 readmission indexed {} pages instead of {} (requests={}, log={:?})",
             recovery_report.indexed,
+            manifest.expected_indexed_paths.len(),
             recovery_report.requests,
             fixture.request_log()
         )));
@@ -250,29 +370,74 @@ pub fn run_controlled_fixture_demo() -> Result<String, DemoError> {
     drop(crawler);
     drop(index);
     let reopened = PersistentIndex::open(&index_path)
-        .map_err(|error| DemoError::Proof(format!("could not reopen Gate 4 index: {error}")))?;
-    let after = reopened
-        .query("controlled")
-        .map_err(|error| DemoError::Proof(format!("reopened Gate 4 query failed: {error}")))?;
-    let before_ids: Vec<&str> = before.iter().map(|item| item.id.as_str()).collect();
-    let after_ids: Vec<&str> = after.iter().map(|item| item.id.as_str()).collect();
-    if before_ids != after_ids {
+        .map_err(|error| DemoError::Proof(format!("could not reopen Gate 7 index: {error}")))?;
+    let reopened_view = reopened.read_view().map_err(|error| {
+        DemoError::Proof(format!("could not read reopened Gate 7 index: {error}"))
+    })?;
+    for (query, expected) in &before {
+        let actual = reopened_view.query(query).map_err(|error| {
+            DemoError::Proof(format!(
+                "reopened Gate 7 query failed for {query:?}: {error}"
+            ))
+        })?;
+        if !same_results_across_generations(expected, &actual) {
+            return Err(DemoError::Proof(format!(
+                "IDs, scores, matches, or explanations changed after restart for {query:?}"
+            )));
+        }
+    }
+    let reopened_redirect = reopened_view.document(&requested_key).ok_or_else(|| {
+        DemoError::Proof("redirected page disappeared after reopening the index".to_owned())
+    })?;
+    if reopened_redirect != redirect_document {
         return Err(DemoError::Proof(
-            "Gate 4 query results changed across index reopen".to_owned(),
+            "requested URL identity, effective URL, or version changed after reopening".to_owned(),
         ));
     }
+    let elapsed_ns = first_crawl_elapsed.as_nanos();
+    let pages_per_second = if first_crawl_elapsed.is_zero() {
+        0.0
+    } else {
+        first_report.pages_fetched as f64 / first_crawl_elapsed.as_secs_f64()
+    };
+    let crawler_measurement = serde_json::json!({
+        "durationNs": elapsed_ns,
+        "requests": first_report.requests,
+        "pagesFetched": first_report.pages_fetched,
+        "indexed": first_report.indexed,
+        "pagesPerSecond": pages_per_second,
+        "definition": "initial controlled fixture run_until_idle only; includes loopback HTTP, robots retrieval, extraction, frontier/outbox work, and persistent indexing; excludes process startup and later revoke/readmit"
+    });
     let output = format!(
-        "Ley Gate 4 Controlled Crawler 0.4\nFixture origin: {} (owned loopback listener)\nHTTP requests: {} (accepted sockets: {})\nPages indexed: {}\nFrontier and index: temporary persistent stores; index reopened and query parity confirmed\nRobots-disallowed path: NOT FETCHED\nFixture request log:\n{}\n",
+        "Ley Gate 7 Flagship 1.0\nFixture origin: {} (owned loopback listener)\nHTTP requests: {} (accepted sockets: {})\nPages fetched/indexed: {}/{}\nFirst crawl timing: {}\nRetained bundle: {}\nPersistent index: {}\nFrontier database: {}\nRedirect requested ID: {}\nRedirect effective URL: {}\nRedirect version ID: {}\nRestart parity: {} manifest queries; ordered IDs, scores, matches, and full explanations verified\nRevocation/readmission: verified\nRobots-disallowed path: NOT FETCHED\nFixture request log:\n{}\n",
         fixture.base_url().origin().ascii_serialization(),
         first_report.requests + recovery_report.requests,
         fixture.accepted_connections(),
-        recovery_report.indexed,
+        first_report.pages_fetched,
+        first_report.indexed,
+        serde_json::to_string(&crawler_measurement).unwrap_or_default(),
+        root_path.display(),
+        index_path.display(),
+        frontier_path.display(),
+        redirect_document.id,
+        redirect_document.effective_url,
+        redirect_document.version_id,
+        manifest.queries.len(),
         final_request_log
             .iter()
             .map(|path| format!("  GET {path}\n"))
             .collect::<String>(),
     );
     Ok(output)
+}
+
+fn same_results_across_generations(expected: &[SearchResult], actual: &[SearchResult]) -> bool {
+    expected.len() == actual.len()
+        && expected.iter().zip(actual).all(|(expected, actual)| {
+            let mut expected = expected.clone();
+            expected.explanation.statistics_source = actual.explanation.statistics_source.clone();
+            expected == *actual
+        })
 }
 
 /// Create a new persistent index containing only authored synthetic search
@@ -700,5 +865,62 @@ mod tests {
             run_demo(&query).unwrap_err().to_string(),
             "query is 4097 UTF-8 bytes; limit is 4096. Shorten the query and retry."
         );
+    }
+
+    #[test]
+    fn retained_controlled_demo_crawls_one_manifest_and_preserves_redirect_identity() {
+        let root = Gate4TempDir::create().unwrap();
+        let retained = root.path().join("retained");
+        let output = run_controlled_fixture_demo_retained(&retained).unwrap();
+        assert!(output.contains("Ley Gate 7 Flagship 1.0"));
+        assert!(output.contains("Robots-disallowed path: NOT FETCHED"));
+        assert!(output.contains("redirect/requested"));
+        assert!(output.contains("redirect/effective"));
+        assert!(retained.join("index/CURRENT").is_file());
+        assert!(retained.join("frontier.sqlite").is_file());
+
+        let index = PersistentIndex::open(retained.join("index")).unwrap();
+        let manifest: LoopbackManifest =
+            serde_json::from_str(include_str!("../fixtures/gate7-loopback-v1.json")).unwrap();
+        let view = index.read_view().unwrap();
+        let hits = view.query(&manifest.redirect_identity_query).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].id.ends_with("/redirect/requested"));
+        assert!(hits[0].version_id.len() > 10);
+
+        let origin = url::Url::parse(&hits[0].id)
+            .unwrap()
+            .origin()
+            .ascii_serialization();
+        let mut independent = crate::index::InMemoryIndex::new();
+        for path in &manifest.expected_indexed_paths {
+            let key = crate::url_key::UrlKey::parse(&format!("{origin}{path}")).unwrap();
+            let document = view.document(&key).unwrap();
+            independent
+                .insert_fields(
+                    document.id,
+                    document.effective_url,
+                    document.title,
+                    document.body,
+                )
+                .unwrap();
+        }
+        for query in &manifest.queries {
+            let actual = view.query(query).unwrap();
+            let parsed = crate::query::parse_query(query).unwrap();
+            let mut expected: Vec<_> = crate::reference::exhaustive_search(&independent, &parsed)
+                .into_iter()
+                .map(|hit| hit.result)
+                .collect();
+            for result in &mut expected {
+                result.explanation.statistics_source =
+                    crate::index::StatisticsSource::PersistentGeneration(view.generation_id());
+            }
+            assert_eq!(actual, expected, "fixture reference parity for {query:?}");
+        }
+
+        let error = run_controlled_fixture_demo_retained(&retained).unwrap_err();
+        assert!(error.to_string().contains("refusing to replace existing"));
+        assert_eq!(view.query(&manifest.redirect_identity_query).unwrap(), hits);
     }
 }

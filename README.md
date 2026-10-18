@@ -2,7 +2,72 @@
 
 Ley is a single-machine search engine built around its own crawler policy, HTML extraction, text analysis, positional index, query evaluator, and BM25 ranking. Rust libraries provide HTTP/TLS, HTML parsing, persistence primitives, and the local API framework. The browser interface uses React and TypeScript.
 
-Gates 0 through 6 are accepted. Gate 6 was independently verified with authored local fixtures, incremental file hashes, reference comparisons, process-crash recovery, and the real CLI, API, and browser interface. The checked-in public policy remains disabled. A bounded collection demonstrated a three-page Rust documentation index on 2026-10-14. Its original temporary corpus and runtime artifacts are now unavailable; the historical acceptance is retained with this limitation. The original request budget is unavailable, and no further public requests are authorized.
+Gates 0 through 6 are accepted. Gate 6 was independently verified with authored local fixtures, incremental file hashes, reference comparisons, process-crash recovery, and the real CLI, API, and browser interface. Gate 7 technical verification covers the retained crawler-to-CLI/API/Chromium pipeline, independent reference comparisons, repeatable offline benchmarks, and the Gate 0 through 6 regression suite. Technical verification does not settle the source-code license or authorize a tagged release. The checked-in public policy remains disabled. A bounded collection demonstrated a three-page Rust documentation index on 2026-10-14. Its original temporary corpus and runtime artifacts are now unavailable; the historical acceptance is retained with this limitation. The original request budget is unavailable, and no further public requests are authorized.
+
+## Reproduce the integrated offline crawl
+
+The offline demonstration uses one authored loopback fixture for the complete local path: HTTP routes and robots rules, controlled crawling, HTML extraction, requested-URL identity across a redirect, durable index and frontier, CLI and API JSON, and the React interface in real Chromium. The query list and expected page paths live with the route data in [`fixtures/gate7-loopback-v1.json`](fixtures/gate7-loopback-v1.json). This command starts only an owned `127.0.0.1` listener and makes no public requests.
+
+Install Rust 1.88 or newer, Node.js and npm, Python 3.10 or newer, then install the UI dependencies and a local Playwright Chromium build:
+
+```sh
+git clone https://github.com/Suraj-H675/Ley.git
+cd Ley
+cargo test --locked -- --test-threads=1
+python3 tools/verify_reference_corpus.py
+cd ui
+npm ci
+npx playwright install chromium
+npm run build
+cd ..
+```
+
+Choose a new evidence path for each crawl. This example retains the paired store under `.audit/gate7-local`:
+
+```sh
+DEMO_DIR=.audit/gate7-local
+mkdir -p "$DEMO_DIR"
+cargo run --locked -- controlled-demo --retain-dir "$DEMO_DIR/crawl"
+cargo run --locked -- search --store "$DEMO_DIR/crawl/index" --query 'requested AND identity'
+LEY_E2E_CORPUS=gate7-loopback-v1 \
+LEY_E2E_STORE_PATH="$DEMO_DIR/crawl/index" \
+LEY_E2E_REUSE_STORE=1 \
+LEY_E2E_ARTIFACT_DIR="$DEMO_DIR/browser" \
+  node ui/scripts/verify-http-e2e.mjs
+```
+
+`controlled-demo --retain-dir` requires a new directory and retains both `index/` and `frontier.sqlite`; it refuses to replace any existing path. The browser run reads the manifest queries, compares complete ordered CLI and HTTP API JSON, then checks rendered result IDs, scores, BM25 explanation fields, and version IDs against the same responses. It also exercises keyboard search, hostile Host/Origin headers, malformed-request recovery, local-only browser requests, and 1280, 700, 390, and 320 pixel layouts. Screenshots, server output, and query responses stay in the selected evidence directory. The separate browser-state check covers contrast, long hostile text/URLs, stale responses, API errors, and responsive reflow.
+
+The retained corpus is synthetic and tiny. It demonstrates integration and lifecycle behavior; it is not an estimate of web-scale relevance or production throughput. The redirect keeps the requested URL as the document ID and records its destination as the effective URL. The index uses incremental immutable segments and a durable outbox; see [Incremental index](#incremental-index-gate-6) for publication and recovery guarantees.
+
+The data path is `ControlledCrawler` admission and frontier → `SafeFetcher` destination and robots checks → HTML extraction → requested-key fenced outbox intent → `PersistentIndex` segment and manifest publication → pinned `ReadView` query and BM25 explanation → CLI or loopback HTTP API → React UI. Ley implements the crawl policy, analyzer, positional retrieval, query evaluation, and BM25 scorer. Rust crates provide HTTP/TLS, HTML parsing, SQLite and filesystem primitives, and the local web framework; no third-party full-text engine or external search API supplies retrieval.
+
+## Reproduce the offline benchmark
+
+The fixed CC0 workload is [`fixtures/benchmark-v1.json`](fixtures/benchmark-v1.json), with its byte-level SHA-256 in [`fixtures/benchmark-v1.sha256`](fixtures/benchmark-v1.sha256). It contains 128 authored documents and 13 fixed queries. The runner performs one warmup and five measured indexing/search trials, plus a separate set of owned-loopback crawler trials. Each persistent-index trial checks full ordered results, scores, match evidence, and explanations against the independent exhaustive evaluator before timing, then checks the measured store after indexing, reopen, and compaction. It records raw query samples and a summary under an ignored evidence directory:
+
+```sh
+python3 tools/run_gate7_benchmark.py \
+  --output-dir .audit/gate7-benchmark-$(date +%Y%m%d-%H%M%S)
+```
+
+Indexing time starts immediately before fresh-store creation. It includes store creation, URL parsing, fence issuance, text analysis, segment append, and manifest publication. It excludes workload validation, JSON loading, reference-parity checks, and compaction. Search p50/p95 use warm-cache `ReadView::query` samples. Each timer starts immediately before the call and reads elapsed time after the result is dropped and the expression is cloned and looked up in the sample `BTreeMap`. The reported latency includes query parsing, retrieval, BM25 scoring, explanations, result disposal, expression cloning, map lookup or insertion, and elapsed-timer read overhead. The sample-vector append happens after the latency timer stops. Query throughput divides completed calls by the full batch interval, including query execution, the loop, timer calls, result disposal, map bookkeeping, and sample-vector recording. Both search measures exclude HTTP, API, JSON, and UI work. Disk size is the regular-file byte total under the index path before and after compaction. Memory is Linux `/proc/self/status` `VmHWM` for the entire isolated Rust test process, including the harness and validation corpus; it is not an isolated index heap measure. The crawler rate is reported separately from the initial local fixture `run_until_idle` interval and includes loopback HTTP, robots, extraction, frontier/outbox work, and persistence. The OS page cache is not flushed. These small synthetic measurements do not establish relevance, general crawling speed, or web-scale capacity.
+
+Observed run on 2026-10-17: 128 documents, 11,664 analyzed tokens, 81,488 body bytes, 3,472 title bytes, 13 queries, workload SHA-256 `f4af07a44dc315025990123ff2a5388219b270b42005af53f3070a6c6a286bd1`. The run used release profile, Rust/Cargo 1.97.0, analyzer `ley-text-v1`, and manifest/segment format 1.0 on Linux 7.2.9, an Intel i7-13620H (16 logical CPUs, 16.4 GB RAM), Samsung NVMe storage on Btrfs. The Git checkout was dirty at base `8828f5a907a93abb100787bf17cdfee9e7cdfe60`; these are local candidate measurements, not a result from a published Gate 7 revision.
+
+| Measure | Median across five trials |
+| --- | ---: |
+| Incremental index append | 27.0 documents/s |
+| Warm query sample latency, including timer and map bookkeeping | p50 0.239 ms; p95 0.369 ms |
+| Warm query batch throughput, including sample recording | 4,471 calls/s |
+| Persistent index files | 524,729 bytes before; 208,264 bytes after compaction |
+| Benchmark-process peak RSS | 26,140,672 bytes (about 24.9 MiB) |
+| Compaction | 60.2 ms; 128 segments / 435,296 segment bytes merged into one 147,180-byte segment |
+| Owned loopback crawl | 17.3 fetched pages/s and 28.8 HTTP requests/s; 3 pages and 5 requests per run |
+
+Each measured query trial contains 100 timed calls per query after 20 complete warmup passes. The query latency distribution varies by trial; one trial had p95 0.533 ms and throughput 3,798 calls/s while the others were faster. System load average at run start was 3.95, 3.83, and 2.40 over 1, 5, and 15 minutes on 16 logical CPUs; background load is one plausible source of variation. Correctness parity passed for all 13 queries in the validation store, after measured indexing, after reopening, and after compaction. The five-trial raw samples and command/environment records are retained locally under `.audit/gate7-20261017/codex-run/benchmark-run-02/`; that ignored evidence is not part of a public checkout.
+
+An earlier attempt was excluded from the measurements. Its fixed query `fixture retrieval` selected no documents because the authored text contains `fixtures`. Its warmup and five indexing trials failed parity, so their indexing and search timings are not included. All five separate loopback crawler trials completed. Their results remain in the ignored `benchmark-run-01` evidence.
 
 ## Run a local search
 
@@ -121,7 +186,7 @@ The script saves `results.json` and Chromium screenshots in the selected artifac
 
 The shipped script was independently run with real Chromium against the retained fixture index at generation 8 through the React UI and Rust API. Its screenshots and `results.json` are under `.audit/gate6-20261017/work-final/browser`. Earlier sandbox-blocked attempts remain part of the historical trail; they do not describe the later verified run.
 
-The reference verifier checks its finite authored corpus. It is not a general web crawler or relevance evaluation. No search-quality or performance claims are made.
+The reference verifier checks its finite authored corpus. It is not a general web crawler or relevance evaluation. The Gate 7 workload measures one modest synthetic dataset on one recorded machine; it is not a scale projection.
 
 ## Public collection policy
 
@@ -133,7 +198,7 @@ On 2026-10-14, one bounded collection ran with a private enabled copy of the rev
 
 The crawl accepted 3 pages and reported 0 failed, rejected, or page-skipped candidates. Link discovery processed 1,037 candidates: 1,033 were denied by source scope, 4 were already in the frontier, and 0 were enqueued, malformed, or withheld by capacity. HTML extraction also reported 6,503 duplicate links. That extraction count is separate from the frontier and source-scope outcomes. The run stopped at `frontier_idle`; it did not follow the sitemap hint or discover more sources. The historical index was generation 7 with corpus size 3. CLI and API returned identical JSON for the `String`, `HashMap`, and `Iterator` queries. A real Chromium session displayed those results from the same index.
 
-The source has a lifetime request limit of 6, and the collection used 4 requests, including `robots.txt`. Two requests were recorded as unused when collection stopped. Because the persisted counter is now missing, the original request budget is unavailable; it must not be reset or reused. The three pages became due for their normal 24-hour recrawl, but no recrawl has run. The checked-in policy remains disabled. The crawler fails closed if it cannot fetch and parse robots rules, and it checks page and robots redirects against admitted paths and pinned network destinations.
+The source has a lifetime request limit of 6, and the collection used 4 requests, including `robots.txt`. Two requests were recorded as unused when collection stopped. That historical 4/6 accounting is not an available live budget: its persisted counter and runtime artifacts are missing, so it must not be recreated, reset, or reused. The three pages became due for their normal 24-hour recrawl, but no recrawl has run. The checked-in policy remains disabled. The crawler fails closed if it cannot fetch and parse robots rules, and it checks page and robots redirects against admitted paths and pinned network destinations.
 
 The candidate allows at most six source-lifetime HTTP requests, uses a one-second per-origin delay, and limits each invocation to 12 MiB of response-body wire bytes, 32 MiB of decoded bytes, and 60 seconds. It caps each index generation at 512 MiB, the frontier at 10,000 URLs, the outbox at 10,000 rows or 16 MiB, and stored robots data at 8 MiB. Body-byte counts exclude headers and TLS or protocol framing. The explicit `crawl-public` command requires an enabled policy, its exact reviewed SHA-256, and `--allow-public-requests`. The checked-in disabled policy cannot start a crawl. Reports include `stopReason` and `boundedRunFinished`; the command exits unsuccessfully when a request, byte, runtime, source budget, source deadline, or progress limit stops the run.
 
@@ -147,10 +212,12 @@ Source revocation was tested on an isolated copy of the collected store. That co
 
 ## Current limits
 
-The API returns at most 20 results from one pinned generation and caps query and response sizes. The local interface is not an internet-facing service. Public crawling is paused, and no further request is authorized. Gate 5 is accepted on the historical independent review record, with the documented runtime-artifact loss explicitly accepted for publication on 2026-10-17. This does not authorize a replacement crawl. The reproducible local fixture checks remain available.
+The persistent storage adapter currently supports Linux; other platforms fail closed with an unsupported-platform error. The API returns at most 20 results from one pinned generation and caps query and response sizes. The local interface is not an internet-facing service. Public crawling is paused, and no further request is authorized. Gate 5 is accepted on the historical independent review record, with the documented runtime-artifact loss explicitly accepted for publication on 2026-10-17. This does not authorize a replacement crawl. The reproducible local fixture checks remain available.
+
+Relevance: Not evaluated — no suitable judged dataset.
 
 ## Licensing
 
-The Ley source-code license has not been selected. Authored reference fixtures use CC0-1.0 as stated in `fixtures/LICENSE.txt`. Crawled pages, indexes, caches, snippets, and crawler logs remain outside Git.
+The Ley source-code license has not been selected. Public visibility does not grant an open-source license. Authored reference, loopback, and benchmark fixtures use CC0-1.0 as stated in `fixtures/LICENSE.txt`; this data dedication does not license Ley source code. Crawled pages, indexes, caches, snippets, and crawler logs remain outside Git.
 
-Gate 5 and Gate 6 implementation used OpenAI Codex with the Poteto workflow. The independent project reviewer accepted both gates.
+Gate 5 and Gate 6 implementation used OpenAI Codex with the Poteto workflow; the independent project reviewer accepted those gates. Gate 7 was implemented with OpenAI Codex in Poteto mode. Independent review reproduced the retained crawler-to-search pipeline, checked results against a separate finite evaluator, reviewed raw benchmark samples, and reran the relevant regressions.
