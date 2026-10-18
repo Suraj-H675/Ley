@@ -2323,10 +2323,12 @@ fn decode_lease_key(bytes: &[u8], expected_store_id: StoreId) -> Result<LeaseMac
     let major = get_u16(bytes, 8)?;
     let minor = get_u16(bytes, 10)?;
     let is_v6 = &bytes[..8] == LEASE_KEY_MAGIC_V6;
-    if (!is_v6 && &bytes[..8] != LEASE_KEY_MAGIC)
-        || (is_v6 && (major != STORE_V6_MAJOR || minor != STORE_V6_MINOR))
-        || (!is_v6 && (major != FORMAT_MAJOR || minor != FORMAT_MINOR))
-    {
+    let header_is_valid = if is_v6 {
+        major == STORE_V6_MAJOR && minor == STORE_V6_MINOR
+    } else {
+        &bytes[..8] == LEASE_KEY_MAGIC && major == FORMAT_MAJOR && minor == FORMAT_MINOR
+    };
+    if !header_is_valid {
         return Err(StorageError::UnsupportedFormat { major, minor });
     }
     if get_u32(bytes, 12)? != 0 {
@@ -4176,12 +4178,11 @@ mod tests {
         } else {
             2
         };
-        let expected_body_average =
-            if action == "upsert" && committed_new || action == "tombstone" && committed_new {
-                3.0
-            } else {
-                2.5
-            };
+        let expected_body_average = if committed_new && matches!(action, "upsert" | "tombstone") {
+            3.0
+        } else {
+            2.5
+        };
         for result in twin {
             assert_eq!(result.explanation.document_count, expected.len());
             assert!((result.explanation.average_title_length - 2.0).abs() < 1e-12);

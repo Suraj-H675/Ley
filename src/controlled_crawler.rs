@@ -6106,7 +6106,7 @@ mod tests {
                     .admit_source(
                         policy(
                             &fixture,
-                            &format!("redirect-{kind}-{}", robots_redirect),
+                            &format!("redirect-{kind}-{robots_redirect}"),
                             clock.now_ms(),
                         ),
                         &[fixture_seed(&fixture, "/")],

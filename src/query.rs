@@ -44,8 +44,7 @@ impl fmt::Display for QueryError {
             Self::UnsupportedSyntax => formatter.write_str("query uses unsupported syntax"),
             Self::QueryTooLong { bytes } => write!(
                 formatter,
-                "query is {bytes} UTF-8 bytes; limit is {}. Shorten the query and retry.",
-                MAX_QUERY_BYTES
+                "query is {bytes} UTF-8 bytes; limit is {MAX_QUERY_BYTES}. Shorten the query and retry."
             ),
             Self::TooManyTerms { occurrences } => write!(
                 formatter,

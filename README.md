@@ -2,13 +2,21 @@
 
 Ley is a single-machine search engine built around its own crawler policy, HTML extraction, text analysis, positional index, query evaluator, and BM25 ranking. Rust libraries provide HTTP/TLS, HTML parsing, persistence primitives, and the local API framework. The browser interface uses React and TypeScript.
 
-Gates 0 through 6 are accepted. Gate 6 was independently verified with authored local fixtures, incremental file hashes, reference comparisons, process-crash recovery, and the real CLI, API, and browser interface. Gate 7 technical verification covers the retained crawler-to-CLI/API/Chromium pipeline, independent reference comparisons, repeatable offline benchmarks, and the Gate 0 through 6 regression suite. Technical verification does not settle the source-code license or authorize a tagged release. The checked-in public policy remains disabled. A bounded collection demonstrated a three-page Rust documentation index on 2026-10-14. Its original temporary corpus and runtime artifacts are now unavailable; the historical acceptance is retained with this limitation. The original request budget is unavailable, and no further public requests are authorized.
+Gates 0 through 7 are accepted. The Gate 7 baseline, [4add0306](https://github.com/Suraj-H675/Ley/commit/4add0306fd6a84c96a41da42b63a42b174003b32), integrates the retained crawler-to-CLI/API/Chromium path, independent reference comparisons, repeatable offline benchmarks, and the Gate 0 through 6 regression suite. Acceptance does not select a source-code license or authorize a tagged release. The checked-in public policy remains disabled. A bounded collection demonstrated a three-page Rust documentation index on 2026-10-14. Its original temporary corpus and runtime artifacts are now unavailable; the historical acceptance is retained with this limitation. The original request budget is unavailable, and no further public requests are authorized.
 
 ## Reproduce the integrated offline crawl
 
 The offline demonstration uses one authored loopback fixture for the complete local path: HTTP routes and robots rules, controlled crawling, HTML extraction, requested-URL identity across a redirect, durable index and frontier, CLI and API JSON, and the React interface in real Chromium. The query list and expected page paths live with the route data in [`fixtures/gate7-loopback-v1.json`](fixtures/gate7-loopback-v1.json). This command starts only an owned `127.0.0.1` listener and makes no public requests.
 
-Install Rust 1.88 or newer, Node.js and npm, Python 3.10 or newer, then install the UI dependencies and a local Playwright Chromium build:
+Install Rust 1.88 or newer with the `rustfmt` and `clippy` components, Node.js 24 or newer with npm, and Python 3.10 or newer. Then install the UI dependencies and a local Playwright Chromium build:
+
+On Debian or Ubuntu, install the native build and TLS-test tools:
+
+```sh
+sudo apt-get install build-essential openssl
+```
+
+The locked rusqlite build compiles bundled SQLite with a C compiler. The non-FIPS AWS-LC build requires C and C++ compilers. Its default builder does not require CMake. If you select AWS-LC's optional CMake builder with `AWS_LC_SYS_CMAKE_BUILDER=1`, add `cmake` to the Debian or Ubuntu install command. See the [libsqlite3-sys 0.38.2 build notes](https://docs.rs/crate/libsqlite3-sys/0.38.2), [AWS-LC Linux requirements](https://aws.github.io/aws-lc-rs/requirements/linux.html), and [AWS-LC build-system options](https://aws.github.io/aws-lc-rs/resources.html#build-system).
 
 ```sh
 git clone https://github.com/Suraj-H675/Ley.git
@@ -21,6 +29,8 @@ npx playwright install chromium
 npm run build
 cd ..
 ```
+
+On Linux, install Chromium's system libraries if Playwright reports missing dependencies. From `ui/`, run `npx playwright install-deps chromium` with system package-install privileges, or run `npx playwright install --with-deps chromium` to install Chromium and its system libraries together. See [Playwright's Linux system requirements](https://playwright.dev/docs/browsers#install-system-dependencies).
 
 Choose a new evidence path for each crawl. This example retains the paired store under `.audit/gate7-local`:
 
@@ -44,7 +54,7 @@ The data path is `ControlledCrawler` admission and frontier → `SafeFetcher` de
 
 ## Reproduce the offline benchmark
 
-The fixed CC0 workload is [`fixtures/benchmark-v1.json`](fixtures/benchmark-v1.json), with its byte-level SHA-256 in [`fixtures/benchmark-v1.sha256`](fixtures/benchmark-v1.sha256). It contains 128 authored documents and 13 fixed queries. The runner performs one warmup and five measured indexing/search trials, plus a separate set of owned-loopback crawler trials. Each persistent-index trial checks full ordered results, scores, match evidence, and explanations against the independent exhaustive evaluator before timing, then checks the measured store after indexing, reopen, and compaction. It records raw query samples and a summary under an ignored evidence directory:
+The fixed CC0 workload is [`fixtures/benchmark-v1.json`](fixtures/benchmark-v1.json), with its byte-level SHA-256 in [`fixtures/benchmark-v1.sha256`](fixtures/benchmark-v1.sha256). It contains 128 authored documents and 13 fixed queries. The runner fetches the lockfile-pinned Rust crates before its offline builds. It performs one warmup and five measured indexing/search trials, plus a separate set of owned-loopback crawler trials. Each persistent-index trial checks full ordered results, scores, match evidence, and explanations against the independent exhaustive evaluator before timing, then checks the measured store after indexing, reopen, and compaction. It records raw query samples and a summary under an ignored evidence directory:
 
 ```sh
 python3 tools/run_gate7_benchmark.py \
@@ -123,17 +133,27 @@ The fixture crawler remains available through `cargo run --locked -- controlled-
 Run the Rust suite, formatter, lint checks, finite reference verifier, UI build, and browser checks from the repository root:
 
 ```sh
-cargo test --locked --offline -- --test-threads=1
+cargo test --locked -- --test-threads=1
 cargo fmt --all -- --check
-cargo clippy --locked --offline --all-targets --all-features -- -D warnings
+cargo clippy --locked --all-targets --all-features -- -D warnings
 python3 tools/verify_reference_corpus.py
 cd ui
+npm ci
 npm run build
-npm run verify:browser
-npm run verify:e2e
+BROWSER_DIR="$(pwd)/../.audit/verify-browser-$(date +%Y%m%d-%H%M%S)-$$"
+mkdir -p "$BROWSER_DIR/tmp" "$BROWSER_DIR/screenshots"
+TMPDIR="$BROWSER_DIR/tmp" \
+LEY_GATE5_ARTIFACT_DIR="$BROWSER_DIR/screenshots" \
+  npm run verify:browser
+E2E_DIR="../.audit/verify-e2e-$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$E2E_DIR"
+LEY_E2E_STORE_PATH="$E2E_DIR/index" \
+LEY_E2E_ARTIFACT_DIR="$E2E_DIR/artifacts" \
+  node scripts/verify-http-e2e.mjs
+cd ..
 ```
 
-`verify:browser` checks UI states with authored responses and raw local-server requests. It is an adapter check. `verify:e2e` runs Chromium through the real UI server and Rust API against the same persistent authored fixture index, checks full CLI/API JSON equality, exercises hostile Host and Origin headers, verifies malformed-request recovery, and saves desktop and mobile screenshots under `/tmp` by default. Its raw HTTP checks send requests without half-closing the client, dispose each socket, and reject EOF, socket errors, and incomplete responses after a four-second absolute response deadline. Set `LEY_E2E_STORE_PATH` and `LEY_E2E_ARTIFACT_DIR` to retain the fixture and screenshots elsewhere; set `LEY_E2E_REUSE_STORE=1` when reusing an existing fixture. `LEY_E2E_API_PORT` and `LEY_E2E_UI_PORT` can select caller-available loopback ports. The real browser path does not mock `fetch`, intercept browser requests, or contact public websites. A real Chromium session searched the public collection through the UI server and API on 2026-10-14; those original runtime artifacts are now missing. The checks above verify authored local fixtures and do not recover or replace the historical public evidence. The automated `verify:e2e` corpus remains synthetic. Both browser commands need local Chromium and loopback sockets. The TLS transport tests need OpenSSL to create owned local certificates.
+`verify:browser` checks UI states with authored responses and raw local-server requests. It is an adapter check. The command above stores its scratch files and screenshots under `.audit/verify-browser-*` through `TMPDIR` and `LEY_GATE5_ARTIFACT_DIR`. The E2E command above runs Chromium through the real UI server and Rust API against the same persistent authored fixture index, checks full CLI/API JSON equality, exercises hostile Host and Origin headers, verifies malformed-request recovery, and saves desktop and mobile screenshots under `.audit/verify-e2e-*`. Its raw HTTP checks send requests without half-closing the client, dispose each socket, and reject EOF, socket errors, and incomplete responses after a four-second absolute response deadline. Set `LEY_E2E_REUSE_STORE=1` only when reusing an existing fixture. `LEY_E2E_API_PORT` and `LEY_E2E_UI_PORT` can select caller-available loopback ports. The real browser path does not mock `fetch`, intercept browser requests, or contact public websites. A real Chromium session searched the public collection through the UI server and API on 2026-10-14; those original runtime artifacts are now missing. The checks above verify authored local fixtures and do not recover or replace the historical public evidence. The automated browser corpus remains synthetic. Both browser commands need local Chromium and loopback sockets. The TLS transport tests need OpenSSL to create owned local certificates. The Linux CI workflow runs Rust formatting, strict Clippy, tests, the reference verifier, and the UI build without installing a browser.
 
 ## Incremental index (Gate 6)
 
@@ -218,6 +238,6 @@ Relevance: Not evaluated — no suitable judged dataset.
 
 ## Licensing
 
-The Ley source-code license has not been selected. Public visibility does not grant an open-source license. Authored reference, loopback, and benchmark fixtures use CC0-1.0 as stated in `fixtures/LICENSE.txt`; this data dedication does not license Ley source code. Crawled pages, indexes, caches, snippets, and crawler logs remain outside Git.
+Use the [public issue tracker](https://github.com/Suraj-H675/Ley/issues) to discuss proposed changes and project questions. Issues are public, so do not send confidential reports there. The Ley source-code license remains undecided; public visibility does not grant reuse rights. Authored reference, loopback, and benchmark fixtures use CC0-1.0 as stated in `fixtures/LICENSE.txt`; this data dedication does not license Ley source code. Crawled pages, indexes, caches, snippets, and crawler logs remain outside Git.
 
-Gate 5 and Gate 6 implementation used OpenAI Codex with the Poteto workflow; the independent project reviewer accepted those gates. Gate 7 was implemented with OpenAI Codex in Poteto mode. Independent review reproduced the retained crawler-to-search pipeline, checked results against a separate finite evaluator, reviewed raw benchmark samples, and reran the relevant regressions.
+Gate 5 and Gate 6 implementation used OpenAI Codex with the Poteto workflow; the independent project reviewer accepted those gates. Gate 7 was implemented with OpenAI Codex in Poteto mode. Independent review reproduced the retained crawler-to-search pipeline, checked results against a separate finite evaluator, reviewed raw benchmark samples, and reran the relevant regressions. The post-Gate-7 open-source preparation also used OpenAI Codex in Poteto mode for documentation, CI, reproducibility, and mechanical Clippy cleanup.

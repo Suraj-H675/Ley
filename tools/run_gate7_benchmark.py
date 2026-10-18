@@ -145,7 +145,7 @@ def machine_metadata(output_dir: Path) -> dict[str, object]:
             if key in os.environ
         },
         "method": {
-            "cargoLock": "Cargo.lock with --locked; builds use --offline",
+            "cargoLock": "Cargo.lock; cargo fetch --locked runs before offline builds",
             "buildProfile": "release",
             "measuredTrials": MEASURED_TRIALS,
             "warmupTrials": 1,
@@ -225,15 +225,20 @@ def main() -> int:
     (output_dir / "index-trials").mkdir()
     (output_dir / "crawler-trials").mkdir()
 
-    test_build = [
-        "cargo", "test", "--locked", "--offline", "--release", "--lib",
-        BENCH_TEST, "--no-run",
-    ]
-    test_build_exit = runner.run("build-release-benchmark-test", test_build)
-    binary_build = runner.run(
-        "build-release-ley-binary",
-        ["cargo", "build", "--locked", "--offline", "--release", "--bin", "ley"],
-    )
+    dependency_fetch_exit = runner.run("fetch-locked-dependencies", ["cargo", "fetch", "--locked"])
+    if dependency_fetch_exit == 0:
+        test_build = [
+            "cargo", "test", "--locked", "--offline", "--release", "--lib",
+            BENCH_TEST, "--no-run",
+        ]
+        test_build_exit = runner.run("build-release-benchmark-test", test_build)
+        binary_build = runner.run(
+            "build-release-ley-binary",
+            ["cargo", "build", "--locked", "--offline", "--release", "--bin", "ley"],
+        )
+    else:
+        test_build_exit = dependency_fetch_exit
+        binary_build = dependency_fetch_exit
 
     index_trials: list[dict[str, object]] = []
     index_warmup_dir = output_dir / "warmup/index"
