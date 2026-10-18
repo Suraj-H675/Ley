@@ -29,6 +29,17 @@ def command_output(argv: list[str], cwd: Path = ROOT) -> str:
     return result.stdout.strip()
 
 
+def release_binary_path() -> Path:
+    configured_target_dir = os.environ.get("CARGO_TARGET_DIR")
+    if not configured_target_dir:
+        target_dir = ROOT / "target"
+    else:
+        target_dir = Path(configured_target_dir)
+        if not target_dir.is_absolute():
+            target_dir = ROOT / target_dir
+    return target_dir / "release" / "ley"
+
+
 def file_text(path: Path) -> str | None:
     try:
         return path.read_text(encoding="utf-8")
@@ -268,7 +279,7 @@ def main() -> int:
             index_trials.append(record)
 
     crawler_trials: list[dict[str, object]] = []
-    binary = ROOT / "target/release/ley"
+    binary = release_binary_path()
     if binary_build == 0 and binary.is_file():
         crawler_warmup = output_dir / "warmup/crawler"
         crawler_warmup.mkdir()

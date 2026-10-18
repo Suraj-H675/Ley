@@ -173,12 +173,12 @@ pub fn run(store_path: impl AsRef<Path>, bind: SocketAddr) -> Result<(), String>
 pub fn search_store_json(store_path: impl AsRef<Path>, query: &str) -> Result<String, String> {
     let index = PersistentIndex::open(store_path).map_err(|_| "index store is unavailable")?;
     let response = make_search_response(&index, query).map_err(|error| error.cli_message())?;
-    let body = serde_json::to_vec(&response).map_err(|_| "could not serialize search results")?;
+    let body = serde_json::to_string_pretty(&response)
+        .map_err(|_| "could not serialize search results".to_owned())?;
     if body.len() > MAX_RESPONSE_BYTES {
         return Err("search input or response exceeds its limit".to_owned());
     }
-    serde_json::to_string_pretty(&response)
-        .map_err(|_| "could not serialize search results".to_owned())
+    Ok(body)
 }
 
 fn router(index: Arc<PersistentIndex>, port: u16) -> Router {
@@ -787,6 +787,41 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert!(DEFAULT_BIND.ip().is_loopback());
+    }
+
+    #[test]
+    fn cli_json_rejects_pretty_response_over_byte_limit() {
+        let temp = TempStore::new();
+        let store = PersistentIndex::create(temp.path().join("index")).unwrap();
+        for number in 0..20 {
+            let key = UrlKey::parse(&format!(
+                "https://fixtures.example.test/large-response/{number}"
+            ))
+            .unwrap();
+            let lease = store.issue_fence(&key).unwrap();
+            store
+                .apply(
+                    &lease,
+                    Intent::Upsert {
+                        effective_url: key.as_str().to_owned(),
+                        title: format!("response limit document {number}"),
+                        body: "needle".to_owned(),
+                    },
+                )
+                .unwrap();
+        }
+
+        let query = std::iter::once("needle".to_owned())
+            .chain((1..64).map(|number| format!("term{number:02}")))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        assert_eq!(store.query(&query).unwrap().len(), 20);
+
+        assert_eq!(
+            super::search_store_json(temp.path().join("index"), &query)
+                .map(|response| response.len()),
+            Err("search input or response exceeds its limit".to_owned())
+        );
     }
 
     #[tokio::test]
