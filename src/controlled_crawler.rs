@@ -4429,11 +4429,18 @@ mod tests {
 
     impl TestDir {
         fn new() -> Self {
-            let id = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
-            let path =
-                std::env::temp_dir().join(format!("ley-gate4-test-{}-{id}", std::process::id()));
-            fs::create_dir(&path).expect("create unique test directory");
-            Self(path)
+            loop {
+                let id = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+                let path = std::env::temp_dir()
+                    .join(format!("ley-gate4-test-{}-{id}", std::process::id()));
+                match fs::create_dir(&path) {
+                    Ok(()) => return Self(path),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => {
+                        panic!("create unique test directory {}: {error}", path.display())
+                    }
+                }
+            }
         }
 
         fn path(&self) -> &Path {
@@ -4444,6 +4451,19 @@ mod tests {
     impl Drop for TestDir {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct ReapChildOnDrop(std::process::Child);
+
+    const OWNER_LOCK_READY_STAGE: &str = "owner_ready";
+
+    impl Drop for ReapChildOnDrop {
+        fn drop(&mut self) {
+            if self.0.try_wait().map_or(true, |status| status.is_none()) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
         }
     }
 
@@ -5597,7 +5617,10 @@ mod tests {
             return;
         };
         let index_path = std::env::var("LEY_GATE4_OWNER_INDEX").unwrap();
+        let stage_path = std::env::var("LEY_GATE4_OWNER_STAGE").unwrap();
+        fs::write(&stage_path, "opening_index").unwrap();
         let index = Arc::new(PersistentIndex::open(index_path).unwrap());
+        fs::write(&stage_path, "opening_frontier_owner").unwrap();
         let _owner = ControlledCrawler::open(
             Path::new(&frontier_path),
             index,
@@ -5607,9 +5630,7 @@ mod tests {
             ManualClock::new(1),
         )
         .unwrap();
-        println!("owner-ready");
-        use std::io::Write;
-        std::io::stdout().flush().unwrap();
+        fs::write(&stage_path, OWNER_LOCK_READY_STAGE).unwrap();
         use std::io::Read;
         let mut input = String::new();
         std::io::stdin().read_to_string(&mut input).unwrap();
@@ -5617,40 +5638,63 @@ mod tests {
 
     #[test]
     fn second_coordinator_is_rejected_and_crash_releases_frontier_owner() {
-        use std::io::BufRead;
         use std::process::Stdio;
 
         let temp = TestDir::new();
         let index_path = temp.path().join("index");
         let frontier_path = temp.path().join("frontier.sqlite");
+        let stage_path = temp.path().join("owner-stage");
+        let stderr_path = temp.path().join("owner-child.stderr");
+        fs::write(&stage_path, "parent_starting_child").unwrap();
         let index = Arc::new(PersistentIndex::create(&index_path).unwrap());
-        let mut child = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "controlled_crawler::tests::owner_lock_child_holds_frontier_until_process_exit",
-                "--nocapture",
-            ])
-            .env("LEY_GATE4_OWNER_FRONTIER", &frontier_path)
-            .env("LEY_GATE4_OWNER_INDEX", &index_path)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
-        let mut ready = String::new();
+        fs::write(&stage_path, "parent_spawning_child").unwrap();
+        let stderr = fs::File::create(&stderr_path).unwrap();
+        let mut child = ReapChildOnDrop(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "controlled_crawler::tests::owner_lock_child_holds_frontier_until_process_exit",
+                    "--nocapture",
+                ])
+                .env("LEY_GATE4_OWNER_FRONTIER", &frontier_path)
+                .env("LEY_GATE4_OWNER_INDEX", &index_path)
+                .env("LEY_GATE4_OWNER_STAGE", &stage_path)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::from(stderr))
+                .spawn()
+                .unwrap(),
+        );
+        let child_stderr = || {
+            fs::read_to_string(&stderr_path)
+                .unwrap_or_else(|error| format!("<child stderr unavailable: {error}>"))
+        };
+        let readiness_deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            ready.clear();
-            assert_ne!(
-                stdout.read_line(&mut ready).unwrap(),
-                0,
-                "child exited before locking frontier"
-            );
-            if ready.trim() == "owner-ready" {
+            let stage = fs::read_to_string(&stage_path)
+                .unwrap_or_else(|error| format!("<stage unavailable: {error}>"));
+            if stage == OWNER_LOCK_READY_STAGE {
                 break;
             }
+            if let Some(status) = child.0.try_wait().unwrap() {
+                panic!(
+                    "owner child exited before acquiring the frontier owner; status={status}; stage={stage}; stderr:\n{}",
+                    child_stderr()
+                );
+            }
+            if Instant::now() >= readiness_deadline {
+                let child_id = child.0.id();
+                let kill = child.0.kill();
+                let status = child.0.wait();
+                panic!(
+                    "owner child readiness timed out after 10 seconds; pid={child_id}; stage={stage}; kill={kill:?}; exit={status:?}; stderr:\n{}",
+                    child_stderr()
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
         }
 
+        fs::write(&stage_path, "parent_checking_live_owner").unwrap();
         let contender = ControlledCrawler::open(
             &frontier_path,
             Arc::clone(&index),
@@ -5659,12 +5703,43 @@ mod tests {
             CrawlLimits::default(),
             ManualClock::new(1),
         );
+        match contender {
+            Err(CrawlError::Policy(message)) if message.contains("live coordinator") => {}
+            Err(error) => panic!(
+                "second coordinator returned the wrong error while owner was live: {error}; child stderr:\n{}",
+                child_stderr()
+            ),
+            Ok(owner) => {
+                drop(owner);
+                panic!(
+                    "second coordinator opened while child held the frontier owner; child stderr:\n{}",
+                    child_stderr()
+                );
+            }
+        }
+
+        fs::write(&stage_path, "parent_terminating_owner").unwrap();
+        child.0.kill().unwrap_or_else(|error| {
+            panic!(
+                "failed to terminate live owner child: {error}; stage={}; stderr:\n{}",
+                fs::read_to_string(&stage_path).unwrap_or_default(),
+                child_stderr()
+            )
+        });
+        let child_status = child.0.wait().unwrap_or_else(|error| {
+            panic!(
+                "failed to reap owner child: {error}; stage={}; stderr:\n{}",
+                fs::read_to_string(&stage_path).unwrap_or_default(),
+                child_stderr()
+            )
+        });
         assert!(
-            matches!(contender, Err(CrawlError::Policy(message)) if message.contains("live coordinator"))
+            !child_status.success(),
+            "owner child exited successfully instead of being terminated; stderr:\n{}",
+            child_stderr()
         );
 
-        child.kill().unwrap();
-        child.wait().unwrap();
+        fs::write(&stage_path, "parent_reopening_after_child_exit").unwrap();
         let owner_after_crash = ControlledCrawler::open(
             &frontier_path,
             index,
@@ -5673,7 +5748,13 @@ mod tests {
             CrawlLimits::default(),
             ManualClock::new(1),
         )
-        .unwrap();
+        .unwrap_or_else(|error| {
+            panic!(
+                "frontier owner did not reopen after child exit: {error}; stage={}; stderr:\n{}",
+                fs::read_to_string(&stage_path).unwrap_or_default(),
+                child_stderr()
+            )
+        });
         drop(owner_after_crash);
     }
 
