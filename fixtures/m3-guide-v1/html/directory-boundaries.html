@@ -1,0 +1,11 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Walking a local HTML directory safely</title></head>
+<body>
+<h1>Walking a local HTML directory safely</h1>
+<p>A directory importer should begin from one explicit root chosen by its operator. Resolve that root once, then inspect entries beneath it without following symbolic links. A symlink can point outside the selected collection, change between checks, or lead back to the root and create a traversal loop. A small offline importer can reject symlinks rather than trying to guess which targets are safe. It should also refuse a special file where regular files or directories are expected.</p>
+<p>Sort relative paths before assigning identities. Filesystem enumeration order is not a stable document order, while deterministic order makes failures and results easier to reproduce. Require each relative path to remain under the canonical root. If a path component cannot be represented as UTF-8, fail with a bounded error rather than silently replacing bytes and creating an ambiguous URL.</p>
+<p>Limits need to apply while the directory is being read. A maximum file count bounds metadata work, a per-file byte limit bounds one read, and an aggregate byte limit bounds the collection. Check file metadata for early rejection, then read at most one byte beyond the permitted maximum because a file may change after its metadata was inspected. Reject the collection if the actual read exceeds the limit.</p>
+<p>Use a new destination for each imported index. Do not overwrite an existing store, and do not put the destination inside the source tree. Extract and validate the selected files before creating the destination so malformed input does not leave a half-created index. If durable storage fails after creation starts, preserve the new output for explicit inspection rather than deleting data automatically.</p>
+</body>
+</html>

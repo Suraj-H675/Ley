@@ -1,0 +1,11 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Mapping local paths to source identities</title></head>
+<body>
+<h1>Mapping local paths to source identities</h1>
+<p>A document key should be stable enough to reconnect a search hit to the same source entry later. For a local collection, an operator can provide a URL prefix and the importer can append each sorted relative path. The URL path segments must be encoded separately so punctuation in a filename cannot introduce a new query, fragment, or path boundary. A URL parser should reject credentials and non-HTTP schemes before the value becomes an identity.</p>
+<p>This URL is a label for provenance. Mapping <code>manual/setup.html</code> to <code>https://docs.example.invalid/guide/manual/setup.html</code> does not fetch a web page, check a redirect, or confirm that a publisher owns the address. It records that the local file was assigned this requested URL. When nothing is fetched, the effective URL is the same assigned URL because there was no observed redirect.</p>
+<p>When a network fetch does occur, preserve both values. The requested URL identifies the resource the system asked for; the effective URL records the final URL after redirects. Search results should not replace the requested identity with the redirect destination because old evidence references and document keys depend on that identity.</p>
+<p>Only link a displayed source URL when its scheme is HTTP or HTTPS and it contains no username or password. Treat unsafe or malformed values as plain text. A safe link policy limits what the browser can navigate to; it does not certify the page content or make it a trustworthy answer.</p>
+</body>
+</html>

@@ -1,0 +1,10 @@
+Ley M3 Local Evidence Guide, version 1
+
+The original HTML documents in this directory were written for the Ley Stage B
+Milestone 3 local retrieval demonstration on 2026-10-20. They contain no copied
+third-party document text. The guide is instructional fixture content, not a
+complete specification of every Ley build or runtime configuration.
+
+The guide text is dedicated to the public domain under CC0 1.0 Universal. The
+CC0 legal code is available at:
+https://creativecommons.org/publicdomain/zero/1.0/legalcode

@@ -1,0 +1,11 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Extracting readable text from HTML</title></head>
+<body>
+<h1>Extracting readable text from HTML</h1>
+<p>HTML extraction turns an input document into searchable title and body fields. It is not the same operation as retaining or displaying the original markup. A bounded parser can ignore scripts and navigation, normalize whitespace, and return text alongside metadata such as an effective URL and indexing restrictions. Every field still comes from untrusted input and must be rendered as ordinary text in a browser.</p>
+<p>For a UTF-8 local import contract, reject invalid byte sequences before parsing and pass the extractor an explicit UTF-8 content type. This keeps one collection from mixing implicit character-set guesses with the operator's declared input format. Enforce limits on encoded bytes, decoded content, parser events, nesting depth, title size, total fields, and analyzed tokens. The first limit prevents an oversized read; parser limits constrain expensive or deeply nested markup.</p>
+<p>A robots <code>noindex</code> declaration is a collection policy signal. Extraction code can report it, but the caller must decide to skip the document. A local importer should honor that restriction and report the skip. A <code>nofollow</code> declaration does not instruct a local directory walker to follow links; an importer that never crawls should not fetch links at all.</p>
+<p>Evidence offsets must name the exact stored body representation, not source HTML byte positions. Parsing and whitespace normalization can change both the bytes and positions of text. A resolver should slice the persisted extracted body at valid UTF-8 boundaries, then return the current text for that source version.</p>
+</body>
+</html>

@@ -44,6 +44,7 @@ const REFERENCE_DOMAIN: &[u8] = b"ley-evidence-reference-v1\0";
 /// Advanced DSL expressions continue to use the existing `query(&str)` API.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "mode", content = "request", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
 pub enum RetrievalRequest {
     Question(QuestionRequest),
 }

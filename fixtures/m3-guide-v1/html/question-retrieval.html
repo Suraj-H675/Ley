@@ -1,0 +1,12 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Ordinary questions and lexical candidates</title></head>
+<body>
+<h1>Ordinary questions and lexical candidates</h1>
+<p>An ordinary question is a request for relevant text expressed in everyday language. A retrieval system may normalize its terms, keep quoted phrases together, and match passages that contain those terms. That process can find useful context, but a lexical match does not prove that the passage answers the question. A passage can contain the requested words while describing a caveat, an unrelated example, or even the opposite of what the reader expected.</p>
+<p>Keep question retrieval separate from an advanced Boolean query language. A query such as <code>cache AND invalidation</code> has operator syntax and a defined parsing rule. A natural question such as “How does a cache invalidation signal reach a reader?” should not be silently reinterpreted as that language. The interface should state which mode is active and never switch modes after an error.</p>
+<p>Return the exact matched passage with its source title, requested URL, effective URL, matched terms or phrases, and an explicit retrieval status. If bounded work was skipped, report partial completeness. If no passage matched, say that no text matched. Do not label a negative query as answered or hide irrelevant hits with an invented confidence threshold.</p>
+<p>Use an answer assessment of <code>not_assessed</code> when the system has not independently evaluated truth or entailment. Avoid answer snippets that were not present in the source and avoid confidence percentages that have no calibrated meaning. Honest limits help a reader decide whether to inspect more context or another source.</p>
+<p>A question can name a code token such as <code>resolve_evidence</code> without changing retrieval mode. Query punctuation, including backticks around a code literal, should not silently turn an ordinary question into the advanced Boolean language.</p>
+</body>
+</html>

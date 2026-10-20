@@ -1,7 +1,11 @@
 use std::env;
+use std::fs::File;
+use std::io::{self, Read};
 use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use ley::{EvidenceReference, QuestionRequest, RetrievalRequest};
 
 fn main() -> ExitCode {
     let mut args = env::args().skip(1);
@@ -89,6 +93,15 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         };
+    }
+    if command == "ingest-html" {
+        return run_ingest_html(args);
+    }
+    if command == "retrieve" {
+        return run_retrieve(args);
+    }
+    if command == "resolve-evidence" {
+        return run_resolve_evidence(args);
     }
     if command == "search" {
         let mut store = None;
@@ -384,8 +397,161 @@ fn main() -> ExitCode {
     }
 }
 
+fn run_ingest_html(mut args: impl Iterator<Item = String>) -> ExitCode {
+    let mut store = None;
+    let mut directory = None;
+    let mut url_prefix = None;
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--store" if store.is_none() => store = args.next(),
+            "--directory" if directory.is_none() => directory = args.next(),
+            "--url-prefix" if url_prefix.is_none() => url_prefix = args.next(),
+            _ => {
+                eprintln!("unknown or repeated ingest-html argument: {argument:?}");
+                print_usage();
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let (Some(store), Some(directory), Some(url_prefix)) = (store, directory, url_prefix) else {
+        eprintln!("ingest-html requires --store NEW_PATH --directory DIR --url-prefix URL");
+        print_usage();
+        return ExitCode::from(2);
+    };
+    match ley::local_ingest::ingest_html_directory(store, directory, &url_prefix) {
+        Ok(report) => {
+            println!(
+                "Imported {} local HTML documents, skipped {} noindex documents, read {} bytes; generation {}",
+                report.indexed_documents,
+                report.skipped_noindex,
+                report.input_bytes,
+                report.generation_id
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("ley: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_retrieve(mut args: impl Iterator<Item = String>) -> ExitCode {
+    let mut store = None;
+    let mut question = None;
+    let mut max_hits = None;
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--store" if store.is_none() => store = args.next(),
+            "--question" if question.is_none() => question = args.next(),
+            "--max-hits" if max_hits.is_none() => {
+                let Some(value) = args.next() else {
+                    eprintln!("--max-hits requires a value between 1 and 8");
+                    return ExitCode::from(2);
+                };
+                match value.parse::<u8>() {
+                    Ok(value @ 1..=8) => max_hits = Some(value),
+                    _ => {
+                        eprintln!("--max-hits requires a value between 1 and 8");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            _ => {
+                eprintln!("unknown or repeated retrieve argument: {argument:?}");
+                print_usage();
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let (Some(store), Some(question)) = (store, question) else {
+        eprintln!("retrieve requires --store PATH and --question TEXT");
+        print_usage();
+        return ExitCode::from(2);
+    };
+    let request = match max_hits {
+        Some(max_hits) => match QuestionRequest::new(question).with_max_hits(max_hits) {
+            Ok(request) => RetrievalRequest::Question(request),
+            Err(_) => {
+                eprintln!("ley: invalid_request");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => RetrievalRequest::question(question),
+    };
+    match ley::api::retrieve_store_json(store, request) {
+        Ok(response) => {
+            println!("{response}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("ley: {}", error.code());
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_resolve_evidence(mut args: impl Iterator<Item = String>) -> ExitCode {
+    let mut store = None;
+    let mut reference_file = None;
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--store" if store.is_none() => store = args.next(),
+            "--reference-file" if reference_file.is_none() => reference_file = args.next(),
+            _ => {
+                eprintln!("unknown or repeated resolve-evidence argument: {argument:?}");
+                print_usage();
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let (Some(store), Some(reference_file)) = (store, reference_file) else {
+        eprintln!("resolve-evidence requires --store PATH and --reference-file PATH|-");
+        print_usage();
+        return ExitCode::from(2);
+    };
+    let reference = match read_evidence_reference(&reference_file) {
+        Ok(reference) => reference,
+        Err(error) => {
+            eprintln!("ley: {}", error.code());
+            return ExitCode::FAILURE;
+        }
+    };
+    match ley::api::resolve_evidence_store_json(store, &reference) {
+        Ok(response) => {
+            println!("{response}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("ley: {}", error.code());
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn read_evidence_reference(path: &str) -> Result<EvidenceReference, ley::api::ClientFailure> {
+    let mut bytes = Vec::with_capacity(ley::api::MAX_TYPED_REQUEST_BYTES);
+    if path == "-" {
+        io::stdin()
+            .lock()
+            .take((ley::api::MAX_TYPED_REQUEST_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|_| ley::api::ClientFailure::InvalidRequest)?;
+    } else {
+        File::open(path)
+            .map_err(|_| ley::api::ClientFailure::InvalidRequest)?
+            .take((ley::api::MAX_TYPED_REQUEST_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|_| ley::api::ClientFailure::InvalidRequest)?;
+    }
+    if bytes.len() > ley::api::MAX_TYPED_REQUEST_BYTES {
+        return Err(ley::api::ClientFailure::ResourceCap);
+    }
+    serde_json::from_slice(&bytes).map_err(|_| ley::api::ClientFailure::InvalidRequest)
+}
+
 fn print_usage() {
     println!(
-        "Ley Search Engine\n\nUsage:\n  cargo run --locked -- demo [--query EXPR] [--explain]\n  cargo run --locked -- controlled-demo [--retain-dir NEW_PATH]\n  cargo run --locked -- fixture-index --store PATH\n  cargo run --locked -- search --store PATH --query EXPR\n  cargo run --locked -- serve --store PATH [--bind 127.0.0.1:7331]\n  cargo run --locked -- compact --store PATH\n  cargo run --locked -- reindex-gate3 --source OLD --destination NEW\n  cargo run --locked -- revoke-source --store PATH --frontier PATH --source-id ID\n  cargo run --locked -- crawl-public --policy PATH --store PATH --frontier PATH --requests 1..12 --approved-policy-sha256 HASH --allow-public-requests\n\nThe controlled demo uses an owned loopback fixture; --retain-dir keeps its persistent index and frontier under a new directory. fixture-index creates authored synthetic documents without network access. search opens a persistent store and prints the current generation's ordered results and full score explanations as bounded JSON. serve binds to loopback and exposes read-only health and search routes. The Gate 6 store appends immutable segments and compacts them explicitly; some aggregate segment limits recommend `compact` when merging can help, while live-corpus and retained lifecycle-history limits do not because compaction cannot reduce them. reindex-gate3 copies a stopped Gate 3 store to a separate destination and preserves the source bytes. Public crawling requires an enabled reviewed policy and an explicit hash approval. Search queries support terms, phrases, AND, OR, and implicit AND."
+        "Ley Search Engine\n\nUsage:\n  cargo run --locked -- demo [--query EXPR] [--explain]\n  cargo run --locked -- controlled-demo [--retain-dir NEW_PATH]\n  cargo run --locked -- fixture-index --store PATH\n  cargo run --locked -- ingest-html --store NEW_PATH --directory DIR --url-prefix URL\n  cargo run --locked -- retrieve --store PATH --question TEXT [--max-hits 1..8]\n  cargo run --locked -- resolve-evidence --store PATH --reference-file PATH|-\n  cargo run --locked -- search --store PATH --query EXPR\n  cargo run --locked -- serve --store PATH [--bind 127.0.0.1:7331]\n  cargo run --locked -- compact --store PATH\n  cargo run --locked -- reindex-gate3 --source OLD --destination NEW\n  cargo run --locked -- revoke-source --store PATH --frontier PATH --source-id ID\n  cargo run --locked -- crawl-public --policy PATH --store PATH --frontier PATH --requests 1..12 --approved-policy-sha256 HASH --allow-public-requests\n\nThe controlled demo uses an owned loopback fixture; --retain-dir keeps its persistent index and frontier under a new directory. fixture-index creates authored synthetic documents without network access. ingest-html reads bounded UTF-8 HTML from an operator-selected local directory into a new store and does not fetch URLs. retrieve runs the versioned ordinary-question contract and prints typed passage candidates; resolve-evidence reads a bounded JSON reference from a file or stdin and revalidates it against the current store. search remains the advanced Boolean/phrase DSL. serve binds to loopback and exposes read-only health, legacy search, question retrieval, and evidence resolution routes. Typed routes use POST /api/v1/retrieve and POST /api/v1/evidence/resolve. The Gate 6 store appends immutable segments and compacts them explicitly; some aggregate segment limits recommend compact when merging can help, while live-corpus and retained lifecycle-history limits do not because compaction cannot reduce them. reindex-gate3 copies a stopped Gate 3 store to a separate destination and preserves the source bytes. Public crawling requires an enabled reviewed policy and an explicit hash approval. Search queries support terms, phrases, AND, OR, and implicit AND."
     );
 }

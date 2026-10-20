@@ -5,6 +5,7 @@ mod crawler;
 mod demo;
 pub mod html;
 pub mod index;
+pub mod local_ingest;
 mod page_policy;
 pub mod public_policy;
 mod query;

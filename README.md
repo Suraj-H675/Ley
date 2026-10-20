@@ -39,14 +39,9 @@ DEMO_DIR=.audit/gate7-local
 mkdir -p "$DEMO_DIR"
 cargo run --locked -- controlled-demo --retain-dir "$DEMO_DIR/crawl"
 cargo run --locked -- search --store "$DEMO_DIR/crawl/index" --query 'requested AND identity'
-LEY_E2E_CORPUS=gate7-loopback-v1 \
-LEY_E2E_STORE_PATH="$DEMO_DIR/crawl/index" \
-LEY_E2E_REUSE_STORE=1 \
-LEY_E2E_ARTIFACT_DIR="$DEMO_DIR/browser" \
-  node ui/scripts/verify-http-e2e.mjs
 ```
 
-`controlled-demo --retain-dir` requires a new directory and retains both `index/` and `frontier.sqlite`; it refuses to replace any existing path. The browser run reads the manifest queries, compares complete ordered CLI and HTTP API JSON, then checks rendered result IDs, scores, BM25 explanation fields, and version IDs against the same responses. It also exercises keyboard search, hostile Host/Origin headers, malformed-request recovery, local-only browser requests, and 1280, 700, 390, and 320 pixel layouts. Screenshots, server output, and query responses stay in the selected evidence directory. The separate browser-state check covers contrast, long hostile text/URLs, stale responses, API errors, and responsive reflow.
+`controlled-demo --retain-dir` requires a new directory and retains both `index/` and `frontier.sqlite`; it refuses to replace any existing path. The Stage B M3 browser verifier uses the separate original CC0 HTML guide described below and creates a new store by default; do not point it at the Gate 7 store.
 
 The retained corpus is synthetic and tiny. It demonstrates integration and lifecycle behavior; it is not an estimate of web-scale relevance or production throughput. The redirect keeps the requested URL as the document ID and records its destination as the effective URL. The index uses incremental immutable segments and a durable outbox; see [Incremental index](#incremental-index-gate-6) for publication and recovery guarantees.
 
@@ -80,6 +75,54 @@ Each measured query trial contains 100 timed calls per query after 20 complete w
 An earlier attempt was excluded from the measurements. Its fixed query `fixture retrieval` selected no documents because the authored text contains `fixtures`. Its warmup and five indexing trials failed parity, so their indexing and search timings are not included. All five separate loopback crawler trials completed. Their results remain in the ignored `benchmark-run-01` evidence.
 
 ## Run a local search
+
+### Reproduce local question-to-evidence retrieval
+
+Ley's default browser mode asks an ordinary question and returns lexical passage candidates with an exact reference into the extracted body stored in one local index. It does not judge whether a passage answers the question. The existing `search --query` command and `GET /api/search?q=...` keep their Boolean and phrase DSL semantics; use the separately labeled **Advanced DSL** UI mode when entering that syntax.
+
+The repository includes a small original, instructional HTML collection for a fresh-store demonstration. Its text was written for Ley, contains no copied third-party pages, and is dedicated under CC0 1.0; see [`fixtures/m3-guide-v1/ATTRIBUTION.txt`](fixtures/m3-guide-v1/ATTRIBUTION.txt). To build a new store and retrieve passages:
+
+```sh
+DEMO_DIR="$(mktemp -d)"
+cargo run --locked -- ingest-html \
+  --store "$DEMO_DIR/index" \
+  --directory fixtures/m3-guide-v1/html \
+  --url-prefix https://docs.example.invalid/ley-m3-guide-v1/
+cargo run --locked -- retrieve --store "$DEMO_DIR/index" \
+  --question 'How should ordinary questions differ from advanced Boolean queries?'
+```
+
+`ingest-html` only reads an operator-selected local directory. It does not fetch URLs, crawl links, change source licenses, or certify that the supplied material is rights-cleared. The caller is responsible for those rights. Ley recursively accepts UTF-8 `.html` and `.htm` files, skips pages marked `noindex`, ignores other regular file types, and rejects symbolic links and special files. Limits are 4,096 directory entries, 128 HTML files, 2 MiB per file, and 32 MiB across the collection. Relative paths map deterministically to escaped URL paths below the required HTTP(S) directory prefix. Those URLs are document identity labels: requested and effective URL are the same because no network redirect was followed. The destination must be new, have an existing parent, and be outside the source directory. Extraction and validation finish before store creation; a storage failure can leave a partial new destination for the operator to inspect.
+
+The Rust response is a versioned typed serde value. For example, retrieval uses `POST /api/v1/retrieve` with `Content-Type: application/json`, `Accept: application/json`, and a same-origin `Origin` header:
+
+```json
+{"mode":"question","request":{"contract_version":1,"question":"How should ordinary questions differ from advanced Boolean queries?","max_hits":8}}
+```
+
+The response contains `contract_version`, `mode`, `generation_id`, `status`, `completeness`, `normalized_terms`, `hits`, and `answer_assessment: "not_assessed"`. Each hit includes the requested and effective URLs, title, matched terms and phrases, and `passage: { "reference": ..., "text": ... }`. The reference contains store ID, requested URL, content version, passage schema, UTF-8 body byte range, and a public SHA-256 consistency checksum. The checksum is not an authenticator. Passage text is a lexical candidate, never a verified answer.
+
+Resolve the exact current passage with `POST /api/v1/evidence/resolve`, sending the `reference` object itself with the same headers. The result has that same reference and current title, URLs, and text. The resolver checks the current manifest and store visibility on every request; it rejects malformed, wrong-store, non-live, revoked, superseded, and expired references without returning historical text. A retrieval response is a copy already delivered to its caller and cannot be recalled after a later tombstone.
+
+Both typed endpoints accept only `POST`, exact `application/json` Content-Type and Accept values, identity encoding, and at most 16 KiB of request JSON while consuming the body. Duplicate or unknown fields are rejected. Unsafe POSTs require a matching loopback Host and same-origin Origin; the UI proxy checks the browser's UI origin and uses a fixed local API origin when forwarding. The API never accepts a store path or write operation. Successes and errors use `Cache-Control: no-store`; responses are capped at 512 KiB. Errors have finite JSON codes: `invalid_request` (400), `unsupported_contract` (422), `malformed_reference` (400), `wrong_store` (404), `not_live`, `revoked`, `version_superseded`, and `public_collection_expired` (410), `resource_cap` (429, or 413 for an oversized request body), `storage_fault` (503), `unsupported_media_type` (415), and `not_acceptable` (406). Host and Origin boundary failures are 403; unsupported methods are 405.
+
+The CLI calls the same Rust retrieval and resolver methods and serializes the same response fields in deterministic pretty JSON. Save a reference from the retrieval response, then pass it to the resolver:
+
+```sh
+cargo run --locked -- retrieve --store "$DEMO_DIR/index" \
+  --question 'How should ordinary questions differ from advanced Boolean queries?' \
+  > "$DEMO_DIR/retrieval.json"
+python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1]))["hits"][0]["passage"]["reference"]))' \
+  "$DEMO_DIR/retrieval.json" > "$DEMO_DIR/reference.json"
+cargo run --locked -- resolve-evidence --store "$DEMO_DIR/index" \
+  --reference-file "$DEMO_DIR/reference.json"
+```
+
+For a local API, start `cargo run --locked -- serve --store "$DEMO_DIR/index" --bind 127.0.0.1:7331` in one terminal. Send only to that loopback listener. The browser UI uses actual network requests through its local same-origin proxy. The offline end-to-end verifier compares parsed CLI, API, and browser retrieval results, checks passage text and reference identity, and retains browser screenshots and structured evidence at its selected output directory.
+
+The current frozen M2 evaluation remains a product limitation: 14 of 48 top-three passages independently supported their query, and all 4 negative queries returned irrelevant text. M3 does not change ranking or add a relevance threshold. Title boilerplate and weak lexical matches can still appear; no answer verification, citation authentication, or confidence estimate is provided.
+
+### Advanced DSL search
 
 Install Rust 1.88 or newer, Node.js with npm, and Python 3.10 or newer. From the repository root, create an authored local fixture index and query it:
 
@@ -124,7 +167,7 @@ npm ci
 npm run dev
 ```
 
-Open `http://127.0.0.1:4173`. The UI proxies searches to the local API on port 7331. Set `LEY_API_PORT` or `LEY_UI_PORT` to use other loopback ports. The UI displays real persistent-index results, plain-text source prefixes, snapshot identity, and expandable ranking explanations. Snippets are bounded source prefixes, not query-aware passages. Result links are limited to HTTP and HTTPS URLs.
+Open `http://127.0.0.1:4173`. The UI proxies question retrieval, evidence resolution, and advanced DSL searches to the local API on port 7331. Set `LEY_API_PORT` or `LEY_UI_PORT` to use other loopback ports. Question mode displays extracted passage text and a stable stored reference; the separate Advanced DSL mode retains ranked document results and explanations. Result links are limited to HTTP and HTTPS URLs without credentials.
 
 The fixture crawler remains available through `cargo run --locked -- controlled-demo`. The original in-memory demo remains available through `cargo run --locked -- demo --query 'Rust OR Ley' --explain`. Both use authored loopback pages and do not contact public hosts.
 
@@ -139,13 +182,7 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 python3 tools/verify_reference_corpus.py
 cd ui
 npm ci
-npm run build
-BROWSER_DIR="$(pwd)/../.audit/verify-browser-$(date +%Y%m%d-%H%M%S)-$$"
-mkdir -p "$BROWSER_DIR/tmp" "$BROWSER_DIR/screenshots"
-TMPDIR="$BROWSER_DIR/tmp" \
-LEY_GATE5_ARTIFACT_DIR="$BROWSER_DIR/screenshots" \
-  npm run verify:browser
-E2E_DIR="../.audit/verify-e2e-$(date +%Y%m%d-%H%M%S)"
+E2E_DIR="../.audit/stage-b-m3-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$E2E_DIR"
 LEY_E2E_STORE_PATH="$E2E_DIR/index" \
 LEY_E2E_ARTIFACT_DIR="$E2E_DIR/artifacts" \
@@ -153,7 +190,7 @@ LEY_E2E_ARTIFACT_DIR="$E2E_DIR/artifacts" \
 cd ..
 ```
 
-`verify:browser` checks UI states with authored responses and raw local-server requests. It is an adapter check. The command above stores its scratch files and screenshots under `.audit/verify-browser-*` through `TMPDIR` and `LEY_GATE5_ARTIFACT_DIR`. The E2E command above runs Chromium through the real UI server and Rust API against the same persistent authored fixture index, checks full CLI/API JSON equality, exercises hostile Host and Origin headers, verifies malformed-request recovery, and saves desktop and mobile screenshots under `.audit/verify-e2e-*`. Its raw HTTP checks send requests without half-closing the client, dispose each socket, and reject EOF, socket errors, and incomplete responses after a four-second absolute response deadline. Set `LEY_E2E_REUSE_STORE=1` only when reusing an existing fixture. `LEY_E2E_API_PORT` and `LEY_E2E_UI_PORT` can select caller-available loopback ports. The real browser path does not mock `fetch`, intercept browser requests, or contact public websites. A real Chromium session searched the public collection through the UI server and API on 2026-10-14; those original runtime artifacts are now missing. The checks above verify authored local fixtures and do not recover or replace the historical public evidence. The automated browser corpus remains synthetic. Both browser commands need local Chromium and loopback sockets. The TLS transport tests need OpenSSL to create owned local certificates. The Linux CI workflow runs Rust formatting, strict Clippy, tests, the reference verifier, and the UI build without installing a browser.
+The end-to-end verifier imports the authored CC0 M3 guide into the selected new store, compares parsed question and evidence JSON from the CLI and HTTP API, exercises the preserved legacy DSL, then drives the same UI through real Chromium network requests. It checks UTF-8 passage text, code identifiers, a negative question with `not_assessed`, a no-match state, on-demand evidence resolution, hostile Host and Origin headers, request caps, and 1280, 700, 390, and 320 pixel layouts. It saves screenshots, parsed results, and an API overlap timing probe under the selected ignored evidence directory. `npm run verify:browser` invokes this same real-network path; it does not mock `fetch`. `LEY_E2E_REUSE_STORE=1` is required only when reusing an existing store. `LEY_E2E_API_PORT`, `LEY_E2E_UI_PORT`, and `LEY_E2E_OVERLAP_API_PORT` can select caller-available loopback ports. The verifier makes no public requests and requires local Chromium plus loopback sockets. The TLS transport tests need OpenSSL to create owned local certificates. The Linux CI workflow runs Rust formatting, strict Clippy, tests, the reference verifier, and the UI build without installing a browser.
 
 ## Incremental index (Gate 6)
 
@@ -191,18 +228,17 @@ LEY_GATE6_EVIDENCE_OUT=.audit/gate6-20261017/incremental-index-inventory.json \
   cargo test --locked --offline storage::tests::append_update_remove_and_compaction_preserve_hashes_and_full_reference_results -- --nocapture
 ```
 
-For a browser run against one retained fixture index through both the Rust API and React UI, use an unused store path on the first run, then add `LEY_E2E_REUSE_STORE=1` on later runs:
+For a browser run against a fresh M3 local HTML store through the Rust API and React UI, create a new ignored evidence directory:
 
 ```sh
-mkdir -p .audit/gate6-20261017/private-fixtures
-npm run --prefix ui build
-LEY_E2E_STORE_PATH=.audit/gate6-20261017/private-fixtures/browser-index \
-LEY_E2E_REUSE_STORE=1 \
-LEY_E2E_ARTIFACT_DIR=.audit/gate6-20261017/browser \
+mkdir -p .audit
+E2E_DIR="$(mktemp -d .audit/stage-b-m3-run-XXXXXX)"
+LEY_E2E_STORE_PATH="$E2E_DIR/index" \
+LEY_E2E_ARTIFACT_DIR="$E2E_DIR/artifacts" \
   node ui/scripts/verify-http-e2e.mjs
 ```
 
-The script saves `results.json` and Chromium screenshots in the selected artifact directory. It makes no public requests. For bounded reruns against an existing fixture, keep `LEY_E2E_REUSE_STORE=1`; the script refuses to overwrite an existing path without it.
+The script imports `fixtures/m3-guide-v1/html`, saves `results.json`, timing data, and Chromium screenshots in the selected artifact directory, and makes no public requests. It refuses to overwrite an existing store unless `LEY_E2E_REUSE_STORE=1` is set. Store and screenshot paths remain local and should be kept outside Git.
 
 The shipped script was independently run with real Chromium against the retained fixture index at generation 8 through the React UI and Rust API. Its screenshots and `results.json` are under `.audit/gate6-20261017/work-final/browser`. Earlier sandbox-blocked attempts remain part of the historical trail; they do not describe the later verified run.
 
@@ -234,7 +270,7 @@ Source revocation was tested on an isolated copy of the collected store. That co
 
 The persistent storage adapter currently supports Linux; other platforms fail closed with an unsupported-platform error. The API returns at most 20 results from one pinned generation and caps query and response sizes. The local interface is not an internet-facing service. Public crawling is paused, and no further request is authorized. Gate 5 is accepted on the historical independent review record, with the documented runtime-artifact loss explicitly accepted for publication on 2026-10-17. This does not authorize a replacement crawl. The reproducible local fixture checks remain available.
 
-Relevance: Not evaluated — no suitable judged dataset.
+The frozen Stage B M2 evaluation found that 14 of 48 top-three passages independently supported their query; all 4 negative queries returned irrelevant text. The M3 authored guide is an integration fixture, not a judged relevance dataset. Question retrieval still reports lexical candidates and `not_assessed`.
 
 ## Licensing
 

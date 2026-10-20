@@ -1,0 +1,11 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Bounded local HTTP request boundaries</title></head>
+<body>
+<h1>Bounded local HTTP request boundaries</h1>
+<p>A loopback address alone does not make every HTTP request trustworthy. Check the request Host against the listener's expected local authority to resist DNS rebinding. Unsafe browser requests should also carry exactly one same-origin Origin. Reject a missing or foreign Origin for a JSON POST instead of treating it as a trusted browser. A direct CLI can call the storage core without relaxing that HTTP rule.</p>
+<p>Validate method, route, Host, Origin, Content-Type, and Accept before decoding the body. A declared Content-Length can be rejected early when it exceeds the limit, but it is not enough: a chunked sender may omit the length. Count bytes as the body stream is consumed and stop as soon as the cap is crossed. Return a small finite error response and do not include paths, parser internals, or source text.</p>
+<p>Deserialize directly into strict typed structures. Duplicate object fields should fail, unknown fields should fail, and the version field should be checked by the same retrieval contract that the CLI uses. A successful retrieval returns the established response type; a failed reference resolution returns only a typed code and no cached passage text.</p>
+<p>If a development proxy changes the browser-facing port to an API port, it becomes a security boundary. It must validate the original browser Host and Origin against its own listener, accept only fixed API paths, bound the forwarded body, and then set the exact upstream Host and Origin itself. It must not trust forwarding headers supplied by the browser.</p>
+</body>
+</html>

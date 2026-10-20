@@ -8,7 +8,7 @@
     "dev": "npm run build && node scripts/dev-server.mjs",
     "build": "tsc --noEmit -p tsconfig.json && node scripts/build.mjs",
     "verify:browser": "node scripts/verify-browser.mjs",
-    "verify:e2e": "npm run build && node scripts/verify-http-e2e.mjs"
+    "verify:e2e": "node scripts/verify-http-e2e.mjs"
   },
   "dependencies": {
     "react": "18.3.1",

@@ -1,7 +1,10 @@
-The authored synthetic data in reference-v1.json, gate7-loopback-v1.json, and
-benchmark-v1.json is dedicated to the public domain under CC0 1.0 Universal.
+The authored synthetic data in reference-v1.json, gate7-loopback-v1.json,
+benchmark-v1.json, and m3-guide-v1/ is dedicated to the public domain under
+CC0 1.0 Universal.
 The CC0 legal code is available at:
 https://creativecommons.org/publicdomain/zero/1.0/legalcode
 
-This dedication covers fixture and benchmark data only. It does not license
-Ley source code, documentation, or verification and benchmark scripts.
+This dedication covers fixture and benchmark data only. The M3 guide is original
+HTML instructional fixture content and is also described by
+m3-guide-v1/ATTRIBUTION.txt. It does not license Ley source code, documentation,
+or verification and benchmark scripts.

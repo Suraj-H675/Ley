@@ -10,8 +10,11 @@ use axum::routing::any;
 use axum::{Json, Router};
 use http_body::Body as HttpBody;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::index::{MatchEvidence, SearchResult, StatisticsSource};
+use crate::retrieval::{EvidenceReference, EvidenceResolveError, RetrievalError, RetrievalRequest};
 use crate::storage::{PersistentIndex, ReadView, StorageError};
 
 pub const DEFAULT_BIND: SocketAddr =
@@ -20,11 +23,14 @@ const MAX_URI_BYTES: usize = 12 * 1024;
 const MAX_QUERY_BYTES: usize = 4096;
 const MAX_RESULTS: usize = 20;
 const MAX_RESPONSE_BYTES: usize = 512 * 1024;
+pub const MAX_TYPED_REQUEST_BYTES: usize = 16 * 1024;
+const MAX_STORAGE_WORKERS: usize = 1;
 
 #[derive(Clone)]
 struct ApiState {
     index: Arc<PersistentIndex>,
     port: u16,
+    storage_work: Arc<Semaphore>,
 }
 
 #[derive(Serialize)]
@@ -141,8 +147,71 @@ impl SearchFailure {
             Self::TooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "response_limit_exceeded"),
             Self::IndexUnavailable => (StatusCode::SERVICE_UNAVAILABLE, "index_unavailable"),
         };
-        (status, Json(ApiError { error })).into_response()
+        no_store_json(status, &ApiError { error })
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClientFailure {
+    InvalidRequest,
+    UnsupportedContract,
+    MalformedReference,
+    WrongStore,
+    NotLive,
+    Revoked,
+    VersionSuperseded,
+    PublicCollectionExpired,
+    ResourceCap,
+    RequestBodyTooLarge,
+    StorageFault,
+    UnsupportedMediaType,
+    NotAcceptable,
+}
+
+impl ClientFailure {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::InvalidRequest => "invalid_request",
+            Self::UnsupportedContract => "unsupported_contract",
+            Self::MalformedReference => "malformed_reference",
+            Self::WrongStore => "wrong_store",
+            Self::NotLive => "not_live",
+            Self::Revoked => "revoked",
+            Self::VersionSuperseded => "version_superseded",
+            Self::PublicCollectionExpired => "public_collection_expired",
+            Self::ResourceCap => "resource_cap",
+            Self::RequestBodyTooLarge => "resource_cap",
+            Self::StorageFault => "storage_fault",
+            Self::UnsupportedMediaType => "unsupported_media_type",
+            Self::NotAcceptable => "not_acceptable",
+        }
+    }
+
+    fn status(self) -> StatusCode {
+        match self {
+            Self::InvalidRequest | Self::MalformedReference => StatusCode::BAD_REQUEST,
+            Self::UnsupportedContract => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::WrongStore => StatusCode::NOT_FOUND,
+            Self::NotLive
+            | Self::Revoked
+            | Self::VersionSuperseded
+            | Self::PublicCollectionExpired => StatusCode::GONE,
+            Self::ResourceCap => StatusCode::TOO_MANY_REQUESTS,
+            Self::RequestBodyTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::UnsupportedMediaType => StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            Self::NotAcceptable => StatusCode::NOT_ACCEPTABLE,
+            Self::StorageFault => StatusCode::SERVICE_UNAVAILABLE,
+        }
+    }
+
+    fn response(self) -> Response {
+        no_store_json(self.status(), &ApiError { error: self.code() })
+    }
+}
+
+enum BlockingFailure {
+    Saturated,
+    WorkerFailed,
 }
 
 pub fn run(store_path: impl AsRef<Path>, bind: SocketAddr) -> Result<(), String> {
@@ -181,17 +250,54 @@ pub fn search_store_json(store_path: impl AsRef<Path>, query: &str) -> Result<St
     Ok(body)
 }
 
+pub fn retrieve_store_json(
+    store_path: impl AsRef<Path>,
+    request: RetrievalRequest,
+) -> Result<String, ClientFailure> {
+    let index = PersistentIndex::open(store_path).map_err(|_| ClientFailure::StorageFault)?;
+    let response = index.retrieve(request).map_err(map_retrieval_failure)?;
+    serialize_client_response(&response)
+}
+
+pub fn resolve_evidence_store_json(
+    store_path: impl AsRef<Path>,
+    reference: &EvidenceReference,
+) -> Result<String, ClientFailure> {
+    let index = PersistentIndex::open(store_path).map_err(|_| ClientFailure::StorageFault)?;
+    let response = index
+        .resolve_evidence(reference)
+        .map_err(map_resolve_failure)?;
+    serialize_client_response(&response)
+}
+
+fn serialize_client_response<T: Serialize>(response: &T) -> Result<String, ClientFailure> {
+    let body = serde_json::to_string_pretty(response).map_err(|_| ClientFailure::StorageFault)?;
+    if body.len() > MAX_RESPONSE_BYTES {
+        return Err(ClientFailure::ResourceCap);
+    }
+    Ok(body)
+}
+
 fn router(index: Arc<PersistentIndex>, port: u16) -> Router {
-    let state = ApiState { index, port };
+    router_with_state(ApiState {
+        index,
+        port,
+        storage_work: Arc::new(Semaphore::new(MAX_STORAGE_WORKERS)),
+    })
+}
+
+fn router_with_state(state: ApiState) -> Router {
     Router::new()
         .route("/api/health", any(health))
         .route("/api/search", any(search))
+        .route("/api/v1/retrieve", any(retrieve_v1))
+        .route("/api/v1/evidence/resolve", any(resolve_evidence_v1))
         .fallback(not_found)
         .with_state(state)
 }
 
 async fn health(State(state): State<ApiState>, request: Request<Body>) -> Response {
-    if let Some(error) = validate_local_authority(&request, state.port) {
+    if let Some(error) = validate_local_authority(&request, state.port, false) {
         return local_authority_error(error);
     }
     if !request_body_is_empty(&request) {
@@ -204,7 +310,7 @@ async fn health(State(state): State<ApiState>, request: Request<Body>) -> Respon
 }
 
 async fn search(State(state): State<ApiState>, request: Request<Body>) -> Response {
-    if let Some(error) = validate_local_authority(&request, state.port) {
+    if let Some(error) = validate_local_authority(&request, state.port, false) {
         return local_authority_error(error);
     }
     if !request_body_is_empty(&request) {
@@ -221,7 +327,17 @@ async fn search(State(state): State<ApiState>, request: Request<Body>) -> Respon
         Err(QueryParameterError::TooLarge) => return SearchFailure::TooLarge.response(),
         Err(QueryParameterError::Malformed) => return SearchFailure::InvalidQuery.response(),
     };
-    match make_search_response(&state.index, &query) {
+    let search_result = match run_storage(state.clone(), move |index| {
+        make_search_response(&index, &query)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(BlockingFailure::Saturated | BlockingFailure::WorkerFailed) => {
+            return SearchFailure::IndexUnavailable.response();
+        }
+    };
+    match search_result {
         Ok(response) => match serde_json::to_vec(&response) {
             Ok(body) if body.len() <= MAX_RESPONSE_BYTES => Response::builder()
                 .status(StatusCode::OK)
@@ -235,18 +351,270 @@ async fn search(State(state): State<ApiState>, request: Request<Body>) -> Respon
     }
 }
 
-async fn not_found(State(state): State<ApiState>, request: Request<Body>) -> Response {
-    if let Some(error) = validate_local_authority(&request, state.port) {
+async fn retrieve_v1(State(state): State<ApiState>, request: Request<Body>) -> Response {
+    let require_origin = request.method() == Method::POST;
+    if let Some(error) = validate_local_authority(&request, state.port, require_origin) {
         return local_authority_error(error);
     }
-    (StatusCode::NOT_FOUND, Json(ApiError { error: "not_found" })).into_response()
+    if request.method() != Method::POST {
+        return method_not_allowed_for("POST");
+    }
+    if let Err(error) = validate_json_headers(&request, MAX_TYPED_REQUEST_BYTES) {
+        return error.response();
+    }
+    let permit = match acquire_storage_permit(&state) {
+        Ok(permit) => permit,
+        Err(BlockingFailure::Saturated) => return ClientFailure::ResourceCap.response(),
+        Err(BlockingFailure::WorkerFailed) => return ClientFailure::StorageFault.response(),
+    };
+    let retrieval_request =
+        match read_json_body::<RetrievalRequest>(request, MAX_TYPED_REQUEST_BYTES).await {
+            Ok(request) => request,
+            Err(error) => return error.response(),
+        };
+    let retrieval = match run_storage_with_permit(state.index, permit, move |index| {
+        index.retrieve(retrieval_request)
+    })
+    .await
+    {
+        Ok(result) => result.map_err(map_retrieval_failure),
+        Err(BlockingFailure::Saturated) => Err(ClientFailure::ResourceCap),
+        Err(BlockingFailure::WorkerFailed) => Err(ClientFailure::StorageFault),
+    };
+    match retrieval {
+        Ok(response) => typed_success(&response),
+        Err(error) => error.response(),
+    }
+}
+
+async fn resolve_evidence_v1(State(state): State<ApiState>, request: Request<Body>) -> Response {
+    let require_origin = request.method() == Method::POST;
+    if let Some(error) = validate_local_authority(&request, state.port, require_origin) {
+        return local_authority_error(error);
+    }
+    if request.method() != Method::POST {
+        return method_not_allowed_for("POST");
+    }
+    if let Err(error) = validate_json_headers(&request, MAX_TYPED_REQUEST_BYTES) {
+        return error.response();
+    }
+    let permit = match acquire_storage_permit(&state) {
+        Ok(permit) => permit,
+        Err(BlockingFailure::Saturated) => return ClientFailure::ResourceCap.response(),
+        Err(BlockingFailure::WorkerFailed) => return ClientFailure::StorageFault.response(),
+    };
+    let reference =
+        match read_json_body::<EvidenceReference>(request, MAX_TYPED_REQUEST_BYTES).await {
+            Ok(reference) => reference,
+            Err(error) => return error.response(),
+        };
+    let resolution = match run_storage_with_permit(state.index, permit, move |index| {
+        index.resolve_evidence(&reference)
+    })
+    .await
+    {
+        Ok(result) => result.map_err(map_resolve_failure),
+        Err(BlockingFailure::Saturated) => Err(ClientFailure::ResourceCap),
+        Err(BlockingFailure::WorkerFailed) => Err(ClientFailure::StorageFault),
+    };
+    match resolution {
+        Ok(response) => typed_success(&response),
+        Err(error) => error.response(),
+    }
+}
+
+async fn run_storage<T, F>(state: ApiState, operation: F) -> Result<T, BlockingFailure>
+where
+    T: Send + 'static,
+    F: FnOnce(Arc<PersistentIndex>) -> T + Send + 'static,
+{
+    let permit = acquire_storage_permit(&state)?;
+    run_storage_with_permit(state.index, permit, operation).await
+}
+
+fn acquire_storage_permit(state: &ApiState) -> Result<OwnedSemaphorePermit, BlockingFailure> {
+    state
+        .storage_work
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| BlockingFailure::Saturated)
+}
+
+async fn run_storage_with_permit<T, F>(
+    index: Arc<PersistentIndex>,
+    permit: OwnedSemaphorePermit,
+    operation: F,
+) -> Result<T, BlockingFailure>
+where
+    T: Send + 'static,
+    F: FnOnce(Arc<PersistentIndex>) -> T + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let _permit: OwnedSemaphorePermit = permit;
+        operation(index)
+    })
+    .await
+    .map_err(|_| BlockingFailure::WorkerFailed)
+}
+
+fn validate_json_headers(request: &Request<Body>, body_limit: usize) -> Result<(), ClientFailure> {
+    let mut content_types = request.headers().get_all(header::CONTENT_TYPE).iter();
+    let content_type = content_types
+        .next()
+        .and_then(|value| value.to_str().ok())
+        .ok_or(ClientFailure::UnsupportedMediaType)?;
+    if content_types.next().is_some()
+        || !content_type.trim().eq_ignore_ascii_case("application/json")
+    {
+        return Err(ClientFailure::UnsupportedMediaType);
+    }
+
+    let mut accepts = request.headers().get_all(header::ACCEPT).iter();
+    let accept = accepts
+        .next()
+        .and_then(|value| value.to_str().ok())
+        .ok_or(ClientFailure::NotAcceptable)?;
+    if accepts.next().is_some() || !accept.trim().eq_ignore_ascii_case("application/json") {
+        return Err(ClientFailure::NotAcceptable);
+    }
+
+    if request
+        .headers()
+        .get(header::CONTENT_ENCODING)
+        .is_some_and(|value| {
+            value
+                .to_str()
+                .map(|encoding| !encoding.trim().eq_ignore_ascii_case("identity"))
+                .unwrap_or(true)
+        })
+    {
+        return Err(ClientFailure::UnsupportedMediaType);
+    }
+
+    let mut lengths = request.headers().get_all(header::CONTENT_LENGTH).iter();
+    if let Some(length) = lengths.next() {
+        let length = length
+            .to_str()
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .ok_or(ClientFailure::InvalidRequest)?;
+        if lengths.next().is_some() {
+            return Err(ClientFailure::InvalidRequest);
+        }
+        if length > body_limit {
+            return Err(ClientFailure::RequestBodyTooLarge);
+        }
+    }
+    Ok(())
+}
+
+async fn read_json_body<T: DeserializeOwned>(
+    request: Request<Body>,
+    body_limit: usize,
+) -> Result<T, ClientFailure> {
+    let bytes = axum::body::to_bytes(request.into_body(), body_limit)
+        .await
+        .map_err(|_| ClientFailure::RequestBodyTooLarge)?;
+    serde_json::from_slice(&bytes).map_err(|_| ClientFailure::InvalidRequest)
+}
+
+fn typed_success<T: Serialize>(value: &T) -> Response {
+    let Ok(body) = serde_json::to_vec(value) else {
+        return ClientFailure::StorageFault.response();
+    };
+    if body.len() > MAX_RESPONSE_BYTES {
+        return ClientFailure::ResourceCap.response();
+    }
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::from(body))
+        .unwrap_or_else(|_| ClientFailure::StorageFault.response())
+}
+
+fn no_store_json<T: Serialize>(status: StatusCode, value: &T) -> Response {
+    let body =
+        serde_json::to_vec(value).unwrap_or_else(|_| b"{\"error\":\"internal_error\"}".to_vec());
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::from(body))
+        .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
+fn method_not_allowed_for(method: &'static str) -> Response {
+    let mut response = no_store_json(
+        StatusCode::METHOD_NOT_ALLOWED,
+        &ApiError {
+            error: "method_not_allowed",
+        },
+    );
+    response
+        .headers_mut()
+        .insert(header::ALLOW, axum::http::HeaderValue::from_static(method));
+    response
+}
+
+fn map_retrieval_failure(error: RetrievalError) -> ClientFailure {
+    match error {
+        RetrievalError::UnsupportedContractVersion(_) => ClientFailure::UnsupportedContract,
+        RetrievalError::ResourceLimit | RetrievalError::ResponseTooLarge => {
+            ClientFailure::ResourceCap
+        }
+        RetrievalError::PublicCollectionExpired => ClientFailure::PublicCollectionExpired,
+        RetrievalError::CorruptStorage | RetrievalError::StorageUnavailable => {
+            ClientFailure::StorageFault
+        }
+        RetrievalError::InvalidHitLimit
+        | RetrievalError::QuestionTooLong { .. }
+        | RetrievalError::TooManyTerms { .. }
+        | RetrievalError::TooManyDistinctTerms { .. }
+        | RetrievalError::PhraseTooLong { .. }
+        | RetrievalError::TokenTooLong { .. }
+        | RetrievalError::UnterminatedQuote
+        | RetrievalError::InvalidEscape
+        | RetrievalError::EmptyQuotedPhrase
+        | RetrievalError::InvalidRange => ClientFailure::InvalidRequest,
+    }
+}
+
+fn map_resolve_failure(error: EvidenceResolveError) -> ClientFailure {
+    match error {
+        EvidenceResolveError::MalformedReference
+        | EvidenceResolveError::OutOfBounds
+        | EvidenceResolveError::NotUtf8Boundary
+        | EvidenceResolveError::InvalidPassageWindow => ClientFailure::MalformedReference,
+        EvidenceResolveError::UnsupportedPassageSchema => ClientFailure::UnsupportedContract,
+        EvidenceResolveError::WrongStore => ClientFailure::WrongStore,
+        EvidenceResolveError::NotLive => ClientFailure::NotLive,
+        EvidenceResolveError::Revoked => ClientFailure::Revoked,
+        EvidenceResolveError::VersionSuperseded => ClientFailure::VersionSuperseded,
+        EvidenceResolveError::PublicCollectionExpired => ClientFailure::PublicCollectionExpired,
+        EvidenceResolveError::ResourceLimit => ClientFailure::ResourceCap,
+        EvidenceResolveError::CorruptStorage | EvidenceResolveError::StorageUnavailable => {
+            ClientFailure::StorageFault
+        }
+    }
+}
+
+async fn not_found(State(state): State<ApiState>, request: Request<Body>) -> Response {
+    if let Some(error) = validate_local_authority(&request, state.port, false) {
+        return local_authority_error(error);
+    }
+    no_store_json(StatusCode::NOT_FOUND, &ApiError { error: "not_found" })
 }
 
 fn local_authority_error(error: &'static str) -> Response {
-    (StatusCode::FORBIDDEN, Json(ApiError { error })).into_response()
+    no_store_json(StatusCode::FORBIDDEN, &ApiError { error })
 }
 
-fn validate_local_authority(request: &Request<Body>, port: u16) -> Option<&'static str> {
+fn validate_local_authority(
+    request: &Request<Body>,
+    port: u16,
+    require_origin: bool,
+) -> Option<&'static str> {
     let host_values = request.headers().get_all(header::HOST);
     let mut hosts = host_values.iter();
     let Some(host) = hosts.next() else {
@@ -271,7 +639,9 @@ fn validate_local_authority(request: &Request<Body>, port: u16) -> Option<&'stat
     let origin_name = HeaderName::from_static("origin");
     let origin_values = request.headers().get_all(origin_name);
     let mut origins = origin_values.iter();
-    let origin = origins.next()?;
+    let Some(origin) = origins.next() else {
+        return require_origin.then_some("invalid_origin");
+    };
     if origins.next().is_some() {
         return Some("invalid_origin");
     }
@@ -321,24 +691,25 @@ fn local_authority(value: &str, expected_port: u16) -> Option<(String, u16)> {
 }
 
 fn method_not_allowed() -> Response {
-    (
+    let mut response = no_store_json(
         StatusCode::METHOD_NOT_ALLOWED,
-        [(header::ALLOW, "GET")],
-        Json(ApiError {
+        &ApiError {
             error: "method_not_allowed",
-        }),
-    )
-        .into_response()
+        },
+    );
+    response
+        .headers_mut()
+        .insert(header::ALLOW, axum::http::HeaderValue::from_static("GET"));
+    response
 }
 
 fn body_not_allowed() -> Response {
-    (
+    no_store_json(
         StatusCode::BAD_REQUEST,
-        Json(ApiError {
+        &ApiError {
             error: "request_body_not_allowed",
-        }),
+        },
     )
-        .into_response()
 }
 
 fn request_body_is_empty(request: &Request<Body>) -> bool {
@@ -346,13 +717,12 @@ fn request_body_is_empty(request: &Request<Body>) -> bool {
 }
 
 fn internal_error() -> Response {
-    (
+    no_store_json(
         StatusCode::INTERNAL_SERVER_ERROR,
-        Json(ApiError {
+        &ApiError {
             error: "internal_error",
-        }),
+        },
     )
-        .into_response()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -556,11 +926,14 @@ fn summarize_evidence(evidence: &MatchEvidence) -> MatchSummary {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::future::Future;
     use std::io::{Read, Write};
     use std::net::TcpStream;
     use std::path::Path;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::task::{Context, Waker};
+    use std::time::Instant;
 
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header};
@@ -568,6 +941,7 @@ mod tests {
 
     use super::{
         DEFAULT_BIND, QueryParameterError, make_search_response, parse_query_parameter, router,
+        router_with_state,
     };
     use crate::storage::{Intent, PersistentIndex, PublicCollectionGate};
     use crate::url_key::UrlKey;
@@ -787,6 +1161,354 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert!(DEFAULT_BIND.ip().is_loopback());
+    }
+
+    #[tokio::test]
+    async fn typed_question_and_resolution_match_cli_contracts() {
+        let (temp, store, _) = populated_index();
+        let app = router(Arc::new(store), DEFAULT_BIND.port());
+        let retrieval_request = crate::retrieval::RetrievalRequest::question(
+            "Where does Rust retrieval use a Ley-owned inverted index?",
+        );
+        let cli_retrieval =
+            super::retrieve_store_json(temp.path().join("index"), retrieval_request.clone())
+                .unwrap();
+        let response = app
+            .clone()
+            .oneshot(typed_post(
+                "/api/v1/retrieve",
+                serde_json::to_vec(&retrieval_request).unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let api_body = axum::body::to_bytes(response.into_body(), super::MAX_RESPONSE_BYTES)
+            .await
+            .unwrap();
+        let api_json: serde_json::Value = serde_json::from_slice(&api_body).unwrap();
+        let cli_json: serde_json::Value = serde_json::from_str(&cli_retrieval).unwrap();
+        assert_eq!(api_json, cli_json);
+        assert_eq!(api_json["answer_assessment"], "not_assessed");
+        assert_eq!(
+            api_json["hits"][0]["passage"]["text"],
+            "Rust retrieval uses a small Ley-owned inverted index."
+        );
+        assert_eq!(
+            api_json["hits"][0]["requested_url"],
+            "https://fixtures.example.test/rust"
+        );
+
+        let reference: crate::retrieval::EvidenceReference =
+            serde_json::from_value(api_json["hits"][0]["passage"]["reference"].clone()).unwrap();
+        let cli_resolution =
+            super::resolve_evidence_store_json(temp.path().join("index"), &reference).unwrap();
+        let response = app
+            .oneshot(typed_post(
+                "/api/v1/evidence/resolve",
+                serde_json::to_vec(&reference).unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let api_resolution = axum::body::to_bytes(response.into_body(), super::MAX_RESPONSE_BYTES)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&api_resolution).unwrap(),
+            serde_json::from_str::<serde_json::Value>(&cli_resolution).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_routes_reject_unsafe_headers_unknown_json_and_overflow_without_text() {
+        let (_temp, store, _) = populated_index();
+        let app = router(Arc::new(store), DEFAULT_BIND.port());
+        let valid_body = br#"{"mode":"question","request":{"contract_version":1,"question":"rust","max_hits":8}}"#;
+
+        for (request, expected_code) in [
+            (
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/retrieve")
+                    .header(header::HOST, format!("localhost:{}", DEFAULT_BIND.port()))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::ACCEPT, "application/json")
+                    .body(Body::from(valid_body.to_vec()))
+                    .unwrap(),
+                "invalid_origin",
+            ),
+            (
+                typed_post_with_origin(
+                    "http://attacker.example",
+                    "/api/v1/retrieve",
+                    valid_body.to_vec(),
+                ),
+                "invalid_origin",
+            ),
+            (
+                typed_post_with_host("attacker.example", "/api/v1/retrieve", valid_body.to_vec()),
+                "invalid_host",
+            ),
+        ] {
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["error"], expected_code);
+            assert!(!String::from_utf8_lossy(&body).contains("Rust retrieval uses"));
+        }
+
+        for (request, status, code) in [
+            (typed_post("/api/v1/retrieve", valid_body.to_vec()), StatusCode::OK, None),
+            (typed_post_with("/api/v1/retrieve", valid_body.to_vec(), "text/plain", "application/json"), StatusCode::UNSUPPORTED_MEDIA_TYPE, Some("unsupported_media_type")),
+            (typed_post_with("/api/v1/retrieve", valid_body.to_vec(), "application/json", "text/plain"), StatusCode::NOT_ACCEPTABLE, Some("not_acceptable")),
+            (typed_post("/api/v1/retrieve", br#"{"mode":"question","request":{"contract_version":1,"question":"rust","max_hits":8,"extra":true}}"#.to_vec()), StatusCode::BAD_REQUEST, Some("invalid_request")),
+            (typed_post("/api/v1/retrieve", br#"{"mode":"question","mode":"question","request":{"contract_version":1,"question":"rust","max_hits":8}}"#.to_vec()), StatusCode::BAD_REQUEST, Some("invalid_request")),
+            (typed_post("/api/v1/retrieve", br#"{"mode":"question","request":{"contract_version":99,"question":"rust","max_hits":8}}"#.to_vec()), StatusCode::UNPROCESSABLE_ENTITY, Some("unsupported_contract")),
+            (typed_post("/api/v1/retrieve", vec![b'x'; super::MAX_TYPED_REQUEST_BYTES + 1]), StatusCode::PAYLOAD_TOO_LARGE, Some("resource_cap")),
+        ] {
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), status);
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            if let Some(code) = code {
+                let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+                let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(json["error"], code);
+                assert!(!String::from_utf8_lossy(&body).contains("Rust retrieval uses"));
+            }
+        }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/retrieve")
+                    .header(header::HOST, format!("localhost:{}", DEFAULT_BIND.port()))
+                    .header(
+                        "origin",
+                        format!("http://localhost:{}", DEFAULT_BIND.port()),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(response.headers()[header::ALLOW], "POST");
+    }
+
+    #[tokio::test]
+    async fn typed_routes_reject_saturated_work_before_parsing_request_body() {
+        let (_temp, store, _) = populated_index();
+        let state = super::ApiState {
+            index: Arc::new(store),
+            port: DEFAULT_BIND.port(),
+            storage_work: Arc::new(tokio::sync::Semaphore::new(0)),
+        };
+        let app = router_with_state(state);
+        let response = app
+            .oneshot(typed_post("/api/v1/retrieve", b"{".to_vec()))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "resource_cap");
+    }
+
+    #[tokio::test]
+    async fn typed_resolution_rechecks_tombstone_revocation_and_superseded_versions() {
+        let temp = TempStore::new();
+        let store = PersistentIndex::create(temp.path().join("index")).unwrap();
+        let cases = [
+            ("tombstone", Intent::Tombstone, "not_live"),
+            ("revoked", Intent::Revoke, "revoked"),
+            (
+                "superseded",
+                Intent::Upsert {
+                    effective_url: "https://fixtures.example.test/superseded".to_owned(),
+                    title: "Updated document".to_owned(),
+                    body: "new current passage text".to_owned(),
+                },
+                "version_superseded",
+            ),
+        ];
+        let mut captured = Vec::new();
+        for (name, _, _) in &cases {
+            let key = UrlKey::parse(&format!("https://fixtures.example.test/{name}")).unwrap();
+            let lease = store.issue_fence(&key).unwrap();
+            store
+                .apply(
+                    &lease,
+                    Intent::Upsert {
+                        effective_url: key.as_str().to_owned(),
+                        title: format!("{name} source"),
+                        body: format!("old passage text for {name}"),
+                    },
+                )
+                .unwrap();
+            captured.push(
+                store
+                    .retrieve(crate::retrieval::RetrievalRequest::question(format!(
+                        "old passage {name}"
+                    )))
+                    .unwrap()
+                    .hits
+                    .into_iter()
+                    .find(|hit| hit.requested_url == key.as_str())
+                    .unwrap()
+                    .passage
+                    .reference,
+            );
+        }
+        for ((name, action, _), reference) in cases.iter().zip(captured.iter()) {
+            let key = UrlKey::parse(&format!("https://fixtures.example.test/{name}")).unwrap();
+            let lease = store.issue_fence(&key).unwrap();
+            store.apply(&lease, action.clone()).unwrap();
+            assert_eq!(reference.requested_url, key.as_str());
+        }
+
+        let app = router(Arc::new(store), DEFAULT_BIND.port());
+        for ((_, _, expected_code), reference) in cases.iter().zip(captured.iter()) {
+            let response = app
+                .clone()
+                .oneshot(typed_post(
+                    "/api/v1/evidence/resolve",
+                    serde_json::to_vec(reference).unwrap(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::GONE);
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            let bytes = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(error["error"], *expected_code);
+            assert!(!String::from_utf8_lossy(&bytes).contains("old passage text"));
+        }
+    }
+
+    fn typed_post(path: &str, body: Vec<u8>) -> Request<Body> {
+        typed_post_with(path, body, "application/json", "application/json")
+    }
+
+    fn typed_post_with(
+        path: &str,
+        body: Vec<u8>,
+        content_type: &str,
+        accept: &str,
+    ) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(path)
+            .header(header::HOST, format!("localhost:{}", DEFAULT_BIND.port()))
+            .header(
+                "origin",
+                format!("http://localhost:{}", DEFAULT_BIND.port()),
+            )
+            .header(header::CONTENT_TYPE, content_type)
+            .header(header::ACCEPT, accept)
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    fn typed_post_with_origin(origin: &str, path: &str, body: Vec<u8>) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(path)
+            .header(header::HOST, format!("localhost:{}", DEFAULT_BIND.port()))
+            .header("origin", origin)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT, "application/json")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    fn typed_post_with_host(host: &str, path: &str, body: Vec<u8>) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(path)
+            .header(header::HOST, host)
+            .header(
+                "origin",
+                format!("http://localhost:{}", DEFAULT_BIND.port()),
+            )
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT, "application/json")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn storage_search_yields_the_api_runtime_for_health_requests() {
+        let temp = TempStore::new();
+        let store = PersistentIndex::create(temp.path().join("index")).unwrap();
+        let block = "blockingprobe durable lexical retrieval scheduling storage query ";
+        let body = block.repeat(600_000 / block.len() + 1);
+        for number in 0..6 {
+            let key =
+                UrlKey::parse(&format!("https://fixtures.example.test/overlap/{number}")).unwrap();
+            let lease = store.issue_fence(&key).unwrap();
+            store
+                .apply(
+                    &lease,
+                    Intent::Upsert {
+                        effective_url: key.as_str().to_owned(),
+                        title: format!("blocking probe document {number}"),
+                        body: body.clone(),
+                    },
+                )
+                .unwrap();
+        }
+        let app = router(Arc::new(store), DEFAULT_BIND.port());
+        let search_request = Request::builder()
+            .uri("/api/search?q=blockingprobe%20AND%20durable")
+            .header(header::HOST, format!("localhost:{}", DEFAULT_BIND.port()))
+            .body(Body::empty())
+            .unwrap();
+        let mut search = Box::pin(app.clone().oneshot(search_request));
+        let first_poll_started = Instant::now();
+        let first_poll = search
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()));
+        let first_poll_ms = first_poll_started.elapsed().as_secs_f64() * 1000.0;
+        assert!(
+            first_poll.is_pending(),
+            "storage search completed inline before yielding to /api/health ({first_poll_ms:.3} ms)"
+        );
+
+        let health_started = Instant::now();
+        let health = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/health")
+                    .header(header::HOST, format!("localhost:{}", DEFAULT_BIND.port()))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let health_ms = health_started.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(health.status(), StatusCode::OK);
+
+        let search_started = Instant::now();
+        let search_response = search.await.unwrap();
+        let search_ms = search_started.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(search_response.status(), StatusCode::OK);
+        println!(
+            "api overlap probe: documents=6 body_bytes_each={} first_poll_ms={first_poll_ms:.3} health_ms={health_ms:.3} remaining_search_ms={search_ms:.3}",
+            body.len()
+        );
     }
 
     #[test]

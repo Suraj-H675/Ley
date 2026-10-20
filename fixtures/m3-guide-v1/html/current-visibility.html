@@ -1,0 +1,11 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Current visibility and stale references</title></head>
+<body>
+<h1>Current visibility and stale references</h1>
+<p>An index generation is a committed view of the documents that were live when that generation was published. A search response can report its generation for diagnostics, but the generation should not authorize a later evidence lookup. Resolution needs to consult current manifest state so a reference cannot bypass a newer tombstone, revocation, or document update.</p>
+<p>Typed lifecycle outcomes tell the caller why a passage is no longer available. A revoked document is distinct from a document that is simply not live. A live document whose content version differs has superseded the referenced version. An expired retained collection has its own closed state. These errors should be machine-readable and should not disclose a private store path.</p>
+<p>A browser should separate the text it initially retrieved from the result of a later revalidation. When the reader asks to revalidate, hide the earlier passage while the request is pending. If the resolver reports revocation, expiry, superseded content, or a malformed reference, show only that status. If resolution succeeds, render the text returned by the resolver, because that response was checked against current state.</p>
+<p>There is a subtle content-identity limitation in a content-derived version scheme. If a document is removed and then reintroduced with exactly the same title and body, the same version may recur. A reference based only on that content identity can become valid again. Stronger permanent revocation would need a new identity rule or lifecycle epoch; do not claim permanent invalidation unless the store actually records one.</p>
+</body>
+</html>

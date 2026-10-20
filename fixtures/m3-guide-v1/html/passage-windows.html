@@ -1,0 +1,12 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Passage windows and byte offsets</title></head>
+<body>
+<h1>Passage windows and byte offsets</h1>
+<p>A passage reference should point into the exact extracted body text stored for one content version. It can contain the requested URL, content version, passage schema, and inclusive start and exclusive end offsets in UTF-8 bytes. The same byte range must land on valid character boundaries; a byte offset is not a character count. Non-ASCII text makes that distinction visible because one character can occupy several UTF-8 bytes.</p>
+<p>For example, the text “Crème brûlée” has visible characters whose UTF-8 byte length is larger than its character count. An evidence range must still slice the exact stored bytes on valid boundaries.</p>
+<p>Canonical window rules make a reference reproducible. If a schema defines a maximum window size and a fixed step, a resolver can reject arbitrary ranges that do not correspond to a window the retrieval system could have produced. The reference checksum can detect a changed field, but it is public data, not a password or authenticator. Anyone who can construct the fields can calculate the checksum.</p>
+<p>Resolution is the authority check. On every call, load current visibility and confirm that the document is live, not revoked, and still has the referenced content version. Then validate the range and slice text from the current stored body. Do not answer from an old generation or an immutable segment that is no longer current. If a check fails, return a typed state without the old passage text.</p>
+<p>Stable references should survive an unrelated document update and a process restart because neither event changes the referenced passage identity. A change to the referenced document should supersede its version. Tombstoning or revoking should prevent ordinary resolution while that state is current. These are visibility guarantees, not promises of physical erasure from append-only historical storage.</p>
+</body>
+</html>

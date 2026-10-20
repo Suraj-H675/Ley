@@ -1,0 +1,11 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Resource budgets for retrieval work</title></head>
+<body>
+<h1>Resource budgets for retrieval work</h1>
+<p>Every boundary should have a practical limit: the question byte count, number of query terms, result count, response bytes, stored body size, passage window, and number of candidate documents scanned. A bound should be applied before the expensive operation it protects. When a corpus is too large to scan completely, the result must report partial completeness rather than implying that the whole collection was checked.</p>
+<p>Disk reads and segment decoding are synchronous storage work. If an asynchronous server performs those operations directly on its only runtime thread, a large lookup can delay unrelated requests such as health checks. Offloading the synchronous call to a blocking worker allows the runtime to continue scheduling, but spawning an unlimited number of such workers can exhaust memory when each reads a large snapshot.</p>
+<p>Use a small in-flight permit count before launching blocking storage work. Reject a request immediately when every permit is occupied. Keep the permit until the worker finishes so a cancelled client cannot make the apparent work count drop while the synchronous operation still runs. A cheap health route should not acquire a retrieval permit.</p>
+<p>Evaluate scheduling with two simultaneous requests against the same local store: one substantial query and one health check. The useful signal is whether health completes while the storage-backed search is still running, not a broad claim about throughput. Record the corpus size, document body sizes, warm-cache conditions, request durations, and repeated trials. This small probe cannot establish general performance or solve writer contention.</p>
+</body>
+</html>
