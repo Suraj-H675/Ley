@@ -26,7 +26,7 @@ use crate::retrieval::{
     InsufficientEvidenceReason, MAX_PASSAGE_BYTES, MAX_RESPONSE_BYTES, MAX_RESPONSE_PASSAGE_BYTES,
     QuestionPlan, QuestionRequest, ResolvedEvidence, RetrievalCompleteness, RetrievalError,
     RetrievalMode, RetrievalRequest, RetrievalResponse, RetrievalStatus,
-    match_passage_terms_bounded, passage_windows, plan_question,
+    match_passage_text_bounded, passage_windows, plan_question,
 };
 use crate::url_key::{MAX_URL_KEY_BYTES, UrlKey};
 
@@ -1219,7 +1219,7 @@ impl PersistentIndex {
                     .analyze(text)
                     .map_err(|_| RetrievalError::CorruptStorage)?;
                 let (matched, phrase_budget_reached) =
-                    match_passage_terms_bounded(&terms, &plan, &mut phrase_steps);
+                    match_passage_text_bounded(&terms, text, &plan, &mut phrase_steps);
                 if phrase_budget_reached {
                     partial = true;
                 }
@@ -2068,8 +2068,7 @@ fn question_bm25_score(
     let count = document_count as f64;
     let average_title = corpus.title_token_total as f64 / count;
     let average_body = corpus.body_token_total as f64 / count;
-    let mut score = 0.0;
-    for term in &plan.scoring_terms {
+    let term_score = |term: &str| {
         let posting = segment
             .postings
             .get(term)
@@ -2081,22 +2080,34 @@ fn question_bm25_score(
             .unwrap_or_default();
         let title_df = usize::try_from(frequencies.title).unwrap_or(usize::MAX);
         let body_df = usize::try_from(frequencies.body).unwrap_or(usize::MAX);
-        score += bm25_field_contribution(
+        bm25_field_contribution(
             posting.map_or(0, |value| value.title_positions.len()),
             title_df,
             document.title_terms.len(),
             average_title,
             document_count,
             2.0,
-        );
-        score += bm25_field_contribution(
+        ) + bm25_field_contribution(
             posting.map_or(0, |value| value.body_positions.len()),
             body_df,
             document.body_terms.len(),
             average_body,
             document_count,
             1.0,
-        );
+        )
+    };
+    let mut score = 0.0;
+    for term in &plan.scoring_terms {
+        if plan.term_alternatives.binary_search(term).is_ok() {
+            continue;
+        }
+        score += term_score(term);
+    }
+    for family in &plan.term_families {
+        score += family
+            .iter()
+            .map(|term| term_score(term))
+            .fold(0.0, f64::max);
     }
     score
 }
@@ -5006,6 +5017,52 @@ mod tests {
             store.retrieve(RetrievalRequest::question("\"unterminated")),
             Err(RetrievalError::UnterminatedQuote)
         ));
+    }
+
+    #[test]
+    fn question_retrieval_matches_surface_forms_and_exact_inline_code() {
+        let temp = TempStore::new();
+        let store = PersistentIndex::create(temp.path()).unwrap();
+        let limits = key("pcre2-limits");
+        upsert(
+            &store,
+            &limits,
+            limits.as_str(),
+            "PCRE2 pattern limits",
+            "The default limit for nesting parenthesized subpatterns is 250.",
+        );
+        let nested = store
+            .retrieve(RetrievalRequest::question(
+                "How deeply may I nest parentheses in a PCRE2 pattern by default?",
+            ))
+            .unwrap();
+        let limit_hit = nested
+            .hits
+            .iter()
+            .find(|hit| hit.requested_url == limits.as_str())
+            .unwrap();
+        assert!(limit_hit.passage.text.contains("nesting"));
+
+        let syntax = key("pcre2-syntax");
+        upsert(
+            &store,
+            &syntax,
+            syntax.as_str(),
+            "PCRE2 pattern syntax",
+            r"In PCRE2, \h matches any horizontal white space character.",
+        );
+        let code = store
+            .retrieve(RetrievalRequest::question(
+                r"What does `\h` match in a PCRE2 pattern?",
+            ))
+            .unwrap();
+        let code_hit = code
+            .hits
+            .iter()
+            .find(|hit| hit.requested_url == syntax.as_str())
+            .unwrap();
+        assert!(code_hit.matched_terms.contains(&"h".to_owned()));
+        assert!(code_hit.passage.text.contains(r"\h"));
     }
 
     #[test]

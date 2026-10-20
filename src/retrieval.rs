@@ -28,6 +28,9 @@ pub(crate) const MAX_QUESTION_BYTES: usize = 4096;
 pub(crate) const MAX_QUESTION_TOKEN_OCCURRENCES: usize = 64;
 pub(crate) const MAX_QUESTION_DISTINCT_TERMS: usize = 32;
 pub(crate) const MAX_QUESTION_PHRASE_TERMS: usize = 16;
+pub(crate) const MAX_QUESTION_SURFACE_VARIANTS: usize = 3;
+pub(crate) const MAX_QUESTION_LITERAL_PHRASES: usize = 8;
+pub(crate) const MAX_QUESTION_LITERAL_BYTES: usize = 128;
 pub(crate) const MAX_QUESTION_PHRASE_STEPS: usize = 25_000_000;
 pub(crate) const MAX_PASSAGE_BYTES: usize = 8192;
 pub(crate) const PASSAGE_STEP_BYTES: usize = 4096;
@@ -394,7 +397,9 @@ pub(crate) struct QuestionPlan {
     pub scoring_terms: Vec<String>,
     pub candidate_terms: Vec<String>,
     pub term_alternatives: Vec<String>,
+    pub term_families: Vec<Vec<String>>,
     pub phrase_groups: Vec<Vec<String>>,
+    pub literal_phrases: Vec<String>,
     phrase_trie: PhraseTrie,
 }
 
@@ -409,6 +414,7 @@ pub(crate) fn plan_question(raw: &str) -> Result<QuestionPlan, RetrievalError> {
     let mut scoring_terms = BTreeSet::new();
     let mut candidate_terms = BTreeSet::new();
     let mut alternatives = Vec::new();
+    let mut literal_phrases = BTreeSet::new();
 
     for atom in atoms {
         let terms = Analyzer.analyze(&atom.text).map_err(map_analysis_error)?;
@@ -422,6 +428,13 @@ pub(crate) fn plan_question(raw: &str) -> Result<QuestionPlan, RetrievalError> {
         }
         if phrase_group && terms.len() > MAX_QUESTION_PHRASE_TERMS {
             return Err(RetrievalError::PhraseTooLong { terms: terms.len() });
+        }
+        if let Some(literal) = &atom.literal
+            && !literal.is_empty()
+            && literal.len() <= MAX_QUESTION_LITERAL_BYTES
+            && literal_phrases.len() < MAX_QUESTION_LITERAL_PHRASES
+        {
+            literal_phrases.insert(literal.clone());
         }
 
         if phrase_group {
@@ -463,13 +476,26 @@ pub(crate) fn plan_question(raw: &str) -> Result<QuestionPlan, RetrievalError> {
     }
     let term_alternatives = term_alternatives.into_iter().collect::<Vec<_>>();
     let phrase_groups = phrase_groups.into_iter().collect::<Vec<_>>();
+    let term_families = term_alternatives
+        .iter()
+        .map(|term| {
+            let mut family = vec![term.clone()];
+            family.extend(question_surface_variants(term));
+            family
+        })
+        .collect::<Vec<_>>();
+    for family in &term_families {
+        candidate_terms.extend(family.iter().cloned());
+    }
     let phrase_trie = build_phrase_trie(&phrase_groups);
     Ok(QuestionPlan {
         normalized_terms: normalized.into_iter().collect(),
         scoring_terms: scoring_terms.into_iter().collect(),
         candidate_terms: candidate_terms.into_iter().collect(),
         term_alternatives,
+        term_families,
         phrase_groups,
+        literal_phrases: literal_phrases.into_iter().collect(),
         phrase_trie,
     })
 }
@@ -478,6 +504,7 @@ pub(crate) fn plan_question(raw: &str) -> Result<QuestionPlan, RetrievalError> {
 struct QuestionAtom {
     text: String,
     quoted: bool,
+    literal: Option<String>,
 }
 
 fn scan_question(raw: &str) -> Result<Vec<QuestionAtom>, RetrievalError> {
@@ -490,6 +517,22 @@ fn scan_question(raw: &str) -> Result<Vec<QuestionAtom>, RetrievalError> {
             .expect("cursor is a UTF-8 boundary");
         if character.is_whitespace() {
             cursor += character.len_utf8();
+            continue;
+        }
+        if character == '`'
+            && let Some(relative_end) = raw[cursor + character.len_utf8()..].find('`')
+        {
+            let content_start = cursor + character.len_utf8();
+            let content_end = content_start + relative_end;
+            let text = raw[content_start..content_end].to_owned();
+            cursor = content_end + character.len_utf8();
+            if !text.is_empty() {
+                atoms.push(QuestionAtom {
+                    text: text.clone(),
+                    quoted: false,
+                    literal: Some(text),
+                });
+            }
             continue;
         }
         if character == '"' {
@@ -524,7 +567,11 @@ fn scan_question(raw: &str) -> Result<Vec<QuestionAtom>, RetrievalError> {
             if !closed {
                 return Err(RetrievalError::UnterminatedQuote);
             }
-            atoms.push(QuestionAtom { text, quoted: true });
+            atoms.push(QuestionAtom {
+                text,
+                quoted: true,
+                literal: None,
+            });
         } else {
             let start = cursor;
             while cursor < raw.len() {
@@ -540,10 +587,52 @@ fn scan_question(raw: &str) -> Result<Vec<QuestionAtom>, RetrievalError> {
             atoms.push(QuestionAtom {
                 text: raw[start..cursor].to_owned(),
                 quoted: false,
+                literal: None,
             });
         }
     }
     Ok(atoms)
+}
+
+fn question_surface_variants(term: &str) -> Vec<String> {
+    if term.len() < 4 || !term.bytes().all(|byte| byte.is_ascii_lowercase()) || term.ends_with('s')
+    {
+        return Vec::new();
+    }
+
+    let mut variants = BTreeSet::new();
+    if let Some(stem) = term.strip_suffix("ly") {
+        if stem.chars().count() >= 3 {
+            variants.insert(stem.to_owned());
+            variants.insert(format!("{stem}s"));
+        }
+    } else if let Some(stem) = term.strip_suffix('e') {
+        variants.insert(format!("{term}s"));
+        variants.insert(format!("{stem}ing"));
+    } else if let Some(stem) = term.strip_suffix('y') {
+        if stem
+            .chars()
+            .last()
+            .is_some_and(|last| !"aeiou".contains(last))
+        {
+            variants.insert(format!("{stem}ies"));
+            variants.insert(format!("{stem}ied"));
+            variants.insert(format!("{stem}ying"));
+        } else {
+            variants.insert(format!("{term}s"));
+            variants.insert(format!("{term}ed"));
+            variants.insert(format!("{term}ing"));
+        }
+    } else {
+        variants.insert(format!("{term}s"));
+        variants.insert(format!("{term}ed"));
+        variants.insert(format!("{term}ing"));
+    }
+    variants.remove(term);
+    variants
+        .into_iter()
+        .take(MAX_QUESTION_SURFACE_VARIANTS)
+        .collect()
 }
 
 fn looks_like_identifier(text: &str) -> bool {
@@ -677,11 +766,12 @@ pub(crate) fn match_passage_terms(
     plan: &QuestionPlan,
 ) -> Option<PassageMatch> {
     let mut phrase_steps = 0;
-    match_passage_terms_bounded(window_terms, plan, &mut phrase_steps).0
+    match_passage_text_bounded(window_terms, "", plan, &mut phrase_steps).0
 }
 
-pub(crate) fn match_passage_terms_bounded(
+pub(crate) fn match_passage_text_bounded(
     window_terms: &[String],
+    window_text: &str,
     plan: &QuestionPlan,
     phrase_steps: &mut usize,
 ) -> (Option<PassageMatch>, bool) {
@@ -719,11 +809,24 @@ pub(crate) fn match_passage_terms_bounded(
             }
         }
     }
+    let matched_literal_count = plan
+        .literal_phrases
+        .iter()
+        .filter(|literal| contains_code_literal(window_text, literal))
+        .count();
+    for phrase in &matched_phrases {
+        matched_terms.extend(phrase.iter().cloned());
+    }
     let phrases = matched_phrases.into_iter().collect::<Vec<_>>();
     let score = u32::try_from(matched_terms.len())
         .unwrap_or(u32::MAX)
         .saturating_add(
             u32::try_from(phrases.len())
+                .unwrap_or(u32::MAX)
+                .saturating_mul(4),
+        )
+        .saturating_add(
+            u32::try_from(matched_literal_count)
                 .unwrap_or(u32::MAX)
                 .saturating_mul(4),
         );
@@ -738,6 +841,22 @@ pub(crate) fn match_passage_terms_bounded(
         }),
         exhausted,
     )
+}
+
+fn contains_code_literal(text: &str, literal: &str) -> bool {
+    let is_word_character = |character: char| character.is_alphanumeric() || character == '_';
+    let first = literal.chars().next();
+    let last = literal.chars().next_back();
+    text.match_indices(literal).any(|(start, _)| {
+        let before = text[..start].chars().next_back();
+        let after = text[start + literal.len()..].chars().next();
+        let left_boundary =
+            !first.is_some_and(is_word_character) || !before.is_some_and(is_word_character);
+        let right_boundary =
+            !last.is_some_and(is_word_character) || !after.is_some_and(is_word_character);
+        let not_escaped_backslash = !(literal.starts_with('\\') && before == Some('\\'));
+        left_boundary && right_boundary && not_escaped_backslash
+    })
 }
 
 fn build_phrase_trie(phrases: &[Vec<String>]) -> PhraseTrie {
@@ -787,6 +906,69 @@ mod tests {
             plan.phrase_groups
                 .contains(&vec!["failed".to_owned(), "login".to_owned()])
         );
+    }
+
+    #[test]
+    fn question_plan_keeps_canonical_terms_and_adds_bounded_surface_variants() {
+        let plan = plan_question("nest literally sequence").unwrap();
+        assert_eq!(plan.normalized_terms, ["literally", "nest", "sequence"]);
+        assert!(plan.candidate_terms.contains(&"nesting".to_owned()));
+        assert!(plan.candidate_terms.contains(&"literal".to_owned()));
+        assert!(plan.candidate_terms.contains(&"literals".to_owned()));
+        assert!(plan.candidate_terms.contains(&"sequences".to_owned()));
+        assert!(plan.term_families.iter().all(|family| family.len() <= 4));
+
+        let matched = match_passage_terms(
+            &["nest".into(), "literally".into(), "sequence".into()],
+            &plan,
+        )
+        .unwrap();
+        assert_eq!(matched.terms, ["literally", "nest", "sequence"]);
+        assert_eq!(matched.score, 3);
+    }
+
+    #[test]
+    fn inline_code_literal_is_preserved_as_an_exact_passage_signal() {
+        let plan = plan_question(r"What does `\h` match in a pattern?").unwrap();
+        assert_eq!(plan.literal_phrases, [r"\h"]);
+        assert!(plan.term_alternatives.contains(&"h".to_owned()));
+        assert!(plan.phrase_groups.is_empty());
+
+        let exact_terms = Analyzer
+            .analyze(r"The \h escape matches whitespace.")
+            .unwrap();
+        let mut phrase_steps = 0;
+        let exact = match_passage_text_bounded(
+            &exact_terms,
+            r"The \h escape matches whitespace.",
+            &plan,
+            &mut phrase_steps,
+        )
+        .0
+        .unwrap();
+        let unrelated_terms = Analyzer
+            .analyze("The h symbol matches whitespace.")
+            .unwrap();
+        let unrelated = match_passage_text_bounded(
+            &unrelated_terms,
+            "The h symbol matches whitespace.",
+            &plan,
+            &mut phrase_steps,
+        )
+        .0
+        .unwrap();
+        assert!(exact.score > unrelated.score);
+        let escaped_terms = Analyzer.analyze(r"The \h is a different escape.").unwrap();
+        let escaped = match_passage_text_bounded(
+            &escaped_terms,
+            r"The \\h is a different escape.",
+            &plan,
+            &mut phrase_steps,
+        )
+        .0
+        .unwrap();
+        assert_eq!(unrelated.score, escaped.score);
+        assert!(!unrelated.phrases.iter().flatten().any(|term| term == r"\h"));
     }
 
     #[test]
