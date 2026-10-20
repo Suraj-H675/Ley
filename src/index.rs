@@ -783,6 +783,29 @@ fn bm25_idf(document_count: f64, document_frequency: f64) -> f64 {
     (1.0 + (document_count - document_frequency + 0.5) / (document_frequency + 0.5)).ln()
 }
 
+pub(crate) fn bm25_field_contribution(
+    term_frequency: usize,
+    document_frequency: usize,
+    document_length: usize,
+    average_length: f64,
+    document_count: usize,
+    weight: f64,
+) -> f64 {
+    if document_count == 0 {
+        return 0.0;
+    }
+    let idf = bm25_idf(document_count as f64, document_frequency as f64);
+    field_score(
+        term_frequency,
+        document_frequency,
+        document_length,
+        average_length,
+        idf,
+        weight,
+    )
+    .contribution
+}
+
 fn field_score(
     term_frequency: usize,
     document_frequency: usize,

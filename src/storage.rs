@@ -17,10 +17,17 @@ use sha2::{Digest, Sha256};
 use crate::analyzer::{ANALYZER_ID, Analyzer, MAX_TERM_SCALARS};
 use crate::html::{HTML_SCHEMA_ID, MAX_DOCUMENT_TOKENS, MAX_FIELDS_BYTES, MAX_TITLE_BYTES};
 use crate::index::{
-    CorpusStatistics as QueryCorpusStatistics, InMemoryIndex, QueryError, SearchResult,
-    query_with_segment_postings,
+    CorpusStatistics as QueryCorpusStatistics, InMemoryIndex, Posting, QueryError, SearchResult,
+    bm25_field_contribution, query_with_segment_postings,
 };
 use crate::query::parse_query;
+use crate::retrieval::{
+    AnswerAssessment, EvidenceHit, EvidencePassage, EvidenceReference, EvidenceResolveError,
+    InsufficientEvidenceReason, MAX_PASSAGE_BYTES, MAX_RESPONSE_BYTES, MAX_RESPONSE_PASSAGE_BYTES,
+    QuestionPlan, QuestionRequest, ResolvedEvidence, RetrievalCompleteness, RetrievalError,
+    RetrievalMode, RetrievalRequest, RetrievalResponse, RetrievalStatus,
+    match_passage_terms_bounded, passage_windows, plan_question,
+};
 use crate::url_key::{MAX_URL_KEY_BYTES, UrlKey};
 
 mod manifest;
@@ -63,6 +70,14 @@ const MAX_SEGMENTS: usize = 4096;
 const MAX_PHYSICAL_POSTING_RECORDS: usize = 4_000_000;
 const MAX_POSITION_VALUES: u64 = 50_000_000;
 const MAX_SNAPSHOT_ESTIMATE_BYTES: u64 = 3 * 1024 * 1024 * 1024;
+const MAX_QUESTION_SEGMENT_PROBES: usize = MAX_SEGMENTS;
+const MAX_QUESTION_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_QUESTION_SEGMENT_MEMORY_ESTIMATE: u64 = 256 * 1024 * 1024;
+const MAX_QUESTION_POSTING_PROBES: usize = 8_192;
+const MAX_QUESTION_CANDIDATES: usize = 256;
+const MAX_QUESTION_PASSAGE_DOCUMENTS: usize = 32;
+const MAX_QUESTION_PASSAGE_BODY_BYTES: usize = 32 * 1024 * 1024;
+const MAX_QUESTION_PASSAGE_WINDOW_BYTES: usize = 64 * 1024 * 1024;
 const STORE_MAGIC_V6: &[u8; 8] = b"LEYSTOR6";
 const LEASE_KEY_MAGIC_V6: &[u8; 8] = b"LEYMACK6";
 const STORE_V6_MAJOR: u16 = 1;
@@ -991,6 +1006,448 @@ impl PersistentIndex {
         self.read_view()?.query(expression)
     }
 
+    /// Retrieve body passages for an explicitly typed ordinary-question request.
+    /// The legacy `query(&str)` method remains the advanced Boolean/phrase DSL.
+    pub fn retrieve(&self, request: RetrievalRequest) -> Result<RetrievalResponse, RetrievalError> {
+        match request {
+            RetrievalRequest::Question(question) => self.retrieve_question(question),
+        }
+    }
+
+    fn retrieve_question(
+        &self,
+        request: QuestionRequest,
+    ) -> Result<RetrievalResponse, RetrievalError> {
+        if request.contract_version() != crate::retrieval::RETRIEVAL_CONTRACT_VERSION {
+            return Err(RetrievalError::UnsupportedContractVersion(
+                request.contract_version(),
+            ));
+        }
+        if !(1..=crate::retrieval::MAX_HITS).contains(&request.max_hits()) {
+            return Err(RetrievalError::InvalidHitLimit);
+        }
+        let plan = plan_question(request.question())?;
+        let _lock = self.lock_shared().map_err(map_retrieval_storage_error)?;
+        let gate = self
+            .load_public_collection_locked()
+            .map_err(map_retrieval_storage_error)?;
+        let now_ms = system_time_ms().map_err(map_retrieval_storage_error)?;
+        ensure_public_collection_current(gate.as_ref(), now_ms)
+            .map_err(map_retrieval_storage_error)?;
+        let manifest = self
+            .load_manifest_locked()
+            .map_err(map_retrieval_storage_error)?;
+        let seed = question_sample_seed(self.store_id, &plan);
+        let mut partial = false;
+
+        let mut response_hits = Vec::new();
+        let mut title_only_match = false;
+        if plan.term_alternatives.is_empty() && plan.phrase_groups.is_empty() {
+            let response = RetrievalResponse {
+                contract_version: crate::retrieval::RETRIEVAL_CONTRACT_VERSION,
+                mode: RetrievalMode::Question,
+                generation_id: manifest.generation_id,
+                status: RetrievalStatus::InsufficientEvidence(
+                    InsufficientEvidenceReason::NoSearchableTerms,
+                ),
+                completeness: RetrievalCompleteness::Complete,
+                normalized_terms: plan.normalized_terms.clone(),
+                hits: Vec::new(),
+                answer_assessment: AnswerAssessment::NotAssessed,
+            };
+            ensure_response_bound(&response)?;
+            self.check_retrieval_expiry(gate.as_ref())?;
+            return Ok(response);
+        }
+
+        let (descriptors, skipped_segments) = select_question_segments(&manifest.segments, &seed)
+            .map_err(map_retrieval_storage_error)?;
+        partial |= skipped_segments;
+
+        let mut segments = Vec::with_capacity(descriptors.len());
+        for descriptor in &descriptors {
+            let path = self.path.join(segment_name(descriptor.id));
+            let bytes = match read_bounded_file(&path, MAX_SEGMENT_BYTES) {
+                Err(StorageError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                    return Err(RetrievalError::CorruptStorage);
+                }
+                result => result.map_err(map_retrieval_storage_error)?,
+            };
+            let segment =
+                Segment::from_bytes(descriptor, &bytes).map_err(map_retrieval_storage_error)?;
+            segments.push((descriptor.id, segment));
+        }
+
+        let mut sampled_by_segment = vec![BTreeSet::<u32>::new(); segments.len()];
+        let mut posting_probes = 0usize;
+        for (segment_index, (segment_id, segment)) in segments.iter().enumerate() {
+            for term in &plan.candidate_terms {
+                let Some(records) = segment.postings.get(term) else {
+                    continue;
+                };
+                if posting_probes >= MAX_QUESTION_POSTING_PROBES {
+                    partial = true;
+                    break;
+                }
+                let term_seed = sample_term_seed(&seed, term, *segment_id);
+                let probe_budget = MAX_QUESTION_POSTING_PROBES - posting_probes;
+                let (ordinals, probes) = sample_question_postings(
+                    records,
+                    segment.documents.len(),
+                    &term_seed,
+                    probe_budget,
+                );
+                posting_probes = posting_probes.saturating_add(probes);
+                if ordinals.len() < records.len() {
+                    partial = true;
+                }
+                for ordinal in ordinals {
+                    let Some(document) = segment.documents.get(ordinal as usize) else {
+                        return Err(RetrievalError::CorruptStorage);
+                    };
+                    let current =
+                        manifest_document_is_live(&manifest, document, *segment_id, ordinal)
+                            .map_err(map_retrieval_storage_error)?;
+                    if current {
+                        sampled_by_segment[segment_index].insert(ordinal);
+                    }
+                }
+            }
+        }
+
+        let mut admitted_by_segment = Vec::<Vec<u32>>::with_capacity(segments.len());
+        if !segments.is_empty() {
+            let quota = MAX_QUESTION_CANDIDATES.div_ceil(segments.len()).max(1);
+            for (segment_index, (segment_id, _segment)) in segments.iter().enumerate() {
+                let mut ordinals = sampled_by_segment[segment_index]
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>();
+                if ordinals.len() > quota {
+                    partial = true;
+                    ordinals
+                        .sort_by_key(|ordinal| sample_ordinal_key(&seed, *segment_id, *ordinal));
+                    ordinals.truncate(quota);
+                    ordinals.sort_unstable();
+                }
+                admitted_by_segment.push(ordinals);
+            }
+        }
+
+        let mut locations = Vec::<(usize, u32)>::new();
+        let max_depth = admitted_by_segment.iter().map(Vec::len).max().unwrap_or(0);
+        'round_robin: for depth in 0..max_depth {
+            for (segment_index, ordinals) in admitted_by_segment.iter().enumerate() {
+                if let Some(ordinal) = ordinals.get(depth) {
+                    if locations.len() == MAX_QUESTION_CANDIDATES {
+                        partial = true;
+                        break 'round_robin;
+                    }
+                    locations.push((segment_index, *ordinal));
+                }
+            }
+        }
+
+        let mut ranked = Vec::with_capacity(locations.len());
+        for (segment_index, ordinal) in locations {
+            let (_, segment) = &segments[segment_index];
+            let document = segment
+                .documents
+                .get(ordinal as usize)
+                .ok_or(RetrievalError::CorruptStorage)?;
+            let score = question_bm25_score(segment, ordinal, &plan, &manifest.statistics);
+            if !score.is_finite() {
+                return Err(RetrievalError::CorruptStorage);
+            }
+            let title_match = document
+                .title_terms
+                .iter()
+                .any(|term| plan.scoring_terms.binary_search(term).is_ok());
+            ranked.push(QuestionCandidate {
+                segment_index,
+                ordinal,
+                score,
+                title_match,
+            });
+        }
+        ranked.sort_by(|left, right| {
+            right.score.total_cmp(&left.score).then_with(|| {
+                let left_id = &segments[left.segment_index].1.documents[left.ordinal as usize].id;
+                let right_id =
+                    &segments[right.segment_index].1.documents[right.ordinal as usize].id;
+                left_id.as_bytes().cmp(right_id.as_bytes())
+            })
+        });
+        if ranked.len() > MAX_QUESTION_PASSAGE_DOCUMENTS {
+            partial = true;
+        }
+
+        let mut scanned_body_bytes = 0usize;
+        let mut scanned_window_bytes = 0usize;
+        let mut phrase_steps = 0usize;
+        for candidate in ranked.iter().take(MAX_QUESTION_PASSAGE_DOCUMENTS) {
+            let segment = &segments[candidate.segment_index].1;
+            let document = segment
+                .documents
+                .get(candidate.ordinal as usize)
+                .ok_or(RetrievalError::CorruptStorage)?;
+            if scanned_body_bytes
+                .checked_add(document.body.len())
+                .is_none_or(|total| total > MAX_QUESTION_PASSAGE_BODY_BYTES)
+            {
+                partial = true;
+                break;
+            }
+            scanned_body_bytes += document.body.len();
+            let windows = passage_windows(&document.body)?;
+            let mut best: Option<(u32, usize, usize, crate::retrieval::PassageMatch)> = None;
+            for window in windows {
+                let byte_len = window.end_byte - window.start_byte;
+                if scanned_window_bytes
+                    .checked_add(byte_len)
+                    .is_none_or(|total| total > MAX_QUESTION_PASSAGE_WINDOW_BYTES)
+                {
+                    partial = true;
+                    break;
+                }
+                scanned_window_bytes += byte_len;
+                let text = document
+                    .body
+                    .get(window.start_byte..window.end_byte)
+                    .ok_or(RetrievalError::InvalidRange)?;
+                let terms = Analyzer
+                    .analyze(text)
+                    .map_err(|_| RetrievalError::CorruptStorage)?;
+                let (matched, phrase_budget_reached) =
+                    match_passage_terms_bounded(&terms, &plan, &mut phrase_steps);
+                if phrase_budget_reached {
+                    partial = true;
+                }
+                let Some(matched) = matched else {
+                    continue;
+                };
+                let replace = best.as_ref().is_none_or(|(best_score, best_start, _, _)| {
+                    matched.score > *best_score
+                        || (matched.score == *best_score && window.start_byte < *best_start)
+                });
+                if replace {
+                    best = Some((matched.score, window.start_byte, window.end_byte, matched));
+                }
+            }
+            if let Some((_, start_byte, end_byte, matched)) = best {
+                let content_version =
+                    decode_version_id(&document.version_id).map_err(map_retrieval_storage_error)?;
+                let reference = EvidenceReference::new(
+                    self.store_id,
+                    document.id.clone(),
+                    content_version,
+                    start_byte,
+                    end_byte,
+                )?;
+                response_hits.push(EvidenceHit {
+                    requested_url: document.id.clone(),
+                    effective_url: document.effective_url.clone(),
+                    title: document.title.clone(),
+                    score: candidate.score,
+                    matched_terms: matched.terms,
+                    matched_phrases: matched.phrases,
+                    passage: EvidencePassage {
+                        reference,
+                        text: document
+                            .body
+                            .get(start_byte..end_byte)
+                            .ok_or(RetrievalError::InvalidRange)?
+                            .to_owned(),
+                    },
+                });
+            } else if candidate.title_match {
+                title_only_match = true;
+            }
+        }
+
+        response_hits.sort_by(|left, right| {
+            right.score.total_cmp(&left.score).then_with(|| {
+                left.requested_url
+                    .as_bytes()
+                    .cmp(right.requested_url.as_bytes())
+            })
+        });
+        let max_hits = usize::from(request.max_hits());
+        response_hits.truncate(max_hits);
+        let response_passage_bytes = response_hits.iter().try_fold(0usize, |total, hit| {
+            total.checked_add(hit.passage.text.len())
+        });
+        if response_passage_bytes.is_none_or(|size| size > MAX_RESPONSE_PASSAGE_BYTES) {
+            return Err(RetrievalError::ResponseTooLarge);
+        }
+
+        let status = if !response_hits.is_empty() {
+            RetrievalStatus::RetrievedText
+        } else if partial {
+            RetrievalStatus::InsufficientEvidence(InsufficientEvidenceReason::WorkBudgetReached)
+        } else if title_only_match {
+            RetrievalStatus::InsufficientEvidence(InsufficientEvidenceReason::OnlyTitleMatches)
+        } else {
+            RetrievalStatus::NoRelevantTextMatch
+        };
+        let response = RetrievalResponse {
+            contract_version: crate::retrieval::RETRIEVAL_CONTRACT_VERSION,
+            mode: RetrievalMode::Question,
+            generation_id: manifest.generation_id,
+            status,
+            completeness: if partial {
+                RetrievalCompleteness::Partial
+            } else {
+                RetrievalCompleteness::Complete
+            },
+            normalized_terms: plan.normalized_terms,
+            hits: response_hits,
+            answer_assessment: AnswerAssessment::NotAssessed,
+        };
+        ensure_response_bound(&response)?;
+        self.check_retrieval_expiry(gate.as_ref())?;
+        Ok(response)
+    }
+
+    fn check_retrieval_expiry(
+        &self,
+        initial_gate: Option<&PublicCollectionGate>,
+    ) -> Result<(), RetrievalError> {
+        let current_gate = self
+            .load_public_collection_locked()
+            .map_err(map_retrieval_storage_error)?;
+        let now_ms = system_time_ms().map_err(map_retrieval_storage_error)?;
+        if initial_gate.is_some_and(|gate| now_ms >= gate.visible_until_ms) {
+            return Err(RetrievalError::PublicCollectionExpired);
+        }
+        ensure_public_collection_current(current_gate.as_ref(), now_ms)
+            .map_err(map_retrieval_storage_error)
+    }
+
+    /// Resolve an evidence reference against the current authenticated store state.
+    /// A pinned `ReadView` is never accepted as authority for this operation.
+    pub fn resolve_evidence(
+        &self,
+        reference: &EvidenceReference,
+    ) -> Result<ResolvedEvidence, EvidenceResolveError> {
+        self.resolve_evidence_with_clock(reference, system_time_ms)
+    }
+
+    fn resolve_evidence_with_clock(
+        &self,
+        reference: &EvidenceReference,
+        mut clock: impl FnMut() -> Result<u64, StorageError>,
+    ) -> Result<ResolvedEvidence, EvidenceResolveError> {
+        reference.validate_shape_and_identity()?;
+        if reference.store_id != self.store_id {
+            return Err(EvidenceResolveError::WrongStore);
+        }
+        if u64::from(reference.end_byte - reference.start_byte) > MAX_PASSAGE_BYTES as u64 {
+            return Err(EvidenceResolveError::InvalidPassageWindow);
+        }
+        let _lock = self.lock_shared().map_err(map_evidence_storage_error)?;
+        let gate = self
+            .load_public_collection_locked()
+            .map_err(map_evidence_storage_error)?;
+        let now_ms = clock().map_err(map_evidence_storage_error)?;
+        if gate
+            .as_ref()
+            .is_some_and(|value| now_ms >= value.visible_until_ms)
+        {
+            return Err(EvidenceResolveError::PublicCollectionExpired);
+        }
+        let manifest = self
+            .load_manifest_locked()
+            .map_err(map_evidence_storage_error)?;
+        let key = reference.requested_url.as_str();
+        if manifest.controls.get(key).is_some_and(manifest_is_revoked) {
+            return Err(EvidenceResolveError::Revoked);
+        }
+        let Some(live) = manifest.live.get(key) else {
+            return Err(EvidenceResolveError::NotLive);
+        };
+        if live.version != reference.content_version {
+            return Err(EvidenceResolveError::VersionSuperseded);
+        }
+        let descriptor = manifest
+            .segments
+            .iter()
+            .find(|descriptor| descriptor.id == live.segment_id)
+            .ok_or(EvidenceResolveError::CorruptStorage)?;
+        let estimate =
+            segment_memory_estimate(descriptor).ok_or(EvidenceResolveError::CorruptStorage)?;
+        if estimate > MAX_SNAPSHOT_ESTIMATE_BYTES {
+            return Err(EvidenceResolveError::ResourceLimit);
+        }
+        let path = self.path.join(segment_name(descriptor.id));
+        let bytes = match read_bounded_file(&path, MAX_SEGMENT_BYTES) {
+            Err(StorageError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(EvidenceResolveError::CorruptStorage);
+            }
+            result => result.map_err(map_evidence_storage_error)?,
+        };
+        let segment =
+            Segment::from_bytes(descriptor, &bytes).map_err(map_evidence_storage_error)?;
+        let document = segment
+            .documents
+            .get(live.ordinal as usize)
+            .ok_or(EvidenceResolveError::CorruptStorage)?;
+        if document.id != reference.requested_url
+            || decode_version_id(&document.version_id).map_err(map_evidence_storage_error)?
+                != reference.content_version
+        {
+            return Err(EvidenceResolveError::CorruptStorage);
+        }
+        if !manifest_document_is_live(&manifest, document, live.segment_id, live.ordinal)
+            .map_err(map_evidence_storage_error)?
+        {
+            return Err(EvidenceResolveError::NotLive);
+        }
+        let start =
+            usize::try_from(reference.start_byte).map_err(|_| EvidenceResolveError::OutOfBounds)?;
+        let end =
+            usize::try_from(reference.end_byte).map_err(|_| EvidenceResolveError::OutOfBounds)?;
+        if end > document.body.len() || start > end {
+            return Err(EvidenceResolveError::OutOfBounds);
+        }
+        if !document.body.is_char_boundary(start) || !document.body.is_char_boundary(end) {
+            return Err(EvidenceResolveError::NotUtf8Boundary);
+        }
+        let windows = passage_windows(&document.body).map_err(|error| match error {
+            RetrievalError::ResourceLimit => EvidenceResolveError::ResourceLimit,
+            _ => EvidenceResolveError::CorruptStorage,
+        })?;
+        if !windows
+            .iter()
+            .any(|window| window.start_byte == start && window.end_byte == end)
+        {
+            return Err(EvidenceResolveError::InvalidPassageWindow);
+        }
+        let text = document
+            .body
+            .get(start..end)
+            .ok_or(EvidenceResolveError::OutOfBounds)?
+            .to_owned();
+        let resolved = ResolvedEvidence {
+            reference: reference.clone(),
+            requested_url: document.id.clone(),
+            effective_url: document.effective_url.clone(),
+            title: document.title.clone(),
+            text,
+        };
+        let final_gate = self
+            .load_public_collection_locked()
+            .map_err(map_evidence_storage_error)?;
+        let final_now_ms = clock().map_err(map_evidence_storage_error)?;
+        if final_gate
+            .as_ref()
+            .is_some_and(|value| final_now_ms >= value.visible_until_ms)
+        {
+            return Err(EvidenceResolveError::PublicCollectionExpired);
+        }
+        Ok(resolved)
+    }
+
     fn load_committed_locked(&self) -> Result<Generation, StorageError> {
         let current_path = self.path.join(CURRENT_NAME);
         match fs::symlink_metadata(&current_path) {
@@ -1375,6 +1832,273 @@ impl PersistentIndex {
             Err(error) => Err(error),
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct QuestionCandidate {
+    segment_index: usize,
+    ordinal: u32,
+    score: f64,
+    title_match: bool,
+}
+
+fn map_retrieval_storage_error(error: StorageError) -> RetrievalError {
+    match error {
+        StorageError::PublicCollectionExpired => RetrievalError::PublicCollectionExpired,
+        StorageError::CapacityExceeded(_) => RetrievalError::ResourceLimit,
+        StorageError::CorruptCommitted(_)
+        | StorageError::Query(_)
+        | StorageError::UnsupportedFormat { .. }
+        | StorageError::ReindexRequired(_) => RetrievalError::CorruptStorage,
+        StorageError::Io(_) => RetrievalError::StorageUnavailable,
+        _ => RetrievalError::StorageUnavailable,
+    }
+}
+
+fn map_evidence_storage_error(error: StorageError) -> EvidenceResolveError {
+    match error {
+        StorageError::PublicCollectionExpired => EvidenceResolveError::PublicCollectionExpired,
+        StorageError::CapacityExceeded(_) => EvidenceResolveError::ResourceLimit,
+        StorageError::CorruptCommitted(_)
+        | StorageError::Query(_)
+        | StorageError::UnsupportedFormat { .. }
+        | StorageError::ReindexRequired(_) => EvidenceResolveError::CorruptStorage,
+        StorageError::Io(_) => EvidenceResolveError::StorageUnavailable,
+        _ => EvidenceResolveError::StorageUnavailable,
+    }
+}
+
+fn ensure_public_collection_current(
+    gate: Option<&PublicCollectionGate>,
+    now_ms: u64,
+) -> Result<(), StorageError> {
+    if gate.is_some_and(|value| now_ms >= value.visible_until_ms) {
+        return Err(StorageError::PublicCollectionExpired);
+    }
+    Ok(())
+}
+
+fn manifest_document_is_live(
+    manifest: &Manifest,
+    document: &crate::index::IndexedDocument,
+    segment_id: u64,
+    ordinal: u32,
+) -> Result<bool, StorageError> {
+    let Some(live) = manifest.live.get(&document.id) else {
+        return Ok(false);
+    };
+    if live.segment_id != segment_id || live.ordinal != ordinal {
+        return Ok(false);
+    }
+    let document_version = decode_version_id(&document.version_id)?;
+    if document_version != live.version {
+        return Err(corrupt(
+            "live manifest version differs from sampled document",
+        ));
+    }
+    let control = manifest
+        .controls
+        .get(&document.id)
+        .ok_or_else(|| corrupt("live sampled document has no lifecycle control"))?;
+    if manifest_is_revoked(control)
+        || control
+            .terminal
+            .last_key_value()
+            .map(|(_, terminal)| *terminal)
+            != Some(TerminalRecord::Upsert(document_version))
+    {
+        return Err(corrupt(
+            "live sampled document differs from current lifecycle controls",
+        ));
+    }
+    Ok(true)
+}
+
+fn ensure_response_bound(response: &RetrievalResponse) -> Result<(), RetrievalError> {
+    let bytes = serde_json::to_vec(response).map_err(|_| RetrievalError::CorruptStorage)?;
+    if bytes.len() > MAX_RESPONSE_BYTES {
+        return Err(RetrievalError::ResponseTooLarge);
+    }
+    Ok(())
+}
+
+fn question_sample_seed(store_id: StoreId, plan: &QuestionPlan) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"ley-question-sampling-v1\0");
+    digest.update(store_id);
+    for term in &plan.normalized_terms {
+        digest.update((term.len() as u64).to_be_bytes());
+        digest.update(term.as_bytes());
+    }
+    digest.finalize().into()
+}
+
+fn sample_term_seed(seed: &[u8; 32], term: &str, segment_id: u64) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"ley-question-term-sample-v1\0");
+    digest.update(seed);
+    digest.update(segment_id.to_be_bytes());
+    digest.update((term.len() as u64).to_be_bytes());
+    digest.update(term.as_bytes());
+    digest.finalize().into()
+}
+
+fn sample_ordinal_key(seed: &[u8; 32], segment_id: u64, ordinal: u32) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"ley-question-candidate-sample-v1\0");
+    digest.update(seed);
+    digest.update(segment_id.to_be_bytes());
+    digest.update(ordinal.to_be_bytes());
+    digest.finalize().into()
+}
+
+fn select_question_segments(
+    descriptors: &[SegmentDescriptor],
+    seed: &[u8; 32],
+) -> Result<(Vec<SegmentDescriptor>, bool), StorageError> {
+    let mut ordered = descriptors.iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| {
+        sample_segment_key(seed, left.id)
+            .cmp(&sample_segment_key(seed, right.id))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    let mut selected = Vec::new();
+    let mut selected_bytes = 0u64;
+    let mut selected_estimate = 0u64;
+    let mut skipped = descriptors.len() > MAX_QUESTION_SEGMENT_PROBES;
+    for descriptor in ordered {
+        if selected.len() == MAX_QUESTION_SEGMENT_PROBES {
+            skipped = true;
+            break;
+        }
+        let Some(estimate) = segment_memory_estimate(descriptor) else {
+            return Err(corrupt("segment memory estimate overflow"));
+        };
+        let Some(next_bytes) = selected_bytes.checked_add(descriptor.byte_len) else {
+            return Err(corrupt("question segment byte bound overflow"));
+        };
+        let Some(next_estimate) = selected_estimate.checked_add(estimate) else {
+            return Err(corrupt("question segment memory estimate overflow"));
+        };
+        if descriptor.byte_len > MAX_QUESTION_SEGMENT_BYTES
+            || estimate > MAX_QUESTION_SEGMENT_MEMORY_ESTIMATE
+            || next_bytes > MAX_QUESTION_SEGMENT_BYTES
+            || next_estimate > MAX_QUESTION_SEGMENT_MEMORY_ESTIMATE
+        {
+            skipped = true;
+            continue;
+        }
+        selected_bytes = next_bytes;
+        selected_estimate = next_estimate;
+        selected.push(descriptor.clone());
+    }
+    Ok((selected, skipped))
+}
+
+fn sample_segment_key(seed: &[u8; 32], segment_id: u64) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"ley-question-segment-sample-v1\0");
+    digest.update(seed);
+    digest.update(segment_id.to_be_bytes());
+    digest.finalize().into()
+}
+
+fn segment_memory_estimate(descriptor: &SegmentDescriptor) -> Option<u64> {
+    descriptor
+        .byte_len
+        .checked_mul(4)?
+        .checked_add(descriptor.position_count.checked_mul(64)?)?
+        .checked_add(descriptor.posting_count.checked_mul(256)?)?
+        .checked_add(u64::from(descriptor.term_count).checked_mul(256)?)
+}
+
+fn sample_question_postings(
+    records: &BTreeMap<u32, Posting>,
+    document_count: usize,
+    seed: &[u8; 32],
+    probe_budget: usize,
+) -> (Vec<u32>, usize) {
+    const SAMPLE_COUNT: usize = 8;
+    if records.len() <= SAMPLE_COUNT {
+        let ordinals = records
+            .keys()
+            .take(probe_budget)
+            .copied()
+            .collect::<Vec<_>>();
+        let probes = ordinals.len();
+        return (ordinals, probes);
+    }
+    if document_count == 0 {
+        return (Vec::new(), 0);
+    }
+    let document_count = document_count as u64;
+    let start =
+        u64::from_be_bytes(seed[..8].try_into().expect("fixed hash length")) % document_count;
+    let stride = document_count.div_ceil(SAMPLE_COUNT as u64).max(1);
+    let first = records.keys().next().copied();
+    let mut ordinals = BTreeSet::new();
+    let probes = SAMPLE_COUNT.min(probe_budget);
+    for sample in 0..probes {
+        let target = (start + (sample as u64 * stride)) % document_count;
+        let target = u32::try_from(target).unwrap_or(u32::MAX);
+        if let Some((&ordinal, _)) = records.range(target..).next() {
+            ordinals.insert(ordinal);
+        } else if let Some(ordinal) = first {
+            ordinals.insert(ordinal);
+        }
+    }
+    (ordinals.into_iter().collect(), probes)
+}
+
+fn question_bm25_score(
+    segment: &Segment,
+    ordinal: u32,
+    plan: &QuestionPlan,
+    corpus: &CorpusStatistics,
+) -> f64 {
+    let Some(document) = segment.documents.get(ordinal as usize) else {
+        return 0.0;
+    };
+    let Ok(document_count) = usize::try_from(corpus.document_count) else {
+        return 0.0;
+    };
+    if document_count == 0 {
+        return 0.0;
+    }
+    let count = document_count as f64;
+    let average_title = corpus.title_token_total as f64 / count;
+    let average_body = corpus.body_token_total as f64 / count;
+    let mut score = 0.0;
+    for term in &plan.scoring_terms {
+        let posting = segment
+            .postings
+            .get(term)
+            .and_then(|records| records.get(&ordinal));
+        let frequencies = corpus
+            .field_document_frequencies
+            .get(term)
+            .copied()
+            .unwrap_or_default();
+        let title_df = usize::try_from(frequencies.title).unwrap_or(usize::MAX);
+        let body_df = usize::try_from(frequencies.body).unwrap_or(usize::MAX);
+        score += bm25_field_contribution(
+            posting.map_or(0, |value| value.title_positions.len()),
+            title_df,
+            document.title_terms.len(),
+            average_title,
+            document_count,
+            2.0,
+        );
+        score += bm25_field_contribution(
+            posting.map_or(0, |value| value.body_positions.len()),
+            body_df,
+            document.body_terms.len(),
+            average_body,
+            document_count,
+            1.0,
+        );
+    }
+    score
 }
 
 struct OwnedStageDirectory(PathBuf);
@@ -4216,6 +4940,670 @@ mod tests {
             ApplyOutcome::Applied
         );
         lease
+    }
+
+    #[test]
+    fn ordinary_question_retrieval_is_typed_and_preserves_the_legacy_dsl() {
+        let temp = TempStore::new();
+        let store = PersistentIndex::create(temp.path()).unwrap();
+        let document = key("pam-login-limits");
+        upsert(
+            &store,
+            &document,
+            "https://example.test/effective-pam-doc",
+            "Linux authentication limits",
+            "On Linux, PAM login limits determine sessions for every user.",
+        );
+
+        let raw_question = "On our shared Linux server, I need a PAM login limit for each user. Which setting controls it, what does the limit count, and what should happen after a user reaches it?";
+        assert!(matches!(
+            store.query(raw_question),
+            Err(StorageError::Query(QueryError::UnsupportedSyntax))
+        ));
+        assert!(
+            store
+                .query(raw_question.trim_end_matches('?'))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store.query("PAM AND login").unwrap()[0].id,
+            document.as_str()
+        );
+
+        let response = store
+            .retrieve(RetrievalRequest::question(raw_question))
+            .unwrap();
+        assert_eq!(response.mode, RetrievalMode::Question);
+        assert_eq!(response.status, RetrievalStatus::RetrievedText);
+        assert_eq!(response.answer_assessment, AnswerAssessment::NotAssessed);
+        assert_eq!(response.hits.len(), 1);
+        assert_eq!(response.hits[0].requested_url, document.as_str());
+        assert_eq!(
+            response.hits[0].effective_url,
+            "https://example.test/effective-pam-doc"
+        );
+        assert!(response.hits[0].matched_terms.contains(&"pam".to_owned()));
+        assert_eq!(
+            response.hits[0].passage.text,
+            "On Linux, PAM login limits determine sessions for every user."
+        );
+
+        let no_match = store
+            .retrieve(RetrievalRequest::question("quantum foobar"))
+            .unwrap();
+        assert_eq!(no_match.status, RetrievalStatus::NoRelevantTextMatch);
+        assert_eq!(no_match.completeness, RetrievalCompleteness::Complete);
+
+        let no_terms = store
+            .retrieve(RetrievalRequest::question("what is the and"))
+            .unwrap();
+        assert_eq!(
+            no_terms.status,
+            RetrievalStatus::InsufficientEvidence(InsufficientEvidenceReason::NoSearchableTerms)
+        );
+        assert!(matches!(
+            store.retrieve(RetrievalRequest::question("\"unterminated")),
+            Err(RetrievalError::UnterminatedQuote)
+        ));
+    }
+
+    #[test]
+    fn question_mode_preserves_technical_identifiers_and_exact_quoted_phrases() {
+        let temp = TempStore::new();
+        let store = PersistentIndex::create(temp.path()).unwrap();
+        let identifier = key("identifier");
+        upsert(
+            &store,
+            &identifier,
+            identifier.as_str(),
+            "PAM setting",
+            "The PAM::MAX_LOGINS setting limits concurrent sessions.",
+        );
+        let exact = key("exact-phrase");
+        upsert(
+            &store,
+            &exact,
+            exact.as_str(),
+            "Login failure handling",
+            "This page covers failed login attempts.",
+        );
+        let separated = key("separated-phrase");
+        upsert(
+            &store,
+            &separated,
+            separated.as_str(),
+            "Another login page",
+            "This page covers failed repeated login attempts.",
+        );
+
+        let identifier_response = store
+            .retrieve(RetrievalRequest::question("What does PAM::MAX_LOGINS do?"))
+            .unwrap();
+        assert!(
+            identifier_response
+                .hits
+                .iter()
+                .any(|hit| hit.requested_url == identifier.as_str())
+        );
+        assert!(identifier_response.hits.iter().any(|hit| {
+            hit.requested_url == identifier.as_str()
+                && hit
+                    .matched_phrases
+                    .contains(&vec!["pam".to_owned(), "max_logins".to_owned()])
+        }));
+
+        let quoted = store
+            .retrieve(RetrievalRequest::question("\"failed login\""))
+            .unwrap();
+        assert_eq!(quoted.hits.len(), 1);
+        assert_eq!(quoted.hits[0].requested_url, exact.as_str());
+        assert_eq!(
+            quoted.hits[0].matched_phrases,
+            [vec!["failed".to_owned(), "login".to_owned(),]]
+        );
+        assert_eq!(store.query("\"failed login\"").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn title_only_matches_are_insufficient_and_passage_cap_reports_partial() {
+        let temp = TempStore::new();
+        let store = PersistentIndex::create(temp.path()).unwrap();
+        let title_only = key("title-only");
+        upsert(
+            &store,
+            &title_only,
+            title_only.as_str(),
+            "unique setting",
+            "body contains unrelated content only",
+        );
+        let title_response = store
+            .retrieve(RetrievalRequest::question("unique setting"))
+            .unwrap();
+        assert_eq!(
+            title_response.status,
+            RetrievalStatus::InsufficientEvidence(InsufficientEvidenceReason::OnlyTitleMatches)
+        );
+        assert!(title_response.hits.is_empty());
+
+        for index in 0..33 {
+            let document = key(&format!("segment-{index}"));
+            upsert(
+                &store,
+                &document,
+                document.as_str(),
+                "Shared marker",
+                "body has unrelated content only",
+            );
+        }
+        let partial = store
+            .retrieve(RetrievalRequest::question("shared marker"))
+            .unwrap();
+        assert_eq!(partial.completeness, RetrievalCompleteness::Partial);
+        assert_eq!(
+            partial.status,
+            RetrievalStatus::InsufficientEvidence(InsufficientEvidenceReason::WorkBudgetReached)
+        );
+        assert!(partial.hits.is_empty());
+    }
+
+    #[test]
+    fn question_search_visits_all_small_segments_across_restart() {
+        let temp = TempStore::new();
+        let store = PersistentIndex::create(temp.path()).unwrap();
+        let target = key("page-39");
+        let question = "Where is qzvanta?";
+
+        for index in 0..40 {
+            let document = key(&format!("page-{index}"));
+            let body = if document == target {
+                "The qzvanta control is documented here."
+            } else {
+                "Routine indexed material for an unrelated page."
+            };
+            upsert(
+                &store,
+                &document,
+                document.as_str(),
+                &format!("Indexed page {index}"),
+                body,
+            );
+        }
+
+        let first = store
+            .retrieve(RetrievalRequest::question(question))
+            .unwrap();
+        assert_eq!(first.completeness, RetrievalCompleteness::Complete);
+        assert_eq!(first.status, RetrievalStatus::RetrievedText);
+        assert_eq!(first.hits.len(), 1);
+        assert_eq!(first.hits[0].requested_url, target.as_str());
+        let first_reference = first.hits[0].passage.reference.clone();
+
+        let unrelated = key("later-unrelated");
+        upsert(
+            &store,
+            &unrelated,
+            unrelated.as_str(),
+            "Unrelated page",
+            "Ordinary content without the queried term.",
+        );
+        drop(store);
+
+        let reopened = PersistentIndex::open(temp.path()).unwrap();
+        let after_restart = reopened
+            .retrieve(RetrievalRequest::question(question))
+            .unwrap();
+        assert_eq!(after_restart.completeness, RetrievalCompleteness::Complete);
+        assert_eq!(after_restart.status, RetrievalStatus::RetrievedText);
+        assert_eq!(after_restart.hits.len(), 1);
+        assert_eq!(after_restart.hits[0].requested_url, target.as_str());
+        assert_eq!(after_restart.hits[0].passage.reference, first_reference);
+    }
+
+    #[test]
+    fn evidence_reference_is_stable_across_restart_and_unrelated_generations() {
+        let temp = TempStore::new();
+        let store = PersistentIndex::create(temp.path()).unwrap();
+        let document = key("stable-ref");
+        let body = format!(
+            "{}Réglage café controls login sessions. End.",
+            "Préface café. ".repeat(900)
+        );
+        upsert(
+            &store,
+            &document,
+            "https://example.test/effective",
+            "Cafe",
+            &body,
+        );
+        let response = store
+            .retrieve(RetrievalRequest::question("\"café controls\""))
+            .unwrap();
+        assert_eq!(response.hits.len(), 1);
+        let hit = &response.hits[0];
+        let reference = hit.passage.reference.clone();
+        assert!(reference.start_byte > 0);
+        assert!(body.is_char_boundary(reference.end_byte as usize));
+        assert_eq!(
+            body.get(reference.start_byte as usize..reference.end_byte as usize),
+            Some(hit.passage.text.as_str())
+        );
+
+        let before = store.read_view().unwrap();
+        upsert(
+            &store,
+            &document,
+            "https://example.test/effective-after-redirect",
+            "Cafe",
+            &body,
+        );
+        let other = key("unrelated");
+        upsert(
+            &store,
+            &other,
+            other.as_str(),
+            "Other",
+            "unrelated storage generation",
+        );
+        assert!(store.resolve_evidence(&reference).is_ok());
+        let reopened = PersistentIndex::open(temp.path()).unwrap();
+        let resolved = reopened.resolve_evidence(&reference).unwrap();
+        assert_eq!(resolved.text, hit.passage.text);
+        assert_eq!(resolved.requested_url, document.as_str());
+        assert_eq!(
+            resolved.effective_url,
+            "https://example.test/effective-after-redirect"
+        );
+        assert_eq!(before.generation_id(), response.generation_id);
+        assert_ne!(
+            reopened.read_view().unwrap().generation_id(),
+            response.generation_id
+        );
+    }
+
+    #[test]
+    fn evidence_offsets_are_utf8_body_bytes_and_reject_mid_scalar_ranges() {
+        let temp = TempStore::new();
+        let store = PersistentIndex::create(temp.path()).unwrap();
+        let document = key("utf8-offsets");
+        let body = format!(
+            "{} café controls after this prefix",
+            "padding ".repeat(1200)
+        );
+        let target = body.find("café").unwrap();
+        upsert(&store, &document, document.as_str(), "Unicode", &body);
+        let hit = store
+            .retrieve(RetrievalRequest::question("\"café controls\""))
+            .unwrap()
+            .hits
+            .remove(0);
+        let reference = hit.passage.reference.clone();
+        assert!(reference.start_byte > 0);
+        assert!(reference.start_byte as usize <= target);
+        assert!(reference.end_byte as usize >= target + "café controls".len());
+        assert!(body.is_char_boundary(reference.start_byte as usize));
+        assert!(body.is_char_boundary(reference.end_byte as usize));
+        assert_eq!(
+            body.get(reference.start_byte as usize..reference.end_byte as usize),
+            Some(hit.passage.text.as_str())
+        );
+
+        let invalid_boundary = EvidenceReference::new(
+            store.store_id,
+            document.to_string(),
+            reference.content_version,
+            target + 3,
+            target + 4,
+        )
+        .unwrap();
+        assert_eq!(
+            store.resolve_evidence(&invalid_boundary),
+            Err(EvidenceResolveError::NotUtf8Boundary)
+        );
+    }
+
+    #[test]
+    fn evidence_resolver_rejects_forged_subranges_and_oversized_windows() {
+        let temp = TempStore::new();
+        let store = PersistentIndex::create(temp.path()).unwrap();
+        let document = key("canonical-window");
+        let body = "alpha ".repeat(1600);
+        upsert(&store, &document, document.as_str(), "Long body", &body);
+        let reference = store
+            .retrieve(RetrievalRequest::question("alpha"))
+            .unwrap()
+            .hits[0]
+            .passage
+            .reference
+            .clone();
+
+        let resolved = store.resolve_evidence(&reference).unwrap();
+        assert_eq!(resolved.text.len(), crate::retrieval::MAX_PASSAGE_BYTES);
+
+        let forged_subrange = EvidenceReference::new(
+            store.store_id,
+            document.to_string(),
+            reference.content_version,
+            1,
+            4,
+        )
+        .unwrap();
+        assert_eq!(
+            store.resolve_evidence(&forged_subrange),
+            Err(EvidenceResolveError::InvalidPassageWindow)
+        );
+
+        let forged_oversized = EvidenceReference::new(
+            store.store_id,
+            document.to_string(),
+            reference.content_version,
+            0,
+            body.len(),
+        )
+        .unwrap();
+        assert_eq!(
+            store.resolve_evidence(&forged_oversized),
+            Err(EvidenceResolveError::InvalidPassageWindow)
+        );
+
+        let descriptor = current_manifest(temp.path()).segments[0].clone();
+        let path = temp.path().join(segment_name(descriptor.id));
+        let mut bytes = fs::read(&path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 1;
+        fs::write(&path, bytes).unwrap();
+        assert_eq!(
+            store.resolve_evidence(&forged_oversized),
+            Err(EvidenceResolveError::InvalidPassageWindow)
+        );
+    }
+
+    #[test]
+    fn evidence_resolver_rejects_wrong_store_superseded_and_out_of_bounds_references() {
+        let temp = TempStore::new();
+        let store = PersistentIndex::create(temp.path()).unwrap();
+        let document = key("reference-errors");
+        upsert(
+            &store,
+            &document,
+            document.as_str(),
+            "Reference",
+            "current evidence text",
+        );
+        let response = store
+            .retrieve(RetrievalRequest::question("current evidence"))
+            .unwrap();
+        let reference = response.hits[0].passage.reference.clone();
+
+        let other_temp = TempStore::new();
+        let other = PersistentIndex::create(other_temp.path()).unwrap();
+        assert_eq!(
+            other.resolve_evidence(&reference),
+            Err(EvidenceResolveError::WrongStore)
+        );
+        let out_of_bounds = EvidenceReference::new(
+            store.store_id,
+            reference.requested_url.clone(),
+            reference.content_version,
+            9000,
+            9001,
+        )
+        .unwrap();
+        assert_eq!(
+            store.resolve_evidence(&out_of_bounds),
+            Err(EvidenceResolveError::OutOfBounds)
+        );
+
+        upsert(
+            &store,
+            &document,
+            document.as_str(),
+            "Updated reference",
+            "superseding content version",
+        );
+        assert_eq!(
+            store.resolve_evidence(&reference),
+            Err(EvidenceResolveError::VersionSuperseded)
+        );
+    }
+
+    #[test]
+    fn question_retrieval_and_reference_resolution_fail_closed_on_segment_corruption() {
+        let temp = TempStore::new();
+        let store = PersistentIndex::create(temp.path()).unwrap();
+        let document = key("corrupt-evidence");
+        upsert(
+            &store,
+            &document,
+            document.as_str(),
+            "Evidence",
+            "corruption evidence marker",
+        );
+        let reference = store
+            .retrieve(RetrievalRequest::question("evidence marker"))
+            .unwrap()
+            .hits[0]
+            .passage
+            .reference
+            .clone();
+        let descriptor = current_manifest(temp.path()).segments[0].clone();
+        let path = temp.path().join(segment_name(descriptor.id));
+        let mut bytes = fs::read(&path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 1;
+        fs::write(&path, bytes).unwrap();
+
+        assert!(matches!(
+            store.retrieve(RetrievalRequest::question("evidence marker")),
+            Err(RetrievalError::CorruptStorage)
+        ));
+        assert_eq!(
+            store.resolve_evidence(&reference),
+            Err(EvidenceResolveError::CorruptStorage)
+        );
+    }
+
+    #[test]
+    fn evidence_resolution_rechecks_tombstone_revocation_and_readmission() {
+        let temp = TempStore::new();
+        let store = PersistentIndex::create(temp.path()).unwrap();
+        let tombstoned = key("reference-tombstone");
+        let revoked = key("reference-revocation");
+        upsert(
+            &store,
+            &tombstoned,
+            tombstoned.as_str(),
+            "Tombstone",
+            "tombstone evidence marker",
+        );
+        upsert(
+            &store,
+            &revoked,
+            revoked.as_str(),
+            "Revocation",
+            "revocation evidence marker",
+        );
+        let stale_view = store.read_view().unwrap();
+        let tombstone_reference = store
+            .retrieve(RetrievalRequest::question("tombstone evidence"))
+            .unwrap()
+            .hits
+            .into_iter()
+            .find(|hit| hit.requested_url == tombstoned.as_str())
+            .unwrap()
+            .passage
+            .reference;
+        let revoke_reference = store
+            .retrieve(RetrievalRequest::question("revocation evidence"))
+            .unwrap()
+            .hits
+            .into_iter()
+            .find(|hit| hit.requested_url == revoked.as_str())
+            .unwrap()
+            .passage
+            .reference;
+
+        let tombstone = store.issue_fence(&tombstoned).unwrap();
+        store.apply(&tombstone, Intent::Tombstone).unwrap();
+        assert!(stale_view.document(&tombstoned).is_some());
+        assert_eq!(
+            store.resolve_evidence(&tombstone_reference),
+            Err(EvidenceResolveError::NotLive)
+        );
+
+        let revoke = store.issue_fence(&revoked).unwrap();
+        store.apply(&revoke, Intent::Revoke).unwrap();
+        assert!(stale_view.document(&revoked).is_some());
+        assert_eq!(
+            store.resolve_evidence(&revoke_reference),
+            Err(EvidenceResolveError::Revoked)
+        );
+        let readmit = store.issue_fence(&revoked).unwrap();
+        store.apply(&readmit, Intent::Readmit).unwrap();
+        assert_eq!(
+            store.resolve_evidence(&revoke_reference),
+            Err(EvidenceResolveError::NotLive)
+        );
+        let restore = store.issue_fence(&revoked).unwrap();
+        store
+            .apply(
+                &restore,
+                Intent::Upsert {
+                    effective_url: revoked.as_str().to_owned(),
+                    title: "Revocation".to_owned(),
+                    body: "revocation evidence marker".to_owned(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store.resolve_evidence(&revoke_reference).unwrap().text,
+            "revocation evidence marker"
+        );
+    }
+
+    #[test]
+    fn evidence_resolution_checks_collection_expiry_before_and_after_loading_text() {
+        let temp = TempStore::new();
+        let store = PersistentIndex::create(temp.path()).unwrap();
+        let current = system_time_ms().unwrap();
+        let deadline = current + 60_000;
+        let notice = b"owned test collection notice";
+        store
+            .install_public_collection_gate(
+                &public_gate(notice, current, deadline),
+                notice,
+                current,
+            )
+            .unwrap();
+        let document = key("expiring-reference");
+        upsert(
+            &store,
+            &document,
+            document.as_str(),
+            "Expiring evidence",
+            "collection expiry evidence marker",
+        );
+        let reference = store
+            .retrieve(RetrievalRequest::question("expiry evidence"))
+            .unwrap()
+            .hits[0]
+            .passage
+            .reference
+            .clone();
+
+        assert_eq!(
+            store.resolve_evidence_with_clock(&reference, || Ok(deadline)),
+            Err(EvidenceResolveError::PublicCollectionExpired)
+        );
+        let mut times = [deadline - 1, deadline].into_iter();
+        assert_eq!(
+            store.resolve_evidence_with_clock(&reference, || Ok(times.next().unwrap())),
+            Err(EvidenceResolveError::PublicCollectionExpired)
+        );
+    }
+
+    #[test]
+    fn question_sampling_and_response_sizes_have_explicit_caps() {
+        let seed = [0x5a; 32];
+        let mut descriptors = (1..=40)
+            .map(|id| SegmentDescriptor {
+                id,
+                byte_len: 1024,
+                sha256: [0; 32],
+                document_count: 1,
+                term_count: 1,
+                posting_count: 1,
+                position_count: 1,
+            })
+            .collect::<Vec<_>>();
+        descriptors.push(SegmentDescriptor {
+            id: 41,
+            byte_len: MAX_SEGMENT_BYTES as u64,
+            sha256: [0; 32],
+            document_count: 1,
+            term_count: 1,
+            posting_count: 1,
+            position_count: MAX_POSITION_VALUES,
+        });
+        let (selected, partial) = select_question_segments(&descriptors, &seed).unwrap();
+        assert!(partial);
+        assert_eq!(selected.len(), 40);
+        let total_bytes = selected.iter().map(|item| item.byte_len).sum::<u64>();
+        let total_estimate = selected
+            .iter()
+            .map(|item| segment_memory_estimate(item).unwrap())
+            .sum::<u64>();
+        assert!(total_bytes <= MAX_QUESTION_SEGMENT_BYTES);
+        assert!(total_estimate <= MAX_QUESTION_SEGMENT_MEMORY_ESTIMATE);
+
+        let records = (0..10_000u32)
+            .map(|ordinal| {
+                (
+                    ordinal,
+                    Posting {
+                        title_positions: Vec::new(),
+                        body_positions: vec![0],
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let (sampled, probes) = sample_question_postings(&records, 10_000, &seed, 8);
+        assert_eq!(probes, 8);
+        assert!(sampled.len() <= 8);
+        assert!(sampled.iter().all(|ordinal| records.contains_key(ordinal)));
+
+        let oversized = RetrievalResponse {
+            contract_version: crate::retrieval::RETRIEVAL_CONTRACT_VERSION,
+            mode: RetrievalMode::Question,
+            generation_id: 1,
+            status: RetrievalStatus::RetrievedText,
+            completeness: RetrievalCompleteness::Complete,
+            normalized_terms: vec!["evidence".to_owned()],
+            hits: vec![EvidenceHit {
+                requested_url: "https://example.test/large".to_owned(),
+                effective_url: "https://example.test/large".to_owned(),
+                title: "Large".to_owned(),
+                score: 1.0,
+                matched_terms: vec!["evidence".to_owned()],
+                matched_phrases: Vec::new(),
+                passage: EvidencePassage {
+                    reference: EvidenceReference::new(
+                        [1; 16],
+                        "https://example.test/large".to_owned(),
+                        [2; 32],
+                        0,
+                        1,
+                    )
+                    .unwrap(),
+                    text: "x".repeat(MAX_RESPONSE_BYTES),
+                },
+            }],
+            answer_assessment: AnswerAssessment::NotAssessed,
+        };
+        assert_eq!(
+            ensure_response_bound(&oversized),
+            Err(RetrievalError::ResponseTooLarge)
+        );
     }
 
     #[test]

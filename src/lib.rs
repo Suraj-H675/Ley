@@ -8,6 +8,7 @@ pub mod index;
 mod page_policy;
 pub mod public_policy;
 mod query;
+pub mod retrieval;
 mod robots;
 mod safe_fetch;
 pub mod storage;
@@ -22,6 +23,11 @@ mod gate7_benchmark;
 pub use demo::{
     DemoError, DemoOutput, DemoStats, create_search_fixture_index, run_controlled_fixture_demo,
     run_controlled_fixture_demo_retained, run_demo, run_demo_with_options,
+};
+pub use retrieval::{
+    AnswerAssessment, EvidenceHit, EvidencePassage, EvidenceReference, EvidenceResolveError,
+    InsufficientEvidenceReason, QuestionRequest, ResolvedEvidence, RetrievalCompleteness,
+    RetrievalError, RetrievalMode, RetrievalRequest, RetrievalResponse, RetrievalStatus,
 };
 
 #[derive(Debug, Eq, PartialEq)]
