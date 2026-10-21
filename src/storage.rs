@@ -43,6 +43,9 @@ const LOCK_NAME: &str = "LOCK";
 const CURRENT_NAME: &str = "CURRENT";
 const PUBLIC_COLLECTION_NAME: &str = "PUBLIC_COLLECTION";
 const PUBLIC_NOTICE_NAME: &str = "rust-stdlib-documentation-MIT.txt";
+const MANAGED_RESERVATION_NAME: &str = ".LOCAL_COLLECTION_RESERVATION";
+const MANAGED_RESERVATION_TEMP_NAME: &str = ".LOCAL_COLLECTION_RESERVATION.tmp";
+const MANAGED_OWNER_STATE_NAME: &str = "LOCAL_COLLECTION";
 const MAX_PUBLIC_COLLECTION_BYTES: usize = 16 * 1024;
 const MAX_PUBLIC_NOTICE_BYTES: usize = 16 * 1024;
 const STORE_MAGIC: &[u8; 8] = b"LEYSTOR3";
@@ -203,6 +206,49 @@ impl From<QueryError> for StorageError {
     }
 }
 
+#[derive(Debug)]
+pub(crate) enum ManagedStorageError {
+    Storage(StorageError),
+    Reserved,
+    Conflict,
+}
+
+impl fmt::Display for ManagedStorageError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Storage(error) => write!(f, "{error}"),
+            Self::Reserved => {
+                f.write_str("store is reserved by a pending managed local collection sync")
+            }
+            Self::Conflict => {
+                f.write_str("managed local collection store state changed; sync is blocked")
+            }
+        }
+    }
+}
+
+impl From<StorageError> for ManagedStorageError {
+    fn from(error: StorageError) -> Self {
+        Self::Storage(error)
+    }
+}
+
+impl From<io::Error> for ManagedStorageError {
+    fn from(error: io::Error) -> Self {
+        Self::Storage(StorageError::Io(error))
+    }
+}
+
+impl From<QueryError> for ManagedStorageError {
+    fn from(error: QueryError) -> Self {
+        Self::Storage(StorageError::Query(error))
+    }
+}
+
+fn managed_write_blocked(detail: &'static str) -> StorageError {
+    StorageError::Io(io::Error::new(io::ErrorKind::WouldBlock, detail))
+}
+
 #[derive(Clone, Debug)]
 pub struct FenceLease {
     store_id: StoreId,
@@ -231,6 +277,59 @@ pub(crate) struct ReadOnlyIndexInspection {
     pub generation_id: u64,
     pub live_document_keys: BTreeSet<String>,
     _lock: FileLock,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ManagedReservation {
+    pub sync_id: String,
+    pub base_generation: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ManagedControlSnapshot {
+    pub high_water: u64,
+    pub terminal_fence: Option<u64>,
+    pub terminal_version: Option<String>,
+    pub terminal_tombstone: bool,
+    pub revoked: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct ManagedStoreSnapshot {
+    pub store_id: [u8; 16],
+    pub generation_id: u64,
+    pub segment_count: usize,
+    pub analyzer_id: String,
+    pub html_schema_id: String,
+    pub documents: BTreeMap<String, crate::index::IndexedDocument>,
+    pub controls: BTreeMap<String, ManagedControlSnapshot>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ManagedExpectedState {
+    pub high_water: u64,
+    pub terminal_fence: Option<u64>,
+    pub terminal_version: Option<String>,
+    pub terminal_tombstone: bool,
+    pub live_version: Option<String>,
+    pub revoked: bool,
+}
+
+pub(crate) enum ManagedBatchIntent {
+    Upsert {
+        effective_url: String,
+        title: String,
+        body: String,
+    },
+    Tombstone,
+}
+
+pub(crate) struct ManagedBatchAction {
+    pub key: UrlKey,
+    pub expected: ManagedExpectedState,
+    pub intent: ManagedBatchIntent,
 }
 
 struct SegmentedSnapshot {
@@ -441,6 +540,329 @@ impl PersistentIndex {
         self.store_id
     }
 
+    pub(crate) fn publish_managed_collection(
+        &self,
+        destination: impl AsRef<Path>,
+    ) -> Result<(), ManagedStorageError> {
+        let destination = destination.as_ref();
+        let owner_state = fs::symlink_metadata(self.path.join(MANAGED_OWNER_STATE_NAME))?;
+        if !owner_state.file_type().is_file() {
+            return Err(ManagedStorageError::Conflict);
+        }
+        let source_parent = fs::canonicalize(
+            self.path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or(Path::new(".")),
+        )?;
+        let destination_parent = fs::canonicalize(
+            destination
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or(Path::new(".")),
+        )?;
+        if source_parent != destination_parent {
+            return Err(ManagedStorageError::Conflict);
+        }
+        storage_failpoint("managed_init_before_publish");
+        rename_directory_noreplace(&self.path, destination)?;
+        sync_directory(&destination_parent)?;
+        Ok(())
+    }
+
+    pub(crate) fn managed_snapshot(&self) -> Result<ManagedStoreSnapshot, ManagedStorageError> {
+        let _lock = self.lock_shared()?;
+        let snapshot = self.load_snapshot_locked()?;
+        let mut controls = BTreeMap::new();
+        for (key, control) in &snapshot.manifest.controls {
+            let (terminal_fence, terminal_version, terminal_tombstone) =
+                match control.terminal.last_key_value() {
+                    Some((fence, TerminalRecord::Upsert(version))) => {
+                        (Some(*fence), Some(hex_lowercase(version)), false)
+                    }
+                    Some((fence, TerminalRecord::Tombstone)) => (Some(*fence), None, true),
+                    None => (None, None, false),
+                };
+            controls.insert(
+                key.clone(),
+                ManagedControlSnapshot {
+                    high_water: control.high_water,
+                    terminal_fence,
+                    terminal_version,
+                    terminal_tombstone,
+                    revoked: manifest_is_revoked(control),
+                },
+            );
+        }
+        Ok(ManagedStoreSnapshot {
+            store_id: self.store_id,
+            generation_id: snapshot.manifest.generation_id,
+            segment_count: snapshot.manifest.segments.len(),
+            analyzer_id: snapshot.manifest.analyzer_id,
+            html_schema_id: snapshot.manifest.html_schema_id,
+            documents: snapshot.documents,
+            controls,
+        })
+    }
+
+    pub(crate) fn managed_reservation(
+        &self,
+    ) -> Result<Option<ManagedReservation>, ManagedStorageError> {
+        let _lock = self.lock_shared()?;
+        Ok(self.read_managed_reservation_locked()?)
+    }
+
+    pub(crate) fn managed_install_reservation(
+        &self,
+        reservation: &ManagedReservation,
+    ) -> Result<(), ManagedStorageError> {
+        validate_managed_reservation(reservation)?;
+        let _writer = self
+            .writer
+            .lock()
+            .map_err(|_| StorageError::CorruptCommitted("writer mutex was poisoned".to_owned()))?;
+        let _lock = self.lock_exclusive()?;
+        if self.read_managed_reservation_locked()?.is_some() {
+            return Err(ManagedStorageError::Reserved);
+        }
+        if self.load_public_collection_locked()?.is_some() {
+            return Err(ManagedStorageError::Conflict);
+        }
+        let current = self.load_manifest_locked()?;
+        if current.generation_id != reservation.base_generation {
+            return Err(ManagedStorageError::Conflict);
+        }
+        let bytes = serde_json::to_vec(reservation)
+            .map_err(|_| corrupt("managed reservation could not be encoded"))?;
+        write_private_file_atomically(
+            &self.path.join(MANAGED_RESERVATION_NAME),
+            &self.path.join(MANAGED_RESERVATION_TEMP_NAME),
+            &bytes,
+        )?;
+        storage_failpoint("managed_reservation_installed");
+        Ok(())
+    }
+
+    pub(crate) fn managed_clear_reservation(
+        &self,
+        expected: &ManagedReservation,
+    ) -> Result<(), ManagedStorageError> {
+        validate_managed_reservation(expected)?;
+        let _writer = self
+            .writer
+            .lock()
+            .map_err(|_| StorageError::CorruptCommitted("writer mutex was poisoned".to_owned()))?;
+        let _lock = self.lock_exclusive()?;
+        if self.read_managed_reservation_locked()?.as_ref() != Some(expected) {
+            return Err(ManagedStorageError::Conflict);
+        }
+        fs::remove_file(self.path.join(MANAGED_RESERVATION_NAME))?;
+        sync_directory(&self.path)?;
+        Ok(())
+    }
+
+    pub(crate) fn managed_batch(
+        &self,
+        reservation: &ManagedReservation,
+        actions: Vec<ManagedBatchAction>,
+    ) -> Result<(u64, BTreeMap<String, u64>), ManagedStorageError> {
+        validate_managed_reservation(reservation)?;
+        if actions.is_empty() {
+            return Err(ManagedStorageError::Conflict);
+        }
+        let _writer = self
+            .writer
+            .lock()
+            .map_err(|_| StorageError::CorruptCommitted("writer mutex was poisoned".to_owned()))?;
+        let _lock = self.lock_exclusive()?;
+        if self.read_managed_reservation_locked()?.as_ref() != Some(reservation) {
+            return Err(ManagedStorageError::Conflict);
+        }
+        if self.load_public_collection_locked()?.is_some() {
+            return Err(ManagedStorageError::Conflict);
+        }
+        let current_snapshot = self.load_snapshot_locked()?;
+        let current = &current_snapshot.manifest;
+        if current.generation_id != reservation.base_generation {
+            return Err(ManagedStorageError::Conflict);
+        }
+
+        let mut next = next_manifest(current)?;
+        let mut seen = BTreeSet::new();
+        let mut prepared = Vec::with_capacity(actions.len());
+        let mut target_fences = BTreeMap::new();
+        for action in actions {
+            let key_text = action.key.as_str().to_owned();
+            if !seen.insert(key_text.clone()) {
+                return Err(ManagedStorageError::Conflict);
+            }
+            let control = current.controls.get(&key_text);
+            let (terminal_fence, terminal_version, terminal_tombstone, high_water, revoked) =
+                match control {
+                    Some(control) => match control.terminal.last_key_value() {
+                        Some((fence, TerminalRecord::Upsert(version))) => (
+                            Some(*fence),
+                            Some(hex_lowercase(version)),
+                            false,
+                            control.high_water,
+                            manifest_is_revoked(control),
+                        ),
+                        Some((fence, TerminalRecord::Tombstone)) => (
+                            Some(*fence),
+                            None,
+                            true,
+                            control.high_water,
+                            manifest_is_revoked(control),
+                        ),
+                        None => (
+                            None,
+                            None,
+                            false,
+                            control.high_water,
+                            manifest_is_revoked(control),
+                        ),
+                    },
+                    None => (None, None, false, 0, false),
+                };
+            let live = current_snapshot.documents.get(&key_text);
+            let live_version = live.map(|document| document.version_id.clone());
+            let actual = ManagedExpectedState {
+                high_water,
+                terminal_fence,
+                terminal_version,
+                terminal_tombstone,
+                live_version,
+                revoked,
+            };
+            if actual != action.expected || revoked {
+                if revoked {
+                    return Err(StorageError::Revoked.into());
+                }
+                return Err(ManagedStorageError::Conflict);
+            }
+            let fence = high_water
+                .checked_add(1)
+                .ok_or(StorageError::CapacityExceeded("u64 fence exhausted"))?;
+            target_fences.insert(key_text.clone(), fence);
+            let mut control = control.cloned().unwrap_or_default();
+            control.high_water = fence;
+            match action.intent {
+                ManagedBatchIntent::Upsert {
+                    effective_url,
+                    title,
+                    body,
+                } => {
+                    if effective_url.is_empty() || effective_url.len() > MAX_EFFECTIVE_URL_BYTES {
+                        return Err(
+                            StorageError::CapacityExceeded("effective URL byte limit").into()
+                        );
+                    }
+                    UrlKey::parse(&effective_url)
+                        .map_err(|error| StorageError::UrlKey(error.to_string()))?;
+                    let mut prepared_index = InMemoryIndex::new();
+                    prepared_index.upsert_fields(key_text.clone(), effective_url, title, body)?;
+                    let document = prepared_index
+                        .documents()
+                        .get(&key_text)
+                        .cloned()
+                        .ok_or_else(|| corrupt("managed upsert document disappeared"))?;
+                    let version = decode_version_id(&document.version_id)?;
+                    if let Some(previous) = current_snapshot.documents.get(&key_text) {
+                        remove_document_statistics(&mut next.statistics, previous)?;
+                    }
+                    add_document_statistics(&mut next.statistics, &document)?;
+                    control
+                        .terminal
+                        .insert(fence, TerminalRecord::Upsert(version));
+                    prepared.push((key_text, control, Some(document)));
+                }
+                ManagedBatchIntent::Tombstone => {
+                    let Some(previous) = current_snapshot.documents.get(&key_text) else {
+                        return Err(ManagedStorageError::Conflict);
+                    };
+                    remove_document_statistics(&mut next.statistics, previous)?;
+                    control.terminal.insert(fence, TerminalRecord::Tombstone);
+                    prepared.push((key_text, control, None));
+                }
+            }
+        }
+
+        let mut segment = None;
+        let mut documents = prepared
+            .iter()
+            .filter_map(|(_, _, document)| document.clone())
+            .collect::<Vec<_>>();
+        if !documents.is_empty() {
+            documents.sort_by(|left, right| left.id.cmp(&right.id));
+            let segment_id = next.next_segment_id;
+            next.next_segment_id = segment_id
+                .checked_add(1)
+                .ok_or(StorageError::CapacityExceeded("segment id exhausted"))?;
+            let new_segment = Segment::from_documents(segment_id, documents)?;
+            for (ordinal, document) in new_segment.documents.iter().enumerate() {
+                next.live.insert(
+                    document.id.clone(),
+                    manifest::LiveReference {
+                        segment_id,
+                        ordinal: u32::try_from(ordinal)
+                            .map_err(|_| StorageError::CapacityExceeded("segment ordinal"))?,
+                        version: decode_version_id(&document.version_id)?,
+                    },
+                );
+            }
+            next.segments.push(new_segment.descriptor.clone());
+            next.segments.sort_by_key(|descriptor| descriptor.id);
+            segment = Some(new_segment);
+        }
+        for (key, control, document) in prepared {
+            if document.is_none() {
+                next.live.remove(&key);
+            }
+            next.controls.insert(key, control);
+        }
+        validate_proposed_manifest_shape(&next, self.store_id)?;
+        storage_failpoint("managed_batch_before_publish");
+        self.publish_manifest_locked(&next, segment.as_ref())?;
+        storage_failpoint("managed_batch_after_publish");
+        Ok((next.generation_id, target_fences))
+    }
+
+    fn read_managed_reservation_locked(&self) -> Result<Option<ManagedReservation>, StorageError> {
+        let path = self.path.join(MANAGED_RESERVATION_NAME);
+        let bytes = match read_bounded_file(&path, 4096) {
+            Ok(bytes) => bytes,
+            Err(StorageError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let reservation: ManagedReservation = serde_json::from_slice(&bytes)
+            .map_err(|_| corrupt("managed collection reservation is malformed"))?;
+        validate_managed_reservation(&reservation)
+            .map_err(|_| corrupt("managed collection reservation is malformed"))?;
+        Ok(Some(reservation))
+    }
+
+    fn ensure_no_managed_reservation_locked(&self) -> Result<(), StorageError> {
+        match self.read_managed_reservation_locked() {
+            Ok(None) => Ok(()),
+            Ok(Some(_)) => Err(managed_write_blocked(
+                "store is reserved by a pending managed local collection sync",
+            )),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn ensure_not_managed_collection_locked(&self) -> Result<(), StorageError> {
+        match fs::symlink_metadata(self.path.join(MANAGED_OWNER_STATE_NAME)) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Ok(_) => Err(managed_write_blocked(
+                "store is bound to a managed local collection; use its sync command",
+            )),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Inspect committed index metadata without exposing mutation operations or
     /// opening the store's lock file for writing.
     pub(crate) fn inspect_read_only(
@@ -536,6 +958,7 @@ impl PersistentIndex {
             .lock()
             .map_err(|_| StorageError::CorruptCommitted("writer mutex was poisoned".to_owned()))?;
         let _lock = self.lock_exclusive()?;
+        self.ensure_no_managed_reservation_locked()?;
         let current_snapshot = self.load_snapshot_locked()?;
         let current = &current_snapshot.manifest;
         let mut next = next_manifest(current)?;
@@ -563,6 +986,7 @@ impl PersistentIndex {
             .lock()
             .map_err(|_| StorageError::CorruptCommitted("writer mutex was poisoned".to_owned()))?;
         let _lock = self.lock_exclusive()?;
+        self.ensure_no_managed_reservation_locked()?;
         let current = self.load_manifest_locked()?;
         let Some(control) = current.controls.get(lease.key.as_str()) else {
             return Err(StorageError::InvalidLease);
@@ -607,6 +1031,7 @@ impl PersistentIndex {
             .lock()
             .map_err(|_| StorageError::CorruptCommitted("writer mutex was poisoned".to_owned()))?;
         let _lock = self.lock_exclusive()?;
+        self.ensure_no_managed_reservation_locked()?;
         let current_snapshot = self.load_snapshot_locked()?;
         let current = &current_snapshot.manifest;
         let mut next = next_manifest(current)?;
@@ -734,6 +1159,7 @@ impl PersistentIndex {
             .lock()
             .map_err(|_| StorageError::CorruptCommitted("writer mutex was poisoned".to_owned()))?;
         let _lock = self.lock_exclusive()?;
+        self.ensure_no_managed_reservation_locked()?;
         let snapshot = self.load_snapshot_locked()?;
         let current = &snapshot.manifest;
         let old_segments = current
@@ -984,6 +1410,8 @@ impl PersistentIndex {
             .lock()
             .map_err(|_| StorageError::CorruptCommitted("writer mutex was poisoned".to_owned()))?;
         let _lock = self.lock_exclusive()?;
+        self.ensure_no_managed_reservation_locked()?;
+        self.ensure_not_managed_collection_locked()?;
         let current = self.load_manifest_locked()?;
         if let Some(existing) = self.load_public_collection_locked()? {
             if !existing.same_admission(gate) {
@@ -4384,6 +4812,16 @@ fn decode_version_id(value: &str) -> Result<VersionId, StorageError> {
     Ok(version)
 }
 
+fn hex_lowercase(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
 fn hex_nibble(byte: u8) -> Result<u8, StorageError> {
     match byte {
         b'0'..=b'9' => Ok(byte - b'0'),
@@ -4534,6 +4972,21 @@ impl<'a> Reader<'a> {
 
 fn corrupt(message: &str) -> StorageError {
     StorageError::CorruptCommitted(message.to_owned())
+}
+
+fn validate_managed_reservation(
+    reservation: &ManagedReservation,
+) -> Result<(), ManagedStorageError> {
+    if reservation.base_generation == 0
+        || reservation.sync_id.len() != 32
+        || !reservation
+            .sync_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(ManagedStorageError::Conflict);
+    }
+    Ok(())
 }
 
 fn validate_store_directory(path: &Path) -> Result<(), StorageError> {

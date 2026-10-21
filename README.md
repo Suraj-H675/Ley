@@ -162,6 +162,25 @@ cargo run --locked -- retrieve --store "$DEMO_DIR/index" \
 
 `ingest-html` only reads an operator-selected local directory. It does not fetch URLs, crawl links, change source licenses, or certify that the supplied material is rights-cleared. The caller is responsible for those rights. Ley recursively accepts UTF-8 `.html` and `.htm` files, skips pages marked `noindex`, ignores other regular file types, and rejects symbolic links and special files. Limits are 4,096 directory entries, 128 HTML files, 2 MiB per file, and 32 MiB across the collection. Relative paths map deterministically to escaped URL paths below the required HTTP(S) directory prefix. Those URLs are document identity labels: requested and effective URL are the same because no network redirect was followed. The destination must be new, have an existing parent, and be outside the source directory. Extraction and validation finish before store creation; a storage failure can leave a partial new destination for the operator to inspect.
 
+#### Keep a local HTML collection in sync
+
+Use a managed collection when you want to repeat the import after files change. The source must contain material you have the right to store and index.
+
+```sh
+SOURCE_DIR=/path/to/rights-cleared/html
+STORE_PARENT="$(mktemp -d)"
+STORE="$STORE_PARENT/index"
+cargo run --locked -- local-collection init \
+  --store "$STORE" --directory "$SOURCE_DIR" \
+  --url-prefix 'https://docs.example.invalid/team/'
+cargo run --locked -- local-collection sync \
+  --store "$STORE" --directory "$SOURCE_DIR" \
+  --url-prefix 'https://docs.example.invalid/team/'
+cargo run --locked -- local-collection status --store "$STORE"
+```
+
+`sync` records added, changed, removed, `noindex`, and unchanged pages. `status` shows the collection and source paths in the CLI. It does not expose those local paths through the search API or browser. The HTTP(S) prefix supplies document identities only. Ley makes no network requests for these URLs. Keep the source directory at its original canonical path and keep the prefix unchanged. `init` requires a new store path and creates one collection for that store; it cannot adopt an existing unmanaged index. The scan allows at most 4,096 filesystem entries and 128 HTML files at once, with a 2 MiB per-file limit and a 32 MiB aggregate HTML limit. The owner record retains up to 4,096 distinct source paths or 2 MiB of metadata, whichever limit is reached first. Other regular files such as CSS and README files are ignored; symbolic links and special files fail the scan. Syncs that add or change indexed pages append an index segment. Use the existing `compact --store "$STORE"` command when aggregate segment limits warrant it. Compaction preserves lifecycle history and does not free owner path records.
+
 The Rust response is a versioned typed serde value. For example, retrieval uses `POST /api/v1/retrieve` with `Content-Type: application/json`, `Accept: application/json`, and a same-origin `Origin` header:
 
 ```json

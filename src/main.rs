@@ -97,6 +97,18 @@ fn main() -> ExitCode {
     if command == "ingest-html" {
         return run_ingest_html(args);
     }
+    if command == "local-collection" {
+        return match ley::run_managed_local_collection_cli(args.collect()) {
+            Ok(output) => {
+                print!("{output}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("ley: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     if command == "retrieve" {
         return run_retrieve(args);
     }
@@ -613,6 +625,9 @@ fn read_evidence_reference(path: &str) -> Result<EvidenceReference, ley::api::Cl
 fn print_usage() {
     println!(
         "Ley Search Engine\n\nUsage:\n  cargo run --locked -- demo [--query EXPR] [--explain]\n  cargo run --locked -- controlled-demo [--retain-dir NEW_PATH]\n  cargo run --locked -- fixture-index --store PATH\n  cargo run --locked -- ingest-html --store NEW_PATH --directory DIR --url-prefix URL\n  cargo run --locked -- retrieve --store PATH --question TEXT [--max-hits 1..8]\n  cargo run --locked -- resolve-evidence --store PATH --reference-file PATH|-\n  cargo run --locked -- search --store PATH --query EXPR\n  cargo run --locked -- serve --store PATH [--bind 127.0.0.1:7331]\n  cargo run --locked -- compact --store PATH\n  cargo run --locked -- reindex-gate3 --source OLD --destination NEW\n  cargo run --locked -- revoke-source --store PATH --frontier PATH --source-id ID\n  cargo run --locked -- crawl-public --policy PATH --store PATH --frontier PATH --requests 1..12 --approved-policy-sha256 HASH --allow-public-requests\n\nThe controlled demo uses an owned loopback fixture; --retain-dir keeps its persistent index and frontier under a new directory. fixture-index creates authored synthetic documents without network access. ingest-html reads bounded UTF-8 HTML from an operator-selected local directory into a new store and does not fetch URLs. retrieve runs the versioned ordinary-question contract and prints typed passage candidates; resolve-evidence reads a bounded JSON reference from a file or stdin and revalidates it against the current store. search remains the advanced Boolean/phrase DSL. serve binds to loopback and exposes read-only health, legacy search, question retrieval, and evidence resolution routes. Typed routes use POST /api/v1/retrieve and POST /api/v1/evidence/resolve. The Gate 6 store appends immutable segments and compacts them explicitly; some aggregate segment limits recommend compact when merging can help, while live-corpus and retained lifecycle-history limits do not because compaction cannot reduce them. reindex-gate3 copies a stopped Gate 3 store to a separate destination and preserves the source bytes. Public crawling requires an enabled reviewed policy and an explicit hash approval. Search queries support terms, phrases, AND, OR, and implicit AND."
+    );
+    println!(
+        "  cargo run --locked -- local-collection init --store NEW_PATH --directory DIR --url-prefix URL\n  cargo run --locked -- local-collection sync --store PATH --directory DIR --url-prefix URL\n  cargo run --locked -- local-collection status --store PATH\n\nManaged local collection initialization and sync are offline. The caller is responsible for rights to retain supplied content. HTTP(S) URLs are document identities only and are never fetched."
     );
     println!(
         "  cargo run --locked -- crawl-status --store PATH --frontier PATH [--source-id ID] [--fixture-clock PATH] [--include-url-inventory]\n  cargo run --locked -- fixture-collection init --root NEW_DIR --profile seed-only|link-discovery|extra-seeds [--port PORT]\n  cargo run --locked -- fixture-collection run --root DIR --revision v1|v2 [--advance-ms N]\n  cargo run --locked -- fixture-collection revoke --root DIR"

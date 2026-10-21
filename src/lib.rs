@@ -7,6 +7,14 @@ mod demo;
 pub mod html;
 pub mod index;
 mod local_collection;
+#[cfg(target_os = "linux")]
+mod managed_collection;
+#[cfg(not(target_os = "linux"))]
+mod managed_collection {
+    pub(crate) fn run_cli(_args: Vec<String>) -> Result<String, String> {
+        Err("managed local HTML collections currently require Linux".to_owned())
+    }
+}
 pub mod local_ingest;
 mod page_policy;
 pub mod public_policy;
@@ -143,6 +151,12 @@ pub fn revoke_public_source(
 ) -> Result<(), String> {
     controlled_crawler::revoke_public_source(index_path.as_ref(), frontier_path.as_ref(), source_id)
         .map_err(|_| "could not revoke the requested public source".to_owned())
+}
+
+/// Entry point used by the command line adapter for managed local HTML collections.
+#[doc(hidden)]
+pub fn run_managed_local_collection_cli(args: Vec<String>) -> Result<String, String> {
+    managed_collection::run_cli(args).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
