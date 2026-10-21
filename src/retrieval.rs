@@ -14,6 +14,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
+use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -101,13 +102,13 @@ impl QuestionRequest {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RetrievalMode {
     Question,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RetrievalStatus {
     /// One or more extracted body passages matched the lexical query plan.
@@ -118,7 +119,7 @@ pub enum RetrievalStatus {
     InsufficientEvidence(InsufficientEvidenceReason),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum InsufficientEvidenceReason {
     NoSearchableTerms,
@@ -126,7 +127,7 @@ pub enum InsufficientEvidenceReason {
     WorkBudgetReached,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RetrievalCompleteness {
     /// All selected query postings and candidate passages were evaluated within the caps.
@@ -135,14 +136,14 @@ pub enum RetrievalCompleteness {
     Partial,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AnswerAssessment {
     NotAssessed,
 }
 
 /// A typed status and passages from the current indexed body.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RetrievalResponse {
     pub contract_version: u16,
@@ -156,7 +157,7 @@ pub struct RetrievalResponse {
     pub answer_assessment: AnswerAssessment,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct EvidenceHit {
     /// Manifest document key, which is the requested URL.
@@ -170,7 +171,7 @@ pub struct EvidenceHit {
     pub passage: EvidencePassage,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct EvidencePassage {
     pub reference: EvidenceReference,
@@ -183,7 +184,7 @@ pub struct EvidencePassage {
 /// authenticator; a resolver revalidates the canonical window and current visibility.
 /// Schema v1 uses UTF-8-safe windows up to 8,192 bytes with a 4,096-byte step.
 /// Generation, segment, ordinal, and effective URL are intentionally excluded.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct EvidenceReference {
     pub store_id: [u8; 16],
@@ -250,7 +251,7 @@ impl EvidenceReference {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 /// Resolved current passage text with bounded indexed metadata.
 ///

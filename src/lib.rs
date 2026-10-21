@@ -16,6 +16,7 @@ mod managed_collection {
     }
 }
 pub mod local_ingest;
+pub mod mcp;
 mod page_policy;
 pub mod public_policy;
 mod query;

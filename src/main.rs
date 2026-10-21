@@ -94,6 +94,29 @@ fn main() -> ExitCode {
             }
         };
     }
+    if command == "mcp" {
+        let mut store = None;
+        while let Some(argument) = args.next() {
+            match argument.as_str() {
+                "--store" if store.is_none() => store = args.next(),
+                _ => {
+                    eprintln!("mcp accepts only --store PATH");
+                    return ExitCode::from(2);
+                }
+            }
+        }
+        let Some(store) = store else {
+            eprintln!("mcp requires --store PATH");
+            return ExitCode::from(2);
+        };
+        return match ley::mcp::run(store) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(_) => {
+                eprintln!("ley mcp: configured store or stdio service is unavailable");
+                ExitCode::FAILURE
+            }
+        };
+    }
     if command == "ingest-html" {
         return run_ingest_html(args);
     }
@@ -632,4 +655,5 @@ fn print_usage() {
     println!(
         "  cargo run --locked -- crawl-status --store PATH --frontier PATH [--source-id ID] [--fixture-clock PATH] [--include-url-inventory]\n  cargo run --locked -- fixture-collection init --root NEW_DIR --profile seed-only|link-discovery|extra-seeds [--port PORT]\n  cargo run --locked -- fixture-collection run --root DIR --revision v1|v2 [--advance-ms N]\n  cargo run --locked -- fixture-collection revoke --root DIR"
     );
+    println!("  cargo run --locked -- mcp --store PATH  (read-only MCP stdio server)");
 }

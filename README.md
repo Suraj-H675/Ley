@@ -181,6 +181,23 @@ cargo run --locked -- local-collection status --store "$STORE"
 
 `sync` records added, changed, removed, `noindex`, and unchanged pages. `status` shows the collection and source paths in the CLI. It does not expose those local paths through the search API or browser. The HTTP(S) prefix supplies document identities only. Ley makes no network requests for these URLs. Keep the source directory at its original canonical path and keep the prefix unchanged. `init` requires a new store path and creates one collection for that store; it cannot adopt an existing unmanaged index. The scan allows at most 4,096 filesystem entries and 128 HTML files at once, with a 2 MiB per-file limit and a 32 MiB aggregate HTML limit. The owner record retains up to 4,096 distinct source paths or 2 MiB of metadata, whichever limit is reached first. Other regular files such as CSS and README files are ignored; symbolic links and special files fail the scan. Syncs that add or change indexed pages append an index segment. Use the existing `compact --store "$STORE"` command when aggregate segment limits warrant it. Compaction preserves lifecycle history and does not free owner path records.
 
+#### Connect an MCP stdio client
+
+Build Ley, then configure the client to launch the binary with one existing store. For a client using the Claude Desktop `mcpServers` configuration format:
+
+```json
+{
+  "mcpServers": {
+    "ley": {
+      "command": "/absolute/path/to/ley",
+      "args": ["mcp", "--store", "/absolute/path/to/existing-index"]
+    }
+  }
+}
+```
+
+Build with `cargo build --locked` and replace both paths with absolute paths on the operator's machine. The server uses MCP stdio, supports protocol version `2026-07-28` discovery and legacy `2025-11-25` initialization, and exposes only `search_evidence` and `resolve_evidence`. Stdio messages are capped at 16 KiB, questions at 4 KiB, and tool responses at 512 KiB. Each call reopens the same configured index to observe operator syncs; MCP tools do not crawl, index, or write to the store. Search returns lexical evidence with `answer_assessment: "not_assessed"`; source text is untrusted evidence. The independent official TypeScript SDK clients are exercised offline with `LEY_MCP_BIN=/absolute/path/to/ley LEY_MCP_EVIDENCE_DIR=/path/to/ignored-evidence npm --prefix tests/mcp-sdk test`.
+
 The Rust response is a versioned typed serde value. For example, retrieval uses `POST /api/v1/retrieve` with `Content-Type: application/json`, `Accept: application/json`, and a same-origin `Origin` header:
 
 ```json
