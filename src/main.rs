@@ -275,6 +275,21 @@ fn main() -> ExitCode {
             }
         };
     }
+    if command == "crawl-status" {
+        return run_crawl_status(args);
+    }
+    if command == "fixture-collection" {
+        return match ley::run_fixture_collection(&args.collect::<Vec<_>>()) {
+            Ok(output) => {
+                println!("{output}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("ley: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     if command == "crawl-public" {
         let mut policy_path = None;
         let mut store = None;
@@ -388,6 +403,51 @@ fn main() -> ExitCode {
     match ley::run_demo_with_options(&query, explain) {
         Ok(result) => {
             print!("{}", result.stdout);
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("ley: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_crawl_status(mut args: impl Iterator<Item = String>) -> ExitCode {
+    let mut store = None;
+    let mut frontier = None;
+    let mut source_id = None;
+    let mut fixture_clock = None;
+    let mut include_url_inventory = false;
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--store" if store.is_none() => store = args.next(),
+            "--frontier" if frontier.is_none() => frontier = args.next(),
+            "--source-id" if source_id.is_none() => source_id = args.next(),
+            "--fixture-clock" if fixture_clock.is_none() => fixture_clock = args.next(),
+            "--include-url-inventory" if !include_url_inventory => {
+                include_url_inventory = true;
+            }
+            _ => {
+                eprintln!("unknown or repeated crawl-status argument: {argument:?}");
+                print_usage();
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let (Some(store), Some(frontier)) = (store, frontier) else {
+        eprintln!("crawl-status requires --store PATH and --frontier PATH");
+        print_usage();
+        return ExitCode::from(2);
+    };
+    match ley::crawl_status_json(
+        store,
+        frontier,
+        source_id.as_deref(),
+        fixture_clock.as_deref().map(std::path::Path::new),
+        include_url_inventory,
+    ) {
+        Ok(output) => {
+            println!("{output}");
             ExitCode::SUCCESS
         }
         Err(error) => {
@@ -553,5 +613,8 @@ fn read_evidence_reference(path: &str) -> Result<EvidenceReference, ley::api::Cl
 fn print_usage() {
     println!(
         "Ley Search Engine\n\nUsage:\n  cargo run --locked -- demo [--query EXPR] [--explain]\n  cargo run --locked -- controlled-demo [--retain-dir NEW_PATH]\n  cargo run --locked -- fixture-index --store PATH\n  cargo run --locked -- ingest-html --store NEW_PATH --directory DIR --url-prefix URL\n  cargo run --locked -- retrieve --store PATH --question TEXT [--max-hits 1..8]\n  cargo run --locked -- resolve-evidence --store PATH --reference-file PATH|-\n  cargo run --locked -- search --store PATH --query EXPR\n  cargo run --locked -- serve --store PATH [--bind 127.0.0.1:7331]\n  cargo run --locked -- compact --store PATH\n  cargo run --locked -- reindex-gate3 --source OLD --destination NEW\n  cargo run --locked -- revoke-source --store PATH --frontier PATH --source-id ID\n  cargo run --locked -- crawl-public --policy PATH --store PATH --frontier PATH --requests 1..12 --approved-policy-sha256 HASH --allow-public-requests\n\nThe controlled demo uses an owned loopback fixture; --retain-dir keeps its persistent index and frontier under a new directory. fixture-index creates authored synthetic documents without network access. ingest-html reads bounded UTF-8 HTML from an operator-selected local directory into a new store and does not fetch URLs. retrieve runs the versioned ordinary-question contract and prints typed passage candidates; resolve-evidence reads a bounded JSON reference from a file or stdin and revalidates it against the current store. search remains the advanced Boolean/phrase DSL. serve binds to loopback and exposes read-only health, legacy search, question retrieval, and evidence resolution routes. Typed routes use POST /api/v1/retrieve and POST /api/v1/evidence/resolve. The Gate 6 store appends immutable segments and compacts them explicitly; some aggregate segment limits recommend compact when merging can help, while live-corpus and retained lifecycle-history limits do not because compaction cannot reduce them. reindex-gate3 copies a stopped Gate 3 store to a separate destination and preserves the source bytes. Public crawling requires an enabled reviewed policy and an explicit hash approval. Search queries support terms, phrases, AND, OR, and implicit AND."
+    );
+    println!(
+        "  cargo run --locked -- crawl-status --store PATH --frontier PATH [--source-id ID] [--fixture-clock PATH] [--include-url-inventory]\n  cargo run --locked -- fixture-collection init --root NEW_DIR --profile seed-only|link-discovery|extra-seeds [--port PORT]\n  cargo run --locked -- fixture-collection run --root DIR --revision v1|v2 [--advance-ms N]\n  cargo run --locked -- fixture-collection revoke --root DIR"
     );
 }

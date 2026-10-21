@@ -1,0 +1,7 @@
+Asteria Ridge Observatory fixture corpus
+
+The original HTML text, route descriptions, and fixture metadata in this directory were created for the Ley Stage C controlled-collection example. Asteria Ridge, its staff, devices, records, and operating details are fictional. The documents do not describe a real observatory or provide real-world safety instructions.
+
+Copyright 2026 contributors to the Ley project. This work is dedicated to the public domain under the Creative Commons CC0 1.0 Universal dedication. You may copy, modify, distribute, and use it without asking permission, subject to the terms stated in the dedication.
+
+CC0 1.0 Universal: https://creativecommons.org/publicdomain/zero/1.0/

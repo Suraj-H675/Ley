@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Field log entry format, revision 2</title>
+  <meta name="description" content="The field log now records the clock source and uncertainty interval for derived readings.">
+</head>
+<body>
+  <main><article>
+    <h1>Field log entry format, revision 2</h1>
+    <p>The revised Asteria field log records the clock source beside each session timestamp. A derived reading also names its uncertainty interval and the source rows used to calculate it.</p>
+    <section><h2>Required fields</h2>
+      <p>An entry starts with a session ID such as AR-2026-10-20-N2, an RFC 3339 UTC timestamp, the recorder, and the instrument IDs. The recorder writes the clock source as `TIME-01` or `manual-check`. A missing value remains unavailable rather than becoming zero.</p>
+    </section>
+    <section><h2>Derived readings</h2>
+      <p>A derived value names its input row IDs, method, and uncertainty interval. The recorder does not overwrite the raw values. When a method changes, the new calculation gets a distinct record ID so an older report can still be reproduced.</p>
+    </section>
+    <section><h2>Correction history</h2>
+      <p>The recorder appends a correction that cites the original row and gives the reason. The measurement-uncertainty page explains resolution and repeated readings. The data-format page defines the updated fields used in the export.</p>
+    </section>
+    <section><h2>Related pages</h2><ul>
+      <li><a href="measurement-uncertainty.html">Reporting measurement uncertainty</a></li>
+      <li><a href="data-format.html">Asteria observation record format</a></li>
+      <li><a href="observatory-index.html">Asteria Ridge Observatory field index</a></li>
+    </ul></section>
+  </article></main>
+</body>
+</html>

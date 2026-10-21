@@ -1,10 +1,12 @@
 pub mod analyzer;
 pub mod api;
 pub(crate) mod controlled_crawler;
+mod crawl_status;
 mod crawler;
 mod demo;
 pub mod html;
 pub mod index;
+mod local_collection;
 pub mod local_ingest;
 mod page_policy;
 pub mod public_policy;
@@ -30,6 +32,26 @@ pub use retrieval::{
     InsufficientEvidenceReason, QuestionRequest, ResolvedEvidence, RetrievalCompleteness,
     RetrievalError, RetrievalMode, RetrievalRequest, RetrievalResponse, RetrievalStatus,
 };
+
+pub fn crawl_status_json(
+    store_path: impl AsRef<std::path::Path>,
+    frontier_path: impl AsRef<std::path::Path>,
+    source_id: Option<&str>,
+    fixture_clock_path: Option<&std::path::Path>,
+    include_url_inventory: bool,
+) -> Result<String, String> {
+    crawl_status::status_json(
+        store_path.as_ref(),
+        frontier_path.as_ref(),
+        source_id,
+        fixture_clock_path,
+        include_url_inventory,
+    )
+}
+
+pub fn run_fixture_collection(args: &[String]) -> Result<String, String> {
+    local_collection::run_cli(args)
+}
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct PublicCrawlOutput {

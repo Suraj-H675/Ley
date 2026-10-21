@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Local instrument network map</title>
+  <meta name="description" content="A text map names the fictional devices on the operations network without exposing real addresses.">
+</head>
+<body>
+  <main>
+    <article>
+      <h1>Local instrument network map</h1>
+      <p>A text map names the fictional devices on the operations network without exposing real addresses.</p>
+    <section>
+      <h2>Logical links</h2>
+      <p>The recorder uses network label `OPS-NET-A`. The clock appliance is `TIME-01`, the radio console is `RAD-02`, and the archive station is `ARC-01`. These names are scenario identifiers, not live hostnames or addresses. The map stores the link between a device label and its role.</p>
+    </section>
+    <section>
+      <h2>Address records</h2>
+      <p>The fixture map uses documentation-only addresses from reserved examples such as `192.0.2.17` and `2001:db8:4::17`. It shows how an IPv4 and IPv6 value can appear in one record without describing a reachable destination. The link-local guide explains why a zone identifier matters for an IPv6 link-local address.</p>
+    </section>
+    <section>
+      <h2>Change control</h2>
+      <p>A cable move or port change creates a dated map revision. The radio handbook identifies the message endpoint, while the clock page records the time source. A map revision does not by itself prove that a device was reachable during a session; the field log holds that observation.</p>
+    </section>
+      <section>
+        <h2>Related pages</h2>
+        <ul>
+          <li><a href="clock-sync.html">Session clock synchronization</a></li>
+          <li><a href="ipv6-link-local.html">IPv6 link-local address notes</a></li>
+          <li><a href="radio-handbook.html">Radio control handbook</a></li>
+          <li><a href="site-layout.html">Asteria Ridge site layout</a></li>
+        </ul>
+      </section>
+    </article>
+  </main>
+</body>
+</html>

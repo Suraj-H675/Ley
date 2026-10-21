@@ -47,6 +47,74 @@ The retained corpus is synthetic and tiny. It demonstrates integration and lifec
 
 The data path is `ControlledCrawler` admission and frontier → `SafeFetcher` destination and robots checks → HTML extraction → requested-key fenced outbox intent → `PersistentIndex` segment and manifest publication → pinned `ReadView` query and BM25 explanation → CLI or loopback HTTP API → React UI. Ley implements the crawl policy, analyzer, positional retrieval, query evaluation, and BM25 scorer. Rust crates provide HTTP/TLS, HTML parsing, SQLite and filesystem primitives, and the local web framework; no third-party full-text engine or external search API supplies retrieval.
 
+## Reproduce the controlled collection freshness slice
+
+This local-only workflow compares a root seed without link discovery, the same root with link discovery, and explicit extra seeds for two truly unlinked pages. Each profile gets a separate persistent store and frontier under a new ignored evidence directory. The frozen task manifest pins origin `http://127.0.0.1:41697`, so this reproduction binds that exact port for every profile; if it is occupied, init fails and the manifest must not be reused with a different port. Each `fixture-collection run` is a separate process: it rebinds the exact port, creates a fresh capability from that listener, and fails before changing state if the port is occupied. The persisted fixture clock advances only when `--advance-ms` is supplied; it does not change the operating-system clock or represent production source time.
+
+The rights-cleared task manifest is tracked at [`fixtures/stage-c-s1/evaluation-tasks-v1.json`](fixtures/stage-c-s1/evaluation-tasks-v1.json) with SHA-256 `2d833ad1ed43f1c77364c40fc6e12152feecbfed4478ce3d1394243ccfaca21e`. The private copy under `.audit/stage-c-s1-20261020/evidence/` records the original acceptance freeze. Store IDs in the manifest identify that freeze; the evaluator reads each fresh store ID from `collection.json` and checks it against `crawl-status`.
+
+```sh
+cargo build --locked
+BIN=target/debug/ley
+EVIDENCE_BASE=.audit/stage-c-s1-20261020/evidence
+mkdir -p "$EVIDENCE_BASE"
+EVIDENCE=$(mktemp -d "$EVIDENCE_BASE/repro-XXXXXX")
+PORT=41697
+sha256sum -c fixtures/stage-c-s1/evaluation-tasks-v1.sha256
+
+INIT_JSON=$("$BIN" fixture-collection init --root "$EVIDENCE/seed-only" --profile seed-only --port "$PORT")
+printf '%s\n' "$INIT_JSON" > "$EVIDENCE/seed-only-init.json"
+"$BIN" fixture-collection init --root "$EVIDENCE/link-discovery" --profile link-discovery --port "$PORT" > "$EVIDENCE/link-discovery-init.json"
+"$BIN" fixture-collection init --root "$EVIDENCE/extra-seeds" --profile extra-seeds --port "$PORT" > "$EVIDENCE/extra-seeds-init.json"
+
+for PROFILE in seed-only link-discovery extra-seeds; do
+  ROOT="$EVIDENCE/$PROFILE"
+  "$BIN" fixture-collection run --root "$ROOT" --revision v1 > "$EVIDENCE/$PROFILE-run-v1.json"
+  "$BIN" fixture-collection run --root "$ROOT" --revision v2 --advance-ms 86400000 > "$EVIDENCE/$PROFILE-run-v2.json"
+  "$BIN" fixture-collection run --root "$ROOT" --revision v2 --advance-ms 1000 > "$EVIDENCE/$PROFILE-run-404-confirmation.json"
+  "$BIN" crawl-status --store "$ROOT/store" --frontier "$ROOT/frontier.sqlite" \
+    --source-id stage-c-s1-asteria --fixture-clock "$ROOT/fixture-clock.json" > "$EVIDENCE/$PROFILE-status.json"
+done
+
+# The evaluator checks the tracked manifest hash and reports source coverage
+# separately from exact top-k passage support. It keeps negative and ambiguous
+# outputs raw for independent judgment.
+python3 tools/evaluate_stage_c_s1.py \
+  --binary "$BIN" \
+  --manifest fixtures/stage-c-s1/evaluation-tasks-v1.json \
+  --evidence-root "$EVIDENCE" \
+  --output "$EVIDENCE/evaluation-v1.json"
+
+python3 - "$EVIDENCE/evaluation-v1.json" "$EVIDENCE/link-discovery-reference.json" <<'PY'
+import json,sys
+results=json.load(open(sys.argv[1],encoding='utf-8'))['profileResults']['link-discovery']['taskOutcomes']
+reference=next((hit['passage']['reference'] for task in results
+                if task['kind']=='answerable' and task['rawResponse']
+                for hit in task['rawResponse']['hits']),None)
+if reference is None: raise SystemExit('no passage reference is available for revocation check')
+json.dump(reference,open(sys.argv[2],'w',encoding='utf-8'),ensure_ascii=False,indent=2)
+PY
+
+# After saving retrieval outputs and any evidence references, revoke one arm.
+"$BIN" fixture-collection revoke --root "$EVIDENCE/link-discovery" > "$EVIDENCE/link-discovery-revoke.json"
+"$BIN" crawl-status --store "$EVIDENCE/link-discovery/store" \
+  --frontier "$EVIDENCE/link-discovery/frontier.sqlite" \
+  --source-id stage-c-s1-asteria \
+  --fixture-clock "$EVIDENCE/link-discovery/fixture-clock.json" \
+  > "$EVIDENCE/link-discovery-revoked-status.json"
+if "$BIN" resolve-evidence --store "$EVIDENCE/link-discovery/store" \
+  --reference-file "$EVIDENCE/link-discovery-reference.json" \
+  > "$EVIDENCE/link-discovery-revoked-evidence.txt" 2>&1; then
+  echo 'Unexpectedly resolved evidence after source revocation.'
+  exit 1
+fi
+grep -q '^ley: revoked$' "$EVIDENCE/link-discovery-revoked-evidence.txt"
+
+printf 'Fresh collection evidence: %s\n' "$EVIDENCE"
+```
+
+The finite source budget is 128 reserved or dispatched requests per workspace, with 96 requests, 16 MiB wire entity bytes, 32 MiB decoded entity bytes, 60 seconds, two retries per URL, five page redirects, two global workers, and one request per origin per invocation. The report distinguishes actual response counts and entity bytes from the persistent source budget counter, which also accounts for robots reservations. The fixture pages, routes, and evaluation metadata are original CC0 1.0 material; see [`fixtures/stage-c-s1/ATTRIBUTION.txt`](fixtures/stage-c-s1/ATTRIBUTION.txt). The fixture validators and logical time are simulated. Use `crawl-status` with the saved clock file to inspect due work; it refuses to repair or migrate the database and does not report per-URL last-fetch time, which is not persisted. `--include-url-inventory` opts into a bounded, source-specific list of URL keys, frontier states, and current live-index membership for task coverage analysis; ordinary status output contains aggregate counts only.
+
 ## Reproduce the offline benchmark
 
 The fixed CC0 workload is [`fixtures/benchmark-v1.json`](fixtures/benchmark-v1.json), with its byte-level SHA-256 in [`fixtures/benchmark-v1.sha256`](fixtures/benchmark-v1.sha256). It contains 128 authored documents and 13 fixed queries. The runner fetches the lockfile-pinned Rust crates before its offline builds. It performs one warmup and five measured indexing/search trials, plus a separate set of owned-loopback crawler trials. Each persistent-index trial checks full ordered results, scores, match evidence, and explanations against the independent exhaustive evaluator before timing, then checks the measured store after indexing, reopen, and compaction. It records raw query samples and a summary under an ignored evidence directory:

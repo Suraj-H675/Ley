@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Session clock synchronization</title>
+  <meta name="description" content="The observatory uses one session reference to make timestamps from logs and devices comparable.">
+</head>
+<body>
+  <main>
+    <article>
+      <h1>Session clock synchronization</h1>
+      <p>The observatory uses one session reference to make timestamps from logs and devices comparable.</p>
+    <section>
+      <h2>Reference display</h2>
+      <p>The operations display shows UTC to the nearest second. At the start of a session, the recorder compares it with the reference time source and writes the observed offset, including its sign. A display that is 1.4 seconds slow is recorded as −1.4 s, not as an unlabeled correction.</p>
+    </section>
+    <section>
+      <h2>Device clocks</h2>
+      <p>A device clock is checked before its first sample and after a reboot. The log keeps the device timestamp and the recorder receipt timestamp when they differ. The difference helps identify buffering or radio delay, but it does not prove which clock failed.</p>
+    </section>
+    <section>
+      <h2>Clock change</h2>
+      <p>If the reference display loses synchronization, the crew marks the affected interval and avoids silently rewriting old rows. The radio handbook defines the message sequence counter; the network map identifies the local time appliance. These references let a reviewer separate message ordering from clock accuracy.</p>
+    </section>
+      <section>
+        <h2>Related pages</h2>
+        <ul>
+          <li><a href="network-map.html">Local instrument network map</a></li>
+          <li><a href="radio-handbook.html">Radio control handbook</a></li>
+          <li><a href="serial-protocol.html">Maintenance serial protocol</a></li>
+          <li><a href="field-log.html">Field log entry format</a></li>
+        </ul>
+      </section>
+    </article>
+  </main>
+</body>
+</html>

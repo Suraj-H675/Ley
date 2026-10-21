@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Instrument and record identifier registry</title>
+  <meta name="description" content="The registry assigns stable labels to the fictional station, devices, and session records.">
+</head>
+<body>
+  <main>
+    <article>
+      <h1>Instrument and record identifier registry</h1>
+      <p>The registry assigns stable labels to the fictional station, devices, and session records.</p>
+    <section>
+      <h2>Device labels</h2>
+      <p>The registry maps `WX-04` to the weather mast, `RG-02` to the rain gauge, `WV-03` to the wind vane, and `AQ-11` to the particle monitor. Device labels do not encode physical location. A move changes the site record and leaves the device identifier intact.</p>
+    </section>
+    <section>
+      <h2>Session labels</h2>
+      <p>A session ID follows the pattern `AR-YYYY-MM-DD-Sn`, where `n` identifies the local shift sequence for that date. The label is unique within this fixture scenario, but the registry would need an assigned namespace before it could safely identify records across independent observatories.</p>
+    </section>
+    <section>
+      <h2>Protocol labels</h2>
+      <p>The radio unit `ARX-17` and the archive station `ARC-01` have distinct roles. A numeric address in a serial frame is not a replacement for the human-readable registry entry. When a device is retired, its label remains in historical records and is marked inactive rather than reassigned to new hardware.</p>
+    </section>
+      <section>
+        <h2>Related pages</h2>
+        <ul>
+          <li><a href="radio-handbook.html">Radio control handbook</a></li>
+          <li><a href="data-format.html">Asteria observation record format</a></li>
+          <li><a href="ipv6-link-local.html">IPv6 link-local address notes</a></li>
+          <li><a href="unicode-station-names.html">Unicode station labels and export</a></li>
+        </ul>
+      </section>
+    </article>
+  </main>
+</body>
+</html>

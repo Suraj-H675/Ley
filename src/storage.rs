@@ -226,6 +226,13 @@ pub struct ReadView {
     public_visible_until_ms: Option<u64>,
 }
 
+pub(crate) struct ReadOnlyIndexInspection {
+    pub store_id: [u8; 16],
+    pub generation_id: u64,
+    pub live_document_keys: BTreeSet<String>,
+    _lock: FileLock,
+}
+
 struct SegmentedSnapshot {
     manifest: Manifest,
     segments: BTreeMap<u64, Arc<Segment>>,
@@ -432,6 +439,35 @@ struct Generation {
 impl PersistentIndex {
     pub(crate) fn store_identity(&self) -> [u8; 16] {
         self.store_id
+    }
+
+    /// Inspect committed index metadata without exposing mutation operations or
+    /// opening the store's lock file for writing.
+    pub(crate) fn inspect_read_only(
+        path: impl AsRef<Path>,
+    ) -> Result<ReadOnlyIndexInspection, StorageError> {
+        let path = path.as_ref();
+        validate_store_directory(path)?;
+        let store_bytes = read_bounded_file(&path.join(STORE_NAME), STORE_BYTES)?;
+        if store_bytes.get(..8) == Some(STORE_MAGIC.as_slice()) {
+            return Err(StorageError::ReindexRequired(
+                "read-only inspection does not support legacy Gate 3 stores".to_owned(),
+            ));
+        }
+        let (store_id, _) = decode_store(&store_bytes)?;
+        let store = Self {
+            path: fs::canonicalize(path)?,
+            store_id,
+            writer: Mutex::new(()),
+        };
+        let lock = FileLock::new_shared_read_only(&store.path.join(LOCK_NAME))?;
+        let snapshot = store.load_snapshot_locked()?;
+        Ok(ReadOnlyIndexInspection {
+            store_id,
+            generation_id: snapshot.manifest.generation_id,
+            live_document_keys: snapshot.documents.into_keys().collect(),
+            _lock: lock,
+        })
     }
 
     pub fn create(path: impl AsRef<Path>) -> Result<Self, StorageError> {
@@ -4544,6 +4580,27 @@ impl FileLock {
             }
         }
     }
+
+    fn new_shared_read_only(path: &Path) -> Result<Self, StorageError> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(path)?;
+        loop {
+            // SAFETY: `file` owns a read-only descriptor for LOCK while shared flock is held.
+            let result =
+                unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&file), libc::LOCK_SH) };
+            if result == 0 {
+                return Ok(Self(file));
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error.into());
+            }
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -4560,6 +4617,10 @@ struct FileLock;
 #[cfg(not(target_os = "linux"))]
 impl FileLock {
     fn new(_path: &Path, _exclusive: bool) -> Result<Self, StorageError> {
+        Err(StorageError::UnsupportedPlatform)
+    }
+
+    fn new_shared_read_only(_path: &Path) -> Result<Self, StorageError> {
         Err(StorageError::UnsupportedPlatform)
     }
 }

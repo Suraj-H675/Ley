@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Tipping-bucket rain gauge</title>
+  <meta name="description" content="The rain gauge converts bucket tips into a cumulative precipitation estimate for a session.">
+</head>
+<body>
+  <main>
+    <article>
+      <h1>Tipping-bucket rain gauge</h1>
+      <p>The rain gauge converts bucket tips into a cumulative precipitation estimate for a session.</p>
+    <section>
+      <h2>Instrument count</h2>
+      <p>The fictional gauge `RG-02` produces one pulse for each calibrated bucket tip. The event counter is cumulative across a session, so the recorder stores both the starting and ending counts. A difference of 12 pulses means twelve events, not twelve millimetres unless the current calibration factor supports that conversion.</p>
+    </section>
+    <section>
+      <h2>Blocked funnel</h2>
+      <p>Leaves, ice, or an insect can obstruct the funnel. The crew inspects the opening before comparing the counter with the weather note. If a blockage is found, the log records when it was seen and leaves the affected interval unresolved instead of estimating rainfall from a later reading.</p>
+    </section>
+    <section>
+      <h2>Context</h2>
+      <p>Wind can carry precipitation past the collector, while a nearby roof can add runoff. The site layout keeps the gauge away from the roof edge. The calibration record stores the bucket factor, and the field log stores the conditions observed during the session.</p>
+    </section>
+      <section>
+        <h2>Related pages</h2>
+        <ul>
+          <li><a href="site-layout.html">Asteria Ridge site layout</a></li>
+          <li><a href="weather-sensor.html">Weather mast sensor notes</a></li>
+          <li><a href="sensor-calibration.html">Sensor calibration record</a></li>
+          <li><a href="field-log.html">Field log entry format</a></li>
+        </ul>
+      </section>
+    </article>
+  </main>
+</body>
+</html>

@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sensor calibration record</title>
+  <meta name="description" content="A calibration record ties a sensor reading to a reference check and a dated adjustment note.">
+</head>
+<body>
+  <main>
+    <article>
+      <h1>Sensor calibration record</h1>
+      <p>A calibration record ties a sensor reading to a reference check and a dated adjustment note.</p>
+    <section>
+      <h2>Before a comparison</h2>
+      <p>The calibration record names the device ID, reference instrument, ambient condition, and operator. Both displayed values use explicit units. The operator takes three readings after the sensor settles, then records all three values instead of choosing the one that looks most plausible.</p>
+    </section>
+    <section>
+      <h2>Adjustment history</h2>
+      <p>If the device is adjusted, the record preserves the values from before and after adjustment. A changed offset receives a new calibration event ID, and the field log points to that event when it uses the adjusted instrument. The weather-sensor page gives a worked example for comparing a mast reading with the reference thermometer.</p>
+    </section>
+    <section>
+      <h2>Limits</h2>
+      <p>A calibration check does not establish accuracy outside the tested range. The record states the temperatures or concentrations tested and leaves untested conditions blank. The measurement-uncertainty page explains the difference between instrument resolution and the spread observed during repeat readings.</p>
+    </section>
+      <section>
+        <h2>Related pages</h2>
+        <ul>
+          <li><a href="weather-sensor.html">Weather mast sensor notes</a></li>
+          <li><a href="air-quality.html">Air-quality inlet handling</a></li>
+          <li><a href="rain-gauge.html">Tipping-bucket rain gauge</a></li>
+          <li><a href="measurement-uncertainty.html">Reporting measurement uncertainty</a></li>
+          <li><a href="observatory-index.html">Asteria Ridge Observatory field index</a></li>
+        </ul>
+      </section>
+    </article>
+  </main>
+</body>
+</html>

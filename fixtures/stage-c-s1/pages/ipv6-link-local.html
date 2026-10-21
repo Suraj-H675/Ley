@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>IPv6 link-local address notes</title>
+  <meta name="description" content="A short reference for reading link-local IPv6 values in fictional equipment records.">
+</head>
+<body>
+  <main>
+    <article>
+      <h1>IPv6 link-local address notes</h1>
+      <p>A short reference for reading link-local IPv6 values in fictional equipment records.</p>
+    <section>
+      <h2>Scope</h2>
+      <p>An IPv6 link-local address begins with `fe80::/10` and is meaningful only on its local link. A record may need a zone identifier such as `%en0` to say which interface the operator meant. The zone is local notation and can differ between machines.</p>
+    </section>
+    <section>
+      <h2>Example record</h2>
+      <p>The fictional mapping `fe80::a12:4%eth0` is a documentation example, not an address to contact. The operations log stores the interface label beside the address. If the zone is absent, the record may be ambiguous when a host has more than one local network.</p>
+    </section>
+    <section>
+      <h2>Network map</h2>
+      <p>The Asteria network map uses reserved documentation prefixes for examples and lists device names separately from addresses. A copied map must retain the scope note so a reader does not treat an address as globally routed. The map revision date identifies the record version, not the time an endpoint was last reachable.</p>
+    </section>
+      <section>
+        <h2>Related pages</h2>
+        <ul>
+          <li><a href="network-map.html">Local instrument network map</a></li>
+          <li><a href="identifier-registry.html">Instrument and record identifier registry</a></li>
+        </ul>
+      </section>
+    </article>
+  </main>
+</body>
+</html>

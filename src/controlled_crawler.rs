@@ -449,6 +449,23 @@ impl Clock for SystemClock {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct FixtureLogicalClock(std::sync::Arc<std::sync::atomic::AtomicU64>);
+
+impl FixtureLogicalClock {
+    pub(crate) fn new(now_ms: u64) -> Self {
+        Self(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+            now_ms,
+        )))
+    }
+}
+
+impl Clock for FixtureLogicalClock {
+    fn now_ms(&self) -> u64 {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct CrawlCancellation(Arc<AtomicBool>);
 
@@ -482,6 +499,7 @@ pub(crate) struct CrawlReport {
     pub max_active: usize,
     pub compressed_bytes: usize,
     pub decompressed_bytes: usize,
+    pub index_apply_latency_ns: Vec<u64>,
     pub network_evidence: Vec<DestinationEvidence>,
 }
 
@@ -583,6 +601,8 @@ impl CrawlReport {
         self.decompressed_bytes = self
             .decompressed_bytes
             .saturating_add(next.decompressed_bytes);
+        self.index_apply_latency_ns
+            .append(&mut next.index_apply_latency_ns);
         let available_evidence = 10_000usize.saturating_sub(self.network_evidence.len());
         self.network_evidence
             .extend(next.network_evidence.into_iter().take(available_evidence));
@@ -1484,6 +1504,8 @@ pub(crate) struct ControlledCrawler<R, C> {
     pending_link_discovery: LinkDiscoveryCounts,
     pending_failed_pages: usize,
     pending_failure_reasons: Vec<String>,
+    link_discovery_enabled: bool,
+    index_apply_latency_ns: Vec<u64>,
 }
 
 impl<R, C> ControlledCrawler<R, C>
@@ -1520,13 +1542,44 @@ where
         limits: CrawlLimits,
         clock: C,
     ) -> Result<Self, CrawlError> {
-        limits.validate()?;
-        let owner_lock = acquire_frontier_owner(path)?;
-        validate_frontier_store(path, &index)?;
         let fetcher = Arc::new(
             SafeFetcher::new_with_public(resolver, capabilities, public_authorities)
                 .with_timeout(limits.request_timeout),
         );
+        Self::open_with_fetcher(path, index, fetcher, limits, clock, false)
+    }
+
+    pub(crate) fn open_existing_with_public(
+        path: &Path,
+        index: Arc<PersistentIndex>,
+        resolver: R,
+        capabilities: Vec<FixtureCapability>,
+        public_authorities: Vec<PublicAuthority>,
+        limits: CrawlLimits,
+        clock: C,
+    ) -> Result<Self, CrawlError> {
+        let fetcher = Arc::new(
+            SafeFetcher::new_with_public(resolver, capabilities, public_authorities)
+                .with_timeout(limits.request_timeout),
+        );
+        Self::open_with_fetcher(path, index, fetcher, limits, clock, true)
+    }
+
+    fn open_with_fetcher(
+        path: &Path,
+        index: Arc<PersistentIndex>,
+        fetcher: Arc<SafeFetcher<R>>,
+        limits: CrawlLimits,
+        clock: C,
+        require_existing_schema: bool,
+    ) -> Result<Self, CrawlError> {
+        limits.validate()?;
+        let owner_lock = acquire_frontier_owner(path)?;
+        if require_existing_schema {
+            crate::crawl_status::validate_existing_frontier(path, index.store_identity())
+                .map_err(CrawlError::Policy)?;
+        }
+        validate_frontier_store(path, &index)?;
         let db = FrontierDb::open(path, index.store_identity())?;
         let mut crawler = Self {
             _owner_lock: owner_lock,
@@ -1543,11 +1596,17 @@ where
             pending_link_discovery: LinkDiscoveryCounts::default(),
             pending_failed_pages: 0,
             pending_failure_reasons: Vec::new(),
+            link_discovery_enabled: true,
+            index_apply_latency_ns: Vec::new(),
         };
         crawler.recover_abandoned_fetches()?;
         crawler.expire_due_sources()?;
         crawler.reconcile_controls()?;
         Ok(crawler)
+    }
+
+    pub(crate) fn set_link_discovery_enabled(&mut self, enabled: bool) {
+        self.link_discovery_enabled = enabled;
     }
 
     pub(crate) fn open_system(
@@ -1827,11 +1886,11 @@ where
         self.fetcher.clear_network_evidence();
         self.pending_failed_pages = 0;
         self.pending_failure_reasons.clear();
-        let started = self.clock.now_ms();
-        let deadline = started.saturating_add(self.limits.max_runtime.as_millis() as u64);
+        let started = Instant::now();
         let mut report = CrawlReport {
             outbox_replays: self.pending_replay_count,
             rejected_intents: self.pending_rejected_count,
+            index_apply_latency_ns: std::mem::take(&mut self.index_apply_latency_ns),
             ..CrawlReport::default()
         };
         self.pending_replay_count = 0;
@@ -1855,7 +1914,7 @@ where
         let mut workers = WorkerDrain::new(cancellation);
 
         loop {
-            if self.clock.now_ms() >= deadline {
+            if started.elapsed() >= self.limits.max_runtime {
                 runtime_expired = true;
                 cancellation.cancel();
                 stop_dispatch = true;
@@ -2029,7 +2088,10 @@ where
             .append(&mut self.pending_failure_reasons);
         self.pending_failed_pages = 0;
         report.network_evidence = self.fetcher.take_network_evidence();
-        if runtime_expired || self.clock.now_ms() >= deadline {
+        report
+            .index_apply_latency_ns
+            .append(&mut self.index_apply_latency_ns);
+        if runtime_expired || started.elapsed() >= self.limits.max_runtime {
             Err(CrawlError::RuntimeLimit)
         } else if cancellation.is_cancelled() {
             Err(CrawlError::Cancelled)
@@ -3784,7 +3846,11 @@ where
                     self.reject_outbox(&item, "source policy blocks automatic recovery")?;
                     continue;
                 }
-                match self.index.apply(&lease, intent) {
+                let apply_started = Instant::now();
+                let apply_result = self.index.apply(&lease, intent);
+                self.index_apply_latency_ns
+                    .push(apply_started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+                match apply_result {
                     Ok(ApplyOutcome::Applied | ApplyOutcome::AlreadyApplied) => {
                         #[cfg(test)]
                         if std::env::var("LEY_GATE4_FAILPOINT").as_deref()
@@ -3833,7 +3899,8 @@ where
                     "UPDATE frontier SET state=?2,fetch_url=url_key,due_ms=COALESCE(?3,due_ms),reason=?4,etag=?5,last_modified=?6,not_found_count=0,lease_token=NULL,schedule_id=NULL,attempts=0,redirect_count=0,redirect_seen=url_key,unconditional=0 WHERE url_key=?1",
                     params![item.key.as_str(), item.completion.state, item.completion.next_due_ms.map(|value| value as i64), item.completion.reason, item.completion.etag, item.completion.last_modified],
                 )?;
-                if let Some(policy) = policy.as_ref()
+                if self.link_discovery_enabled
+                    && let Some(policy) = policy.as_ref()
                     && !item.completion.links.is_empty()
                 {
                     self.pending_link_discovery

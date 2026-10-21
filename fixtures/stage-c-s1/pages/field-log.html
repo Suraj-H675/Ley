@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Field log entry format</title>
+  <meta name="description" content="The field log records observations with enough context for another volunteer to interpret them.">
+</head>
+<body>
+  <main>
+    <article>
+      <h1>Field log entry format</h1>
+      <p>The field log records observations with enough context for another volunteer to interpret them.</p>
+    <section>
+      <h2>Required fields</h2>
+      <p>A log entry starts with a session ID such as AR-2026-10-20-N2, a UTC timestamp, the recorder, and the instrument IDs. Each measurement includes its unit and the displayed precision. The recorder marks a missing value as unavailable instead of writing zero, because zero can be a valid reading.</p>
+    </section>
+    <section>
+      <h2>Context and correction</h2>
+      <p>The note field records cloud cover, equipment changes, and unusual noise without replacing measured values with an explanation. If an entry needs correction, the recorder appends a correction line that names the original row and the reason. The measurement-uncertainty page describes how to report a range when the instrument resolution limits precision.</p>
+    </section>
+    <section>
+      <h2>Export</h2>
+      <p>At the end of a session, the recorder checks the export for duplicate timestamps and mixed units. The CSV guide defines the column order, while the data-format page documents how the same row is represented in the archive. This page is the source for the current log procedure in the v1 fixture revision.</p>
+    </section>
+      <section>
+        <h2>Related pages</h2>
+        <ul>
+          <li><a href="measurement-uncertainty.html">Reporting measurement uncertainty</a></li>
+          <li><a href="data-format.html">Asteria observation record format</a></li>
+          <li><a href="unicode-station-names.html">Unicode station labels and export</a></li>
+          <li><a href="csv-export.html">CSV export checks</a></li>
+          <li><a href="observatory-index.html">Asteria Ridge Observatory field index</a></li>
+        </ul>
+      </section>
+    </article>
+  </main>
+</body>
+</html>

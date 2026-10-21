@@ -25,20 +25,27 @@ const FIXTURE_HOST: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
 type CapturedHeaders = Vec<Vec<(String, String)>>;
 
 #[derive(Clone, Debug)]
-pub(super) struct FixtureResponse {
+pub(crate) struct FixtureResponse {
     status: u16,
     content_type: String,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
     delay: Duration,
+    not_modified_behavior: FixtureNotModifiedBehavior,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FixtureNotModifiedBehavior {
+    ScriptedConditional,
+    RequireMatchingValidator,
 }
 
 impl FixtureResponse {
-    pub(super) fn html(body: impl AsRef<[u8]>) -> Self {
+    pub(crate) fn html(body: impl AsRef<[u8]>) -> Self {
         Self::new(200, "text/html; charset=utf-8", body)
     }
 
-    pub(super) fn text(body: impl AsRef<[u8]>) -> Self {
+    pub(crate) fn text(body: impl AsRef<[u8]>) -> Self {
         Self::new(200, "text/plain; charset=utf-8", body)
     }
 
@@ -51,8 +58,13 @@ impl FixtureResponse {
         response
     }
 
-    pub(super) fn with_header(mut self, name: &str, value: &str) -> Self {
+    pub(crate) fn with_header(mut self, name: &str, value: &str) -> Self {
         self.headers.push((name.to_owned(), value.to_owned()));
+        self
+    }
+
+    pub(crate) fn with_validator_matched_304(mut self) -> Self {
+        self.not_modified_behavior = FixtureNotModifiedBehavior::RequireMatchingValidator;
         self
     }
 
@@ -62,18 +74,19 @@ impl FixtureResponse {
         self
     }
 
-    pub(super) fn new(status: u16, content_type: &str, body: impl AsRef<[u8]>) -> Self {
+    pub(crate) fn new(status: u16, content_type: &str, body: impl AsRef<[u8]>) -> Self {
         Self {
             status,
             content_type: content_type.to_owned(),
             headers: Vec::new(),
             body: body.as_ref().to_vec(),
             delay: Duration::ZERO,
+            not_modified_behavior: FixtureNotModifiedBehavior::ScriptedConditional,
         }
     }
 }
 
-pub(super) struct LocalFixture {
+pub(crate) struct LocalFixture {
     origin: FixtureOrigin,
     capability: FixtureCapability,
     #[cfg(test)]
@@ -97,11 +110,33 @@ impl LocalFixture {
         Self::start_with_origin(|_| routes)
     }
 
-    pub(super) fn start_with_origin(
+    pub(crate) fn start_with_origin(
         routes: impl FnOnce(FixtureOrigin) -> Vec<(String, FixtureResponse)>,
     ) -> Result<Self, CrawlError> {
         let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(FIXTURE_HOST), 0))
             .map_err(|error| CrawlError::Fixture(error.to_string()))?;
+        Self::start_listener(listener, routes)
+    }
+
+    pub(crate) fn start_at(
+        port: u16,
+        routes: impl IntoIterator<Item = (String, FixtureResponse)>,
+    ) -> Result<Self, CrawlError> {
+        if port == 0 {
+            return Err(CrawlError::Fixture(
+                "stable fixture port must be nonzero".to_owned(),
+            ));
+        }
+        let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(FIXTURE_HOST), port))
+            .map_err(|error| CrawlError::Fixture(error.to_string()))?;
+        let routes = routes.into_iter().collect();
+        Self::start_listener(listener, |_| routes)
+    }
+
+    fn start_listener(
+        listener: TcpListener,
+        routes: impl FnOnce(FixtureOrigin) -> Vec<(String, FixtureResponse)>,
+    ) -> Result<Self, CrawlError> {
         listener
             .set_nonblocking(true)
             .map_err(|error| CrawlError::Fixture(error.to_string()))?;
@@ -167,20 +202,20 @@ impl LocalFixture {
         })
     }
 
-    pub(super) fn origin(&self) -> FixtureOrigin {
+    pub(crate) fn origin(&self) -> FixtureOrigin {
         self.origin
     }
 
-    pub(super) fn capability(&self) -> FixtureCapability {
+    pub(crate) fn capability(&self) -> FixtureCapability {
         self.capability.clone()
     }
 
-    pub(super) fn base_url(&self) -> Url {
+    pub(crate) fn base_url(&self) -> Url {
         Url::parse(&format!("http://127.0.0.1:{}/", self.origin.port))
             .expect("fixture origin is a validated loopback URL")
     }
 
-    pub(super) fn request_log(&self) -> Vec<String> {
+    pub(crate) fn request_log(&self) -> Vec<String> {
         self.requests
             .lock()
             .expect("fixture request log poisoned")
@@ -195,8 +230,12 @@ impl LocalFixture {
             .clone()
     }
 
-    pub(super) fn accepted_connections(&self) -> usize {
+    pub(crate) fn accepted_connections(&self) -> usize {
         self.accepted_connections.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn port(&self) -> u16 {
+        self.origin.port
     }
 
     #[cfg(test)]
@@ -245,6 +284,8 @@ fn serve_one(
         .unwrap_or("/")
         .to_owned();
     let mut conditional = false;
+    let mut if_none_match = None;
+    let mut if_modified_since = None;
     let mut observed_headers = Vec::new();
     loop {
         let mut header = String::new();
@@ -256,6 +297,11 @@ fn serve_one(
             let value = value.trim().to_owned();
             if matches!(name.as_str(), "if-none-match" | "if-modified-since") {
                 conditional = true;
+            }
+            match name.as_str() {
+                "if-none-match" => if_none_match = Some(value.clone()),
+                "if-modified-since" => if_modified_since = Some(value.clone()),
+                _ => {}
             }
             observed_headers.push((name, value));
         }
@@ -282,10 +328,20 @@ fn serve_one(
         .get(&route)
         .cloned()
         .unwrap_or(fallback);
-    let (status, body) = if response.status == 304 && !conditional {
-        (200, response.body.as_slice())
-    } else if response.status == 304 {
-        (304, &[][..])
+    let validators_match = conditional_validators_match(
+        if_none_match.as_deref(),
+        if_modified_since.as_deref(),
+        &response.headers,
+    );
+    let (status, body) = if response.status == 304 {
+        match response.not_modified_behavior {
+            FixtureNotModifiedBehavior::ScriptedConditional if conditional => (304, &[][..]),
+            FixtureNotModifiedBehavior::ScriptedConditional => (200, response.body.as_slice()),
+            FixtureNotModifiedBehavior::RequireMatchingValidator if validators_match => {
+                (304, &[][..])
+            }
+            FixtureNotModifiedBehavior::RequireMatchingValidator => (200, response.body.as_slice()),
+        }
     } else {
         (response.status, response.body.as_slice())
     };
@@ -322,8 +378,34 @@ fn serve_one(
     }
 }
 
+fn conditional_validators_match(
+    if_none_match: Option<&str>,
+    if_modified_since: Option<&str>,
+    response_headers: &[(String, String)],
+) -> bool {
+    let header = |name: &str| {
+        response_headers
+            .iter()
+            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    };
+
+    if let Some(request_etag) = if_none_match {
+        return header("etag").is_some_and(|response_etag| {
+            request_etag
+                .split(',')
+                .map(str::trim)
+                .any(|candidate| candidate == "*" || candidate == response_etag)
+        });
+    }
+
+    if_modified_since
+        .zip(header("last-modified"))
+        .is_some_and(|(request_date, response_date)| request_date == response_date)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct FixtureOrigin {
+pub(crate) struct FixtureOrigin {
     port: u16,
 }
 
@@ -345,7 +427,7 @@ impl FixtureOrigin {
             && url.password().is_none()
     }
 
-    pub(super) fn url(&self, path: &str) -> Result<UrlKey, CrawlError> {
+    pub(crate) fn url(&self, path: &str) -> Result<UrlKey, CrawlError> {
         let url = Url::parse(&format!("http://127.0.0.1:{}{path}", self.port))
             .map_err(|error| CrawlError::Url(error.to_string()))?;
         UrlKey::parse(url.as_str()).map_err(CrawlError::from)
@@ -882,5 +964,80 @@ mod tests {
         .unwrap_err();
         assert_eq!(error, CrawlError::RequestLimit);
         assert_eq!(fixture.request_log(), ["/robots.txt"]);
+    }
+
+    #[test]
+    fn stable_fixture_bind_fails_closed_on_conflict_and_rebinds_the_same_port() {
+        let first = LocalFixture::start(routes([])).unwrap();
+        let port = first.origin.port;
+        let original_origin = first.origin;
+        assert!(LocalFixture::start_at(port, routes([])).is_err());
+        drop(first);
+
+        let restarted = LocalFixture::start_at(port, routes([])).unwrap();
+        assert_eq!(restarted.origin, original_origin);
+        let restarted_key = UrlKey::parse(restarted.base_url().as_str()).unwrap();
+        assert_eq!(restarted_key, original_origin.url("/").unwrap());
+    }
+
+    #[test]
+    fn fixture_304_preserves_scripted_and_validator_matched_modes() {
+        let fixture = LocalFixture::start(routes([
+            (
+                "/page".to_owned(),
+                FixtureResponse::new(304, "text/html", "representation")
+                    .with_validator_matched_304()
+                    .with_header("ETag", "\"v1\"")
+                    .with_header("Last-Modified", "Tue, 14 Nov 2023 22:13:20 GMT"),
+            ),
+            (
+                "/scripted".to_owned(),
+                FixtureResponse::new(304, "text/html", "scripted representation")
+                    .with_header("ETag", "\"v1\""),
+            ),
+        ]))
+        .unwrap();
+        let client = reqwest::blocking::Client::new();
+        let url = fixture.base_url().join("page").unwrap();
+
+        let stale = client
+            .get(url.clone())
+            .header("If-None-Match", "\"v0\"")
+            .header("If-Modified-Since", "Tue, 14 Nov 2023 22:13:20 GMT")
+            .send()
+            .unwrap();
+        assert_eq!(stale.status(), reqwest::StatusCode::OK);
+        assert_eq!(stale.text().unwrap(), "representation");
+
+        let etag_match = client
+            .get(url.clone())
+            .header("If-None-Match", "\"v1\"")
+            .send()
+            .unwrap();
+        assert_eq!(etag_match.status(), reqwest::StatusCode::NOT_MODIFIED);
+        assert!(etag_match.bytes().unwrap().is_empty());
+
+        let date_match = client
+            .get(url)
+            .header("If-Modified-Since", "Tue, 14 Nov 2023 22:13:20 GMT")
+            .send()
+            .unwrap();
+        assert_eq!(date_match.status(), reqwest::StatusCode::NOT_MODIFIED);
+        assert!(date_match.bytes().unwrap().is_empty());
+
+        let scripted = client
+            .get(fixture.base_url().join("scripted").unwrap())
+            .header("If-None-Match", "\"v0\"")
+            .send()
+            .unwrap();
+        assert_eq!(scripted.status(), reqwest::StatusCode::NOT_MODIFIED);
+        assert!(scripted.bytes().unwrap().is_empty());
+
+        let unconditional = client
+            .get(fixture.base_url().join("scripted").unwrap())
+            .send()
+            .unwrap();
+        assert_eq!(unconditional.status(), reqwest::StatusCode::OK);
+        assert_eq!(unconditional.text().unwrap(), "scripted representation");
     }
 }

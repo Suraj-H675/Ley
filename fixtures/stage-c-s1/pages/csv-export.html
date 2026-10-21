@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CSV export checks</title>
+  <meta name="description" content="A short procedure for checking a session CSV before adding it to the local archive.">
+</head>
+<body>
+  <main>
+    <article>
+      <h1>CSV export checks</h1>
+      <p>A short procedure for checking a session CSV before adding it to the local archive.</p>
+    <section>
+      <h2>Column and encoding checks</h2>
+      <p>The export uses the field order documented in the data-format page and UTF-8 encoding. A header row appears once. The export check rejects a file if an instrument ID moves into the unit column or if a decoded Unicode label becomes replacement characters such as �.</p>
+    </section>
+    <section>
+      <h2>Quoting</h2>
+      <p>The exporter encloses a field in double quotes when it contains a comma, a quote, or a line break. It doubles an embedded quote. A note such as `mast, east pad` remains one field after import, while a plain identifier such as `WX-04` needs no quotes.</p>
+    </section>
+    <section>
+      <h2>Review before archive</h2>
+      <p>The recorder checks row count, timestamp order, and missing-value markers against the field log. A correction creates a new archive revision with a note; it does not overwrite a file that another session already cited. The archive records page describes that retention rule.</p>
+    </section>
+      <section>
+        <h2>Related pages</h2>
+        <ul>
+          <li><a href="data-format.html">Asteria observation record format</a></li>
+          <li><a href="field-log.html">Field log entry format</a></li>
+          <li><a href="unicode-station-names.html">Unicode station labels and export</a></li>
+        </ul>
+      </section>
+    </article>
+  </main>
+</body>
+</html>

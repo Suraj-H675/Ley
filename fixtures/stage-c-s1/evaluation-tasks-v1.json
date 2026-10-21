@@ -1,0 +1,330 @@
+{
+  "schema": "ley-stage-c-s1-frozen-evaluation-v1",
+  "frozen_at_utc": "2026-10-20T18:06:29Z",
+  "frozen_before_candidate_crawls_and_retrieval": true,
+  "authoring_and_judgment_provenance": "Task wording, expected source URLs, and passage substrings frozen by the accountable Codex implementer from the CC0 route manifest and authored HTML. No retrieval output was inspected. This is not an independent relevance judgment.",
+  "collection": {
+    "id": "asteria-ridge-observatory-synthetic",
+    "source_id": "stage-c-s1-asteria",
+    "origin": "http://127.0.0.1:41697",
+    "source_url_keys": [
+      "http://127.0.0.1:41697/pages/accessibility-guide.html",
+      "http://127.0.0.1:41697/pages/after-hours-training.html",
+      "http://127.0.0.1:41697/pages/air-quality.html",
+      "http://127.0.0.1:41697/pages/archive-records.html",
+      "http://127.0.0.1:41697/pages/backup-procedure.html",
+      "http://127.0.0.1:41697/pages/clock-sync.html",
+      "http://127.0.0.1:41697/pages/csv-export.html",
+      "http://127.0.0.1:41697/pages/data-format.html",
+      "http://127.0.0.1:41697/pages/field-log.html",
+      "http://127.0.0.1:41697/pages/identifier-registry.html",
+      "http://127.0.0.1:41697/pages/incident-reporting.html",
+      "http://127.0.0.1:41697/pages/ipv6-link-local.html",
+      "http://127.0.0.1:41697/pages/maintenance-schedule.html",
+      "http://127.0.0.1:41697/pages/measurement-uncertainty.html",
+      "http://127.0.0.1:41697/pages/network-map.html",
+      "http://127.0.0.1:41697/pages/night-operations.html",
+      "http://127.0.0.1:41697/pages/observatory-index.html",
+      "http://127.0.0.1:41697/pages/power-system.html",
+      "http://127.0.0.1:41697/pages/radio-handbook.html",
+      "http://127.0.0.1:41697/pages/rain-gauge.html",
+      "http://127.0.0.1:41697/pages/research-agreement.html",
+      "http://127.0.0.1:41697/pages/safety-practices.html",
+      "http://127.0.0.1:41697/pages/sensor-calibration.html",
+      "http://127.0.0.1:41697/pages/serial-protocol.html",
+      "http://127.0.0.1:41697/pages/site-layout.html",
+      "http://127.0.0.1:41697/pages/sky-camera.html",
+      "http://127.0.0.1:41697/pages/station-charter.html",
+      "http://127.0.0.1:41697/pages/unicode-station-names.html",
+      "http://127.0.0.1:41697/pages/weather-sensor.html",
+      "http://127.0.0.1:41697/pages/wind-vane.html",
+      "http://127.0.0.1:41697/records/night-watch-2024.html",
+      "http://127.0.0.1:41697/retired/legacy-calibration.html",
+      "http://127.0.0.1:41697/robots.txt",
+      "http://127.0.0.1:41697/start-here",
+      "http://127.0.0.1:41697/suppressed/maintenance-draft.html"
+    ],
+    "profile_store_identities": {
+      "seed-only": "a34df9b756716347147b33642bba43ab",
+      "link-discovery": "2e86d1c22ae9305882dcea7789da1a19",
+      "extra-seeds": "e855592174fd65d42fdbf2621001785b"
+    },
+    "profile_seed_url_keys": {
+      "seed-only": [
+        "http://127.0.0.1:41697/pages/observatory-index.html"
+      ],
+      "link-discovery": [
+        "http://127.0.0.1:41697/pages/observatory-index.html"
+      ],
+      "extra-seeds": [
+        "http://127.0.0.1:41697/pages/observatory-index.html",
+        "http://127.0.0.1:41697/pages/archive-records.html",
+        "http://127.0.0.1:41697/pages/research-agreement.html"
+      ]
+    },
+    "profiles": {
+      "seed-only": {
+        "link_discovery_enabled": false
+      },
+      "link-discovery": {
+        "link_discovery_enabled": true
+      },
+      "extra-seeds": {
+        "link_discovery_enabled": true
+      }
+    },
+    "rights": "CC0-1.0; see fixtures/stage-c-s1/ATTRIBUTION.txt",
+    "route_manifest_sha256": "d503ed72a0a805c792fd2aa341dc8249788f210ed667ad62e46700fd4083c965",
+    "dataset_sha256": "0707dbfbc63413defbe54599e9df1f80e675c060c4f42e64be9f15e187c61f4d"
+  },
+  "protocol": {
+    "retrieval_contract": "existing versioned ordinary-question CLI; no ranking or analyzer changes",
+    "top_k": 4,
+    "source_coverage_is_measured_separately_from_top_k_support": true,
+    "positive_support_rule": "A supporting top-k passage must have the exact expected requested_url and contain the frozen exact substring.",
+    "negative_and_ambiguous_rule": "Record raw status, completeness, answerAssessment, hits, and passages. Do not assign confidence. Mark unsupported claims as false positives only when returned passages purport to support the frozen unsupported proposition.",
+    "heldout_fraction": "4/16 = 25%",
+    "no_heldout_retuning": true
+  },
+  "tasks": [
+    {
+      "id": "dev-01",
+      "split": "development",
+      "kind": "answerable",
+      "question": "How high is the WX-04 temperature shield above the north pad, and which mast is it on?",
+      "expected_source_urls": [
+        "http://127.0.0.1:41697/pages/weather-sensor.html"
+      ],
+      "expected_support_passages": [
+        {
+          "source_url": "http://127.0.0.1:41697/pages/weather-sensor.html",
+          "contains_exact_text": "The fictional mast label is `WX-04`. Its temperature shield sits 1.8 m above the north pad surface, away from the operations-room exhaust.",
+          "text_sha256": "a49a5b292979a3852ee0cba793888e49c77f664b8a20a835fee0dfe02cb0f23c"
+        }
+      ]
+    },
+    {
+      "id": "dev-02",
+      "split": "development",
+      "kind": "answerable",
+      "question": "In an Asteria export, what does a blank value mean, and is it equivalent to zero or an offline sensor?",
+      "expected_source_urls": [
+        "http://127.0.0.1:41697/pages/data-format.html"
+      ],
+      "expected_support_passages": [
+        {
+          "source_url": "http://127.0.0.1:41697/pages/data-format.html",
+          "contains_exact_text": "A blank value means no reading was recorded. It does not mean zero, and it does not mean that the sensor was offline. The recorder adds a status code such as `sensor_unavailable` when the reason is known.",
+          "text_sha256": "2aea97c2117963e48d4a207bbe5a189ce52b216d3392b75d201a8e57c24e4884"
+        }
+      ]
+    },
+    {
+      "id": "dev-03",
+      "split": "development",
+      "kind": "answerable",
+      "question": "How should the recorder write a reference display that is 1.4 seconds slow?",
+      "expected_source_urls": [
+        "http://127.0.0.1:41697/pages/clock-sync.html"
+      ],
+      "expected_support_passages": [
+        {
+          "source_url": "http://127.0.0.1:41697/pages/clock-sync.html",
+          "contains_exact_text": "A display that is 1.4 seconds slow is recorded as −1.4 s, not as an unlabeled correction.",
+          "text_sha256": "0ba3f6881b0d5d4e09f1fcf475e98c347bf984c9b42ba5ddd0fe9d738178447b"
+        }
+      ]
+    },
+    {
+      "id": "dev-04",
+      "split": "development",
+      "kind": "answerable",
+      "question": "What are the opening byte and example command for the maintenance serial status frame, and how is length bounded?",
+      "expected_source_urls": [
+        "http://127.0.0.1:41697/pages/serial-protocol.html"
+      ],
+      "expected_support_passages": [
+        {
+          "source_url": "http://127.0.0.1:41697/pages/serial-protocol.html",
+          "contains_exact_text": "A maintenance frame starts with byte `0x7E`, a one-byte device address, a one-byte command, a two-byte payload length, and a checksum. The example status request uses command `0x11` and a zero-length payload. The receiver rejects a frame whose declared length exceeds the local buffer limit.",
+          "text_sha256": "d38ddf38448910fb10e9740db3cb1fe40b3911c3069bd11ff0d18d9b1038aa46"
+        }
+      ]
+    },
+    {
+      "id": "dev-05",
+      "split": "development",
+      "kind": "answerable",
+      "question": "When must the Asteria CSV exporter quote a field, and what does it do with an embedded quote?",
+      "expected_source_urls": [
+        "http://127.0.0.1:41697/pages/csv-export.html"
+      ],
+      "expected_support_passages": [
+        {
+          "source_url": "http://127.0.0.1:41697/pages/csv-export.html",
+          "contains_exact_text": "The exporter encloses a field in double quotes when it contains a comma, a quote, or a line break. It doubles an embedded quote.",
+          "text_sha256": "d9ae36c836fd671926b373857e789e1668730b9675ee6e7fddb89d37e296ef4a"
+        }
+      ]
+    },
+    {
+      "id": "dev-06",
+      "split": "development",
+      "kind": "answerable",
+      "question": "A wind-vane display says 090°. Which direction is that, and how is direction measured?",
+      "expected_source_urls": [
+        "http://127.0.0.1:41697/pages/wind-vane.html"
+      ],
+      "expected_support_passages": [
+        {
+          "source_url": "http://127.0.0.1:41697/pages/wind-vane.html",
+          "contains_exact_text": "The display reports the direction from which the wind arrives, measured clockwise from north. A reading of 090° means wind from the east.",
+          "text_sha256": "640369b8f112d5e0f26a1d70e5fc843596d35daab7943d537462f58b332c965f"
+        }
+      ]
+    },
+    {
+      "id": "dev-07",
+      "split": "development",
+      "kind": "answerable",
+      "question": "Does a difference of 12 RG-02 pulses mean 12 millimetres of rain? What determines conversion?",
+      "expected_source_urls": [
+        "http://127.0.0.1:41697/pages/rain-gauge.html"
+      ],
+      "expected_support_passages": [
+        {
+          "source_url": "http://127.0.0.1:41697/pages/rain-gauge.html",
+          "contains_exact_text": "A difference of 12 pulses means twelve events, not twelve millimetres unless the current calibration factor supports that conversion.",
+          "text_sha256": "c894ead11df6b233a21c4c45b1fb254dd02de33d88400ee276b877aa3ad1e57f"
+        }
+      ]
+    },
+    {
+      "id": "dev-08",
+      "split": "development",
+      "kind": "answerable",
+      "question": "How many calibration readings are recorded after the sensor settles?",
+      "expected_source_urls": [
+        "http://127.0.0.1:41697/pages/sensor-calibration.html"
+      ],
+      "expected_support_passages": [
+        {
+          "source_url": "http://127.0.0.1:41697/pages/sensor-calibration.html",
+          "contains_exact_text": "The operator takes three readings after the sensor settles, then records all three values instead of choosing the one that looks most plausible.",
+          "text_sha256": "33ed895a3d195bbc2468a9f50af01427cc9639b59bc29af7a47d81f006892c64"
+        }
+      ]
+    },
+    {
+      "id": "dev-09",
+      "split": "development",
+      "kind": "answerable",
+      "question": "In the revised field log, what clock source labels are allowed and what must a derived reading retain?",
+      "expected_source_urls": [
+        "http://127.0.0.1:41697/pages/field-log.html"
+      ],
+      "expected_support_passages": [
+        {
+          "source_url": "http://127.0.0.1:41697/pages/field-log.html",
+          "contains_exact_text": "The recorder writes the clock source as `TIME-01` or `manual-check`. A missing value remains unavailable rather than becoming zero.",
+          "text_sha256": "1f281c85eef1836ccd5bb94a94cfdf36661be50003508cc47a83e731036fe5b7"
+        }
+      ]
+    },
+    {
+      "id": "dev-10",
+      "split": "development",
+      "kind": "answerable",
+      "question": "Which conditions make an Asteria volunteer stop a task, and who should they contact?",
+      "expected_source_urls": [
+        "http://127.0.0.1:41697/pages/safety-practices.html"
+      ],
+      "expected_support_passages": [
+        {
+          "source_url": "http://127.0.0.1:41697/pages/safety-practices.html",
+          "contains_exact_text": "A volunteer stops a task when a cable is damaged, a cover is wet, an odor is unexplained, or the work area differs from the local plan. The volunteer moves to the designated safe area and contacts the session lead.",
+          "text_sha256": "0eaa67b36f915c1b0cd2fb32f4d66a08d2d35bf797f22b6ec46cec27e5c55450"
+        }
+      ]
+    },
+    {
+      "id": "dev-11",
+      "split": "development",
+      "kind": "negative",
+      "question": "What is NASA’s confirmed launch date and launch vehicle for its next crewed lunar mission?",
+      "expected_source_urls": [],
+      "expected_support_passages": [],
+      "judgment": "No source in this fictional corpus supports the external NASA launch claim. Record the actual retrieval status and any returned passages; do not infer confidence from a score."
+    },
+    {
+      "id": "dev-12",
+      "split": "development",
+      "kind": "ambiguous",
+      "question": "Which named person is authorized to disconnect the backup battery cabinet?",
+      "expected_source_urls": [],
+      "expected_support_passages": [],
+      "candidate_source_urls": [
+        "http://127.0.0.1:41697/pages/site-layout.html",
+        "http://127.0.0.1:41697/pages/safety-practices.html"
+      ],
+      "judgment": "The corpus locates the cabinet and says only authorized personnel handle electrical enclosures; it names no person and gives no lockout authorization. A passage may support only that limited wording, not an identity."
+    },
+    {
+      "id": "heldout-13",
+      "split": "heldout",
+      "kind": "answerable",
+      "question": "If a later corrected archive export has more rows, should the original be replaced?",
+      "expected_source_urls": [
+        "http://127.0.0.1:41697/pages/archive-records.html"
+      ],
+      "expected_support_passages": [
+        {
+          "source_url": "http://127.0.0.1:41697/pages/archive-records.html",
+          "contains_exact_text": "The archive does not replace the first file merely because the new file has more rows or a later timestamp.",
+          "text_sha256": "2628d4646f7e5479f1a62122d8f052048ee98fc2fd70f7c05a9b01a387c67b5d"
+        }
+      ]
+    },
+    {
+      "id": "heldout-14",
+      "split": "heldout",
+      "kind": "answerable",
+      "question": "What information must a collaborator provide before the station prepares a record copy?",
+      "expected_source_urls": [
+        "http://127.0.0.1:41697/pages/research-agreement.html"
+      ],
+      "expected_support_passages": [
+        {
+          "source_url": "http://127.0.0.1:41697/pages/research-agreement.html",
+          "contains_exact_text": "A collaborator names the session IDs, intended analysis, and requested date range.",
+          "text_sha256": "990b083cf2ad415bb512af9bc99d1e335b2e9c32d64be21efdd4b15bb198026e"
+        }
+      ]
+    },
+    {
+      "id": "heldout-15",
+      "split": "heldout",
+      "kind": "answerable",
+      "question": "Which two UTF-8 display labels are used for the eastern window and temperature difference, and what stays the lookup key?",
+      "expected_source_urls": [
+        "http://127.0.0.1:41697/pages/unicode-station-names.html"
+      ],
+      "expected_support_passages": [
+        {
+          "source_url": "http://127.0.0.1:41697/pages/unicode-station-names.html",
+          "contains_exact_text": "The eastern window is labeled `北窗` in the volunteer notebook, and the instrument group uses `ΔTₐ` for a temperature difference derived from two probes. These are display labels. The ASCII device ID remains the lookup key because older serial tools accept only a restricted character set.",
+          "text_sha256": "d9392eb3d22a50d8a1b626777def2ac1ef06f1c9000285e143adeb2e44d245a4"
+        }
+      ]
+    },
+    {
+      "id": "heldout-16",
+      "split": "heldout",
+      "kind": "negative",
+      "question": "What date is the next crewed lunar mission from Asteria Ridge scheduled to launch?",
+      "expected_source_urls": [],
+      "expected_support_passages": [],
+      "judgment": "No source in the fictional corpus supports a real or fictional launch date. Preserve the system status and passage outputs, and do not invent a confidence score."
+    }
+  ]
+}

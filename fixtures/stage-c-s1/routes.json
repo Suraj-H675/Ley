@@ -1,0 +1,1061 @@
+{
+  "schema_version": 1,
+  "collection_id": "asteria-ridge-observatory-synthetic",
+  "description": "Original fictional local-only fixture corpus for Ley Stage C controlled discovery and freshness work.",
+  "rights": {
+    "license": "CC0-1.0",
+    "notice": "ATTRIBUTION.txt"
+  },
+  "time_basis": "Fixture-only simulated UTC validators. These dates are corpus metadata, not live source freshness claims.",
+  "document_count": 30,
+  "profiles": {
+    "seed-only": {
+      "seed_ids": [
+        "observatory-index"
+      ],
+      "link_discovery": false
+    },
+    "link-discovery": {
+      "seed_ids": [
+        "observatory-index"
+      ],
+      "link_discovery": true
+    },
+    "extra-seeds": {
+      "seed_ids": [
+        "observatory-index",
+        "archive-records",
+        "research-agreement"
+      ],
+      "link_discovery": true
+    }
+  },
+  "schedule": {
+    "initial_revision": "v1",
+    "recrawl_advance_ms": 86400000,
+    "update_revision": "v2",
+    "not_found_confirmation_advance_ms": 1000,
+    "note": "Advance only the fixture logical clock. Do not use these timestamps as production source times."
+  },
+  "pages": [
+    {
+      "id": "observatory-index",
+      "path": "/pages/observatory-index.html",
+      "file": "pages/observatory-index.html",
+      "title": "Asteria Ridge Observatory field index",
+      "summary": "A working index for the fictional Asteria Ridge community observatory, its instruments, records, and operating procedures.",
+      "seed_group": "root",
+      "links": [
+        "/pages/station-charter.html",
+        "/pages/site-layout.html",
+        "/pages/field-log.html",
+        "/pages/radio-handbook.html",
+        "/pages/sensor-calibration.html",
+        "/pages/data-format.html",
+        "/pages/accessibility-guide.html"
+      ],
+      "duplicate_links": [
+        "/pages/field-log.html"
+      ],
+      "versions": {
+        "v1": {
+          "file": "pages/observatory-index.html",
+          "status": 200,
+          "etag": "\"asteria-observatory-index-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT"
+        },
+        "v2": {
+          "file": "pages/observatory-index.html",
+          "status": 200,
+          "etag": "\"asteria-observatory-index-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT",
+          "unchanged": true
+        }
+      },
+      "special_links": [
+        "/start-here"
+      ]
+    },
+    {
+      "id": "station-charter",
+      "path": "/pages/station-charter.html",
+      "file": "pages/station-charter.html",
+      "title": "Station charter and shift roles",
+      "summary": "The Asteria Ridge charter defines who records a session and how a shift hands work to the next crew.",
+      "seed_group": "connected",
+      "links": [
+        "/pages/accessibility-guide.html",
+        "/pages/safety-practices.html",
+        "/pages/incident-reporting.html",
+        "/pages/night-operations.html",
+        "/pages/observatory-index.html",
+        "/pages/after-hours-training.html"
+      ],
+      "duplicate_links": [],
+      "versions": {
+        "v1": {
+          "file": "pages/station-charter.html",
+          "status": 200,
+          "etag": "\"asteria-station-charter-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT"
+        },
+        "v2": {
+          "file": "pages/station-charter.html",
+          "status": 200,
+          "etag": "\"asteria-station-charter-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT",
+          "unchanged": true
+        }
+      }
+    },
+    {
+      "id": "site-layout",
+      "path": "/pages/site-layout.html",
+      "file": "pages/site-layout.html",
+      "title": "Asteria Ridge site layout",
+      "summary": "A route description for the fictional instrument yard and the small operations room.",
+      "seed_group": "connected",
+      "links": [
+        "/pages/network-map.html",
+        "/pages/weather-sensor.html",
+        "/pages/rain-gauge.html",
+        "/pages/wind-vane.html",
+        "/pages/sky-camera.html",
+        "/pages/power-system.html",
+        "/pages/observatory-index.html"
+      ],
+      "duplicate_links": [
+        "/pages/wind-vane.html"
+      ],
+      "versions": {
+        "v1": {
+          "file": "pages/site-layout.html",
+          "status": 200,
+          "etag": "\"asteria-site-layout-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT"
+        },
+        "v2": {
+          "file": "pages/site-layout.html",
+          "status": 200,
+          "etag": "\"asteria-site-layout-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT",
+          "unchanged": true
+        }
+      },
+      "special_links": [
+        "/suppressed/maintenance-draft.html"
+      ]
+    },
+    {
+      "id": "field-log",
+      "path": "/pages/field-log.html",
+      "file": "pages/field-log.html",
+      "title": "Field log entry format",
+      "summary": "The field log records observations with enough context for another volunteer to interpret them.",
+      "seed_group": "connected",
+      "links": [
+        "/pages/measurement-uncertainty.html",
+        "/pages/data-format.html",
+        "/pages/unicode-station-names.html",
+        "/pages/csv-export.html",
+        "/pages/observatory-index.html"
+      ],
+      "duplicate_links": [],
+      "versions": {
+        "v1": {
+          "file": "pages/field-log.html",
+          "status": 200,
+          "etag": "\"asteria-field-log-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT"
+        },
+        "v2": {
+          "file": "pages/field-log-v2.html",
+          "status": 200,
+          "etag": "\"asteria-field-log-v2\"",
+          "last_modified": "Wed, 21 Oct 2026 12:00:00 GMT",
+          "unchanged": false
+        }
+      }
+    },
+    {
+      "id": "radio-handbook",
+      "path": "/pages/radio-handbook.html",
+      "file": "pages/radio-handbook.html",
+      "title": "Radio control handbook",
+      "summary": "The fictional radio link carries short control messages between the operations room and field instruments.",
+      "seed_group": "connected",
+      "links": [
+        "/pages/serial-protocol.html",
+        "/pages/clock-sync.html",
+        "/pages/identifier-registry.html",
+        "/pages/safety-practices.html",
+        "/pages/observatory-index.html"
+      ],
+      "duplicate_links": [],
+      "versions": {
+        "v1": {
+          "file": "pages/radio-handbook.html",
+          "status": 200,
+          "etag": "\"asteria-radio-handbook-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT"
+        },
+        "v2": {
+          "file": "pages/radio-handbook.html",
+          "status": 200,
+          "etag": "\"asteria-radio-handbook-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT",
+          "unchanged": true
+        }
+      }
+    },
+    {
+      "id": "sensor-calibration",
+      "path": "/pages/sensor-calibration.html",
+      "file": "pages/sensor-calibration.html",
+      "title": "Sensor calibration record",
+      "summary": "A calibration record ties a sensor reading to a reference check and a dated adjustment note.",
+      "seed_group": "connected",
+      "links": [
+        "/pages/weather-sensor.html",
+        "/pages/air-quality.html",
+        "/pages/rain-gauge.html",
+        "/pages/measurement-uncertainty.html",
+        "/pages/observatory-index.html"
+      ],
+      "duplicate_links": [],
+      "versions": {
+        "v1": {
+          "file": "pages/sensor-calibration.html",
+          "status": 200,
+          "etag": "\"asteria-sensor-calibration-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT"
+        },
+        "v2": {
+          "file": "pages/sensor-calibration.html",
+          "status": 200,
+          "etag": "\"asteria-sensor-calibration-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT",
+          "unchanged": true
+        }
+      }
+    },
+    {
+      "id": "clock-sync",
+      "path": "/pages/clock-sync.html",
+      "file": "pages/clock-sync.html",
+      "title": "Session clock synchronization",
+      "summary": "The observatory uses one session reference to make timestamps from logs and devices comparable.",
+      "seed_group": "connected",
+      "links": [
+        "/pages/network-map.html",
+        "/pages/radio-handbook.html",
+        "/pages/serial-protocol.html",
+        "/pages/field-log.html"
+      ],
+      "duplicate_links": [],
+      "versions": {
+        "v1": {
+          "file": "pages/clock-sync.html",
+          "status": 200,
+          "etag": "\"asteria-clock-sync-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT"
+        },
+        "v2": {
+          "file": "pages/clock-sync.html",
+          "status": 200,
+          "etag": "\"asteria-clock-sync-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT",
+          "unchanged": true
+        }
+      }
+    },
+    {
+      "id": "data-format",
+      "path": "/pages/data-format.html",
+      "file": "pages/data-format.html",
+      "title": "Asteria observation record format",
+      "summary": "The record format describes field names, units, and identifiers used in exported observations.",
+      "seed_group": "connected",
+      "links": [
+        "/pages/csv-export.html",
+        "/pages/identifier-registry.html",
+        "/pages/field-log.html",
+        "/pages/unicode-station-names.html"
+      ],
+      "duplicate_links": [],
+      "versions": {
+        "v1": {
+          "file": "pages/data-format.html",
+          "status": 200,
+          "etag": "\"asteria-data-format-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT"
+        },
+        "v2": {
+          "file": "pages/data-format.html",
+          "status": 200,
+          "etag": "\"asteria-data-format-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT",
+          "unchanged": true
+        }
+      }
+    },
+    {
+      "id": "csv-export",
+      "path": "/pages/csv-export.html",
+      "file": "pages/csv-export.html",
+      "title": "CSV export checks",
+      "summary": "A short procedure for checking a session CSV before adding it to the local archive.",
+      "seed_group": "connected",
+      "links": [
+        "/pages/data-format.html",
+        "/pages/field-log.html",
+        "/pages/unicode-station-names.html"
+      ],
+      "duplicate_links": [],
+      "versions": {
+        "v1": {
+          "file": "pages/csv-export.html",
+          "status": 200,
+          "etag": "\"asteria-csv-export-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT"
+        },
+        "v2": {
+          "file": "pages/csv-export.html",
+          "status": 200,
+          "etag": "\"asteria-csv-export-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT",
+          "unchanged": true
+        }
+      }
+    },
+    {
+      "id": "measurement-uncertainty",
+      "path": "/pages/measurement-uncertainty.html",
+      "file": "pages/measurement-uncertainty.html",
+      "title": "Reporting measurement uncertainty",
+      "summary": "The guide separates display resolution from observed variation in repeated measurements.",
+      "seed_group": "connected",
+      "links": [
+        "/pages/sensor-calibration.html",
+        "/pages/field-log.html",
+        "/pages/data-format.html"
+      ],
+      "duplicate_links": [],
+      "versions": {
+        "v1": {
+          "file": "pages/measurement-uncertainty.html",
+          "status": 200,
+          "etag": "\"asteria-measurement-uncertainty-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT"
+        },
+        "v2": {
+          "file": "pages/measurement-uncertainty.html",
+          "status": 200,
+          "etag": "\"asteria-measurement-uncertainty-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT",
+          "unchanged": true
+        }
+      }
+    },
+    {
+      "id": "weather-sensor",
+      "path": "/pages/weather-sensor.html",
+      "file": "pages/weather-sensor.html",
+      "title": "Weather mast sensor notes",
+      "summary": "The weather mast records air temperature and relative humidity at a fixed height above the pad.",
+      "seed_group": "connected",
+      "links": [
+        "/pages/sensor-calibration.html",
+        "/pages/rain-gauge.html",
+        "/pages/wind-vane.html",
+        "/pages/site-layout.html",
+        "/pages/field-log.html"
+      ],
+      "duplicate_links": [],
+      "versions": {
+        "v1": {
+          "file": "pages/weather-sensor.html",
+          "status": 200,
+          "etag": "\"asteria-weather-sensor-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT"
+        },
+        "v2": {
+          "file": "pages/weather-sensor.html",
+          "status": 200,
+          "etag": "\"asteria-weather-sensor-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT",
+          "unchanged": true
+        }
+      }
+    },
+    {
+      "id": "rain-gauge",
+      "path": "/pages/rain-gauge.html",
+      "file": "pages/rain-gauge.html",
+      "title": "Tipping-bucket rain gauge",
+      "summary": "The rain gauge converts bucket tips into a cumulative precipitation estimate for a session.",
+      "seed_group": "connected",
+      "links": [
+        "/pages/site-layout.html",
+        "/pages/weather-sensor.html",
+        "/pages/sensor-calibration.html",
+        "/pages/field-log.html"
+      ],
+      "duplicate_links": [],
+      "versions": {
+        "v1": {
+          "file": "pages/rain-gauge.html",
+          "status": 200,
+          "etag": "\"asteria-rain-gauge-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT"
+        },
+        "v2": {
+          "file": "pages/rain-gauge.html",
+          "status": 200,
+          "etag": "\"asteria-rain-gauge-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT",
+          "unchanged": true
+        }
+      }
+    },
+    {
+      "id": "wind-vane",
+      "path": "/pages/wind-vane.html",
+      "file": "pages/wind-vane.html",
+      "title": "Wind vane orientation and readings",
+      "summary": "The wind vane record defines the direction convention used by the Asteria field log.",
+      "seed_group": "connected",
+      "links": [
+        "/pages/site-layout.html",
+        "/pages/weather-sensor.html",
+        "/pages/sensor-calibration.html",
+        "/pages/identifier-registry.html"
+      ],
+      "duplicate_links": [],
+      "versions": {
+        "v1": {
+          "file": "pages/wind-vane.html",
+          "status": 200,
+          "etag": "\"asteria-wind-vane-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT"
+        },
+        "v2": {
+          "file": "pages/wind-vane.html",
+          "status": 200,
+          "etag": "\"asteria-wind-vane-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT",
+          "unchanged": true
+        }
+      }
+    },
+    {
+      "id": "air-quality",
+      "path": "/pages/air-quality.html",
+      "file": "pages/air-quality.html",
+      "title": "Air-quality inlet handling",
+      "summary": "The fictional particle monitor uses a clear inlet and a documented warm-up interval.",
+      "seed_group": "connected",
+      "links": [
+        "/pages/sensor-calibration.html",
+        "/pages/weather-sensor.html",
+        "/pages/site-layout.html",
+        "/pages/identifier-registry.html"
+      ],
+      "duplicate_links": [],
+      "versions": {
+        "v1": {
+          "file": "pages/air-quality.html",
+          "status": 200,
+          "etag": "\"asteria-air-quality-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT"
+        },
+        "v2": {
+          "file": "pages/air-quality.html",
+          "status": 200,
+          "etag": "\"asteria-air-quality-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT",
+          "unchanged": true
+        }
+      }
+    },
+    {
+      "id": "sky-camera",
+      "path": "/pages/sky-camera.html",
+      "file": "pages/sky-camera.html",
+      "title": "Sky camera capture notes",
+      "summary": "The sky camera records the visible cloud field with a fixed exposure and a session timestamp.",
+      "seed_group": "connected",
+      "links": [
+        "/pages/night-operations.html",
+        "/pages/clock-sync.html",
+        "/pages/site-layout.html",
+        "/pages/incident-reporting.html"
+      ],
+      "duplicate_links": [],
+      "versions": {
+        "v1": {
+          "file": "pages/sky-camera.html",
+          "status": 200,
+          "etag": "\"asteria-sky-camera-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT"
+        },
+        "v2": {
+          "file": "pages/sky-camera.html",
+          "status": 200,
+          "etag": "\"asteria-sky-camera-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT",
+          "unchanged": true
+        }
+      }
+    },
+    {
+      "id": "night-operations",
+      "path": "/pages/night-operations.html",
+      "file": "pages/night-operations.html",
+      "title": "Night session operating notes",
+      "summary": "The night session notes cover setup, observation intervals, and the closeout handoff.",
+      "seed_group": "connected",
+      "links": [
+        "/pages/sky-camera.html",
+        "/pages/maintenance-schedule.html",
+        "/pages/field-log.html",
+        "/pages/safety-practices.html",
+        "/pages/incident-reporting.html"
+      ],
+      "duplicate_links": [],
+      "versions": {
+        "v1": {
+          "file": "pages/night-operations.html",
+          "status": 200,
+          "etag": "\"asteria-night-operations-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT"
+        },
+        "v2": {
+          "file": "pages/night-operations.html",
+          "status": 200,
+          "etag": "\"asteria-night-operations-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT",
+          "unchanged": true
+        }
+      }
+    },
+    {
+      "id": "maintenance-schedule",
+      "path": "/pages/maintenance-schedule.html",
+      "file": "pages/maintenance-schedule.html",
+      "title": "Routine maintenance schedule",
+      "summary": "A schedule for recurring checks and their evidence records at the fictional observatory.",
+      "seed_group": "connected",
+      "links": [
+        "/pages/power-system.html",
+        "/pages/backup-procedure.html",
+        "/pages/sensor-calibration.html",
+        "/pages/night-operations.html",
+        "/pages/observatory-index.html"
+      ],
+      "duplicate_links": [],
+      "versions": {
+        "v1": {
+          "file": "pages/maintenance-schedule.html",
+          "status": 200,
+          "etag": "\"asteria-maintenance-schedule-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT"
+        },
+        "v2": {
+          "file": "pages/maintenance-schedule.html",
+          "status": 200,
+          "etag": "\"asteria-maintenance-schedule-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT",
+          "unchanged": true
+        }
+      },
+      "special_links": [
+        "/retired/legacy-calibration.html",
+        "/records/night-watch-2024.html"
+      ]
+    },
+    {
+      "id": "power-system",
+      "path": "/pages/power-system.html",
+      "file": "pages/power-system.html",
+      "title": "Operations power system overview",
+      "summary": "The operations room uses a mains supply and a monitored battery backup for the recorder and clock display.",
+      "seed_group": "connected",
+      "links": [
+        "/pages/backup-procedure.html",
+        "/pages/maintenance-schedule.html",
+        "/pages/site-layout.html",
+        "/pages/safety-practices.html"
+      ],
+      "duplicate_links": [],
+      "versions": {
+        "v1": {
+          "file": "pages/power-system.html",
+          "status": 200,
+          "etag": "\"asteria-power-system-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT"
+        },
+        "v2": {
+          "file": "pages/power-system.html",
+          "status": 200,
+          "etag": "\"asteria-power-system-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT",
+          "unchanged": true
+        }
+      }
+    },
+    {
+      "id": "backup-procedure",
+      "path": "/pages/backup-procedure.html",
+      "file": "pages/backup-procedure.html",
+      "title": "Session record backup and restore",
+      "summary": "The backup procedure checks that an archived session can be read after a local copy is restored.",
+      "seed_group": "connected",
+      "links": [
+        "/pages/maintenance-schedule.html",
+        "/pages/power-system.html",
+        "/pages/csv-export.html"
+      ],
+      "duplicate_links": [],
+      "versions": {
+        "v1": {
+          "file": "pages/backup-procedure.html",
+          "status": 200,
+          "etag": "\"asteria-backup-procedure-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT"
+        },
+        "v2": {
+          "file": "pages/backup-procedure.html",
+          "status": 200,
+          "etag": "\"asteria-backup-procedure-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT",
+          "unchanged": true
+        }
+      }
+    },
+    {
+      "id": "network-map",
+      "path": "/pages/network-map.html",
+      "file": "pages/network-map.html",
+      "title": "Local instrument network map",
+      "summary": "A text map names the fictional devices on the operations network without exposing real addresses.",
+      "seed_group": "connected",
+      "links": [
+        "/pages/clock-sync.html",
+        "/pages/ipv6-link-local.html",
+        "/pages/radio-handbook.html",
+        "/pages/site-layout.html"
+      ],
+      "duplicate_links": [],
+      "versions": {
+        "v1": {
+          "file": "pages/network-map.html",
+          "status": 200,
+          "etag": "\"asteria-network-map-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT"
+        },
+        "v2": {
+          "file": "pages/network-map.html",
+          "status": 200,
+          "etag": "\"asteria-network-map-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT",
+          "unchanged": true
+        }
+      }
+    },
+    {
+      "id": "ipv6-link-local",
+      "path": "/pages/ipv6-link-local.html",
+      "file": "pages/ipv6-link-local.html",
+      "title": "IPv6 link-local address notes",
+      "summary": "A short reference for reading link-local IPv6 values in fictional equipment records.",
+      "seed_group": "connected",
+      "links": [
+        "/pages/network-map.html",
+        "/pages/identifier-registry.html"
+      ],
+      "duplicate_links": [],
+      "versions": {
+        "v1": {
+          "file": "pages/ipv6-link-local.html",
+          "status": 200,
+          "etag": "\"asteria-ipv6-link-local-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT"
+        },
+        "v2": {
+          "file": "pages/ipv6-link-local.html",
+          "status": 200,
+          "etag": "\"asteria-ipv6-link-local-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT",
+          "unchanged": true
+        }
+      }
+    },
+    {
+      "id": "serial-protocol",
+      "path": "/pages/serial-protocol.html",
+      "file": "pages/serial-protocol.html",
+      "title": "Maintenance serial protocol",
+      "summary": "The serial protocol defines a bounded frame for local maintenance reads from a device.",
+      "seed_group": "connected",
+      "links": [
+        "/pages/radio-handbook.html",
+        "/pages/clock-sync.html",
+        "/pages/identifier-registry.html",
+        "/pages/safety-practices.html"
+      ],
+      "duplicate_links": [],
+      "versions": {
+        "v1": {
+          "file": "pages/serial-protocol.html",
+          "status": 200,
+          "etag": "\"asteria-serial-protocol-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT"
+        },
+        "v2": {
+          "file": "pages/serial-protocol.html",
+          "status": 200,
+          "etag": "\"asteria-serial-protocol-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT",
+          "unchanged": true
+        }
+      }
+    },
+    {
+      "id": "identifier-registry",
+      "path": "/pages/identifier-registry.html",
+      "file": "pages/identifier-registry.html",
+      "title": "Instrument and record identifier registry",
+      "summary": "The registry assigns stable labels to the fictional station, devices, and session records.",
+      "seed_group": "connected",
+      "links": [
+        "/pages/radio-handbook.html",
+        "/pages/data-format.html",
+        "/pages/ipv6-link-local.html",
+        "/pages/unicode-station-names.html"
+      ],
+      "duplicate_links": [],
+      "versions": {
+        "v1": {
+          "file": "pages/identifier-registry.html",
+          "status": 200,
+          "etag": "\"asteria-identifier-registry-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT"
+        },
+        "v2": {
+          "file": "pages/identifier-registry.html",
+          "status": 200,
+          "etag": "\"asteria-identifier-registry-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT",
+          "unchanged": true
+        }
+      }
+    },
+    {
+      "id": "unicode-station-names",
+      "path": "/pages/unicode-station-names.html",
+      "file": "pages/unicode-station-names.html",
+      "title": "Unicode station labels and export",
+      "summary": "The station uses UTF-8 labels for informal locations while keeping device IDs ASCII and stable.",
+      "seed_group": "connected",
+      "links": [
+        "/pages/csv-export.html",
+        "/pages/data-format.html",
+        "/pages/identifier-registry.html",
+        "/pages/field-log.html"
+      ],
+      "duplicate_links": [],
+      "versions": {
+        "v1": {
+          "file": "pages/unicode-station-names.html",
+          "status": 200,
+          "etag": "\"asteria-unicode-station-names-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT"
+        },
+        "v2": {
+          "file": "pages/unicode-station-names.html",
+          "status": 200,
+          "etag": "\"asteria-unicode-station-names-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT",
+          "unchanged": true
+        }
+      }
+    },
+    {
+      "id": "accessibility-guide",
+      "path": "/pages/accessibility-guide.html",
+      "file": "pages/accessibility-guide.html",
+      "title": "Reading the station pages with assistive technology",
+      "summary": "The page conventions keep instrument names and measurement context readable in a linear view.",
+      "seed_group": "connected",
+      "links": [
+        "/pages/station-charter.html",
+        "/pages/field-log.html",
+        "/pages/data-format.html"
+      ],
+      "duplicate_links": [],
+      "versions": {
+        "v1": {
+          "file": "pages/accessibility-guide.html",
+          "status": 200,
+          "etag": "\"asteria-accessibility-guide-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT"
+        },
+        "v2": {
+          "file": "pages/accessibility-guide.html",
+          "status": 200,
+          "etag": "\"asteria-accessibility-guide-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT",
+          "unchanged": true
+        }
+      }
+    },
+    {
+      "id": "safety-practices",
+      "path": "/pages/safety-practices.html",
+      "file": "pages/safety-practices.html",
+      "title": "General session safety practices",
+      "summary": "These fictional station notes direct volunteers to local facility rules and define when to stop work.",
+      "seed_group": "connected",
+      "links": [
+        "/pages/incident-reporting.html",
+        "/pages/power-system.html",
+        "/pages/maintenance-schedule.html",
+        "/pages/station-charter.html"
+      ],
+      "duplicate_links": [],
+      "versions": {
+        "v1": {
+          "file": "pages/safety-practices.html",
+          "status": 200,
+          "etag": "\"asteria-safety-practices-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT"
+        },
+        "v2": {
+          "file": "pages/safety-practices.html",
+          "status": 200,
+          "etag": "\"asteria-safety-practices-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT",
+          "unchanged": true
+        }
+      }
+    },
+    {
+      "id": "incident-reporting",
+      "path": "/pages/incident-reporting.html",
+      "file": "pages/incident-reporting.html",
+      "title": "Incident and interruption report",
+      "summary": "The report preserves the sequence of an event and separates observed facts from later analysis.",
+      "seed_group": "connected",
+      "links": [
+        "/pages/safety-practices.html",
+        "/pages/station-charter.html",
+        "/pages/night-operations.html",
+        "/pages/sky-camera.html"
+      ],
+      "duplicate_links": [],
+      "versions": {
+        "v1": {
+          "file": "pages/incident-reporting.html",
+          "status": 200,
+          "etag": "\"asteria-incident-reporting-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT"
+        },
+        "v2": {
+          "file": "pages/incident-reporting.html",
+          "status": 200,
+          "etag": "\"asteria-incident-reporting-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT",
+          "unchanged": true
+        }
+      }
+    },
+    {
+      "id": "after-hours-training",
+      "path": "/pages/after-hours-training.html",
+      "file": "pages/after-hours-training.html",
+      "title": "After-hours visitor training note",
+      "summary": "A fictional internal training note about visitor orientation during an evening session.",
+      "seed_group": "connected",
+      "links": [
+        "/pages/station-charter.html",
+        "/pages/accessibility-guide.html",
+        "/pages/safety-practices.html"
+      ],
+      "duplicate_links": [],
+      "versions": {
+        "v1": {
+          "file": "pages/after-hours-training.html",
+          "status": 200,
+          "etag": "\"asteria-after-hours-training-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT"
+        },
+        "v2": {
+          "file": "pages/after-hours-training.html",
+          "status": 200,
+          "etag": "\"asteria-after-hours-training-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT",
+          "unchanged": true,
+          "headers": {
+            "X-Robots-Tag": "noindex"
+          }
+        }
+      },
+      "noindex_on_v2": true
+    },
+    {
+      "id": "archive-records",
+      "path": "/pages/archive-records.html",
+      "file": "pages/archive-records.html",
+      "title": "Archive record handling agreement",
+      "summary": "A fictional agreement that defines what the station archive retains and how a correction is attached.",
+      "seed_group": "unlinked",
+      "links": [],
+      "duplicate_links": [],
+      "versions": {
+        "v1": {
+          "file": "pages/archive-records.html",
+          "status": 200,
+          "etag": "\"asteria-archive-records-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT"
+        },
+        "v2": {
+          "file": "pages/archive-records.html",
+          "status": 200,
+          "etag": "\"asteria-archive-records-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT",
+          "unchanged": true
+        }
+      }
+    },
+    {
+      "id": "research-agreement",
+      "path": "/pages/research-agreement.html",
+      "file": "pages/research-agreement.html",
+      "title": "Local research use agreement",
+      "summary": "A fictional agreement for collaborators who request a copy of an Asteria observation record.",
+      "seed_group": "unlinked",
+      "links": [],
+      "duplicate_links": [],
+      "versions": {
+        "v1": {
+          "file": "pages/research-agreement.html",
+          "status": 200,
+          "etag": "\"asteria-research-agreement-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT"
+        },
+        "v2": {
+          "file": "pages/research-agreement.html",
+          "status": 200,
+          "etag": "\"asteria-research-agreement-v1\"",
+          "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT",
+          "unchanged": true
+        }
+      }
+    }
+  ],
+  "special_routes": [
+    {
+      "id": "start-redirect",
+      "path": "/start-here",
+      "kind": "redirect",
+      "v1": {
+        "status": 302,
+        "target": "/pages/observatory-index.html"
+      },
+      "v2": {
+        "status": 302,
+        "target": "/pages/observatory-index.html"
+      },
+      "note": "Same-origin redirect to an admitted page. The requested alias URL remains distinct from the target URL."
+    },
+    {
+      "id": "robots-disallowed-draft",
+      "path": "/suppressed/maintenance-draft.html",
+      "kind": "robots-disallowed",
+      "file": "responses/robots-blocked.html",
+      "status": 200,
+      "etag": "\"asteria-maintenance-draft-v1\"",
+      "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT",
+      "robots_rule": "Disallow: /suppressed/maintenance-draft.html"
+    },
+    {
+      "id": "legacy-calibration-retired",
+      "path": "/retired/legacy-calibration.html",
+      "kind": "removal-410",
+      "v1": {
+        "status": 200,
+        "file": "responses/legacy-calibration-v1.html",
+        "etag": "\"asteria-legacy-calibration-v1\"",
+        "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT"
+      },
+      "v2": {
+        "status": 410,
+        "etag": "\"asteria-legacy-calibration-v2\"",
+        "last_modified": "Wed, 21 Oct 2026 12:00:00 GMT"
+      },
+      "note": "The stable path first returns a body and later returns 410 to test removal from current evidence."
+    },
+    {
+      "id": "night-watch-missing",
+      "path": "/records/night-watch-2024.html",
+      "kind": "removal-404",
+      "v1": {
+        "status": 200,
+        "file": "responses/night-watch-stub-v1.html",
+        "etag": "\"asteria-night-watch-stub-v1\"",
+        "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT"
+      },
+      "v2": {
+        "status": 404,
+        "etag": "\"asteria-night-watch-missing-v2\"",
+        "last_modified": "Wed, 21 Oct 2026 12:00:00 GMT"
+      },
+      "confirmation": {
+        "status": 404,
+        "advance_ms_after_first_404": 1000
+      },
+      "note": "The first 404 and its confirming 404 are separate scheduled observations."
+    },
+    {
+      "id": "training-noindex-transition",
+      "path": "/pages/after-hours-training.html",
+      "kind": "noindex-transition",
+      "v1": {
+        "status": 200,
+        "file": "pages/after-hours-training.html",
+        "etag": "\"asteria-after-hours-training-v1\"",
+        "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT"
+      },
+      "v2": {
+        "status": 200,
+        "file": "pages/after-hours-training-v2.html",
+        "etag": "\"asteria-after-hours-training-v2\"",
+        "last_modified": "Wed, 21 Oct 2026 12:00:00 GMT",
+        "headers": {
+          "X-Robots-Tag": "noindex"
+        }
+      },
+      "note": "The page is indexable in v1 and receives X-Robots-Tag: noindex in v2."
+    },
+    {
+      "id": "robots-policy",
+      "path": "/robots.txt",
+      "kind": "robots",
+      "status": 200,
+      "file": "robots.txt",
+      "etag": "\"asteria-robots-v1\"",
+      "last_modified": "Tue, 20 Oct 2026 12:00:00 GMT"
+    }
+  ],
+  "graph_notes": {
+    "root_id": "observatory-index",
+    "unlinked_ids": [
+      "archive-records",
+      "research-agreement"
+    ],
+    "unlinked_rule": "No page links to either unlinked route. The extra-seeds profile requests both directly.",
+    "relative_links": "Page anchors use same-directory relative hrefs. Duplicate href variants point to the same canonical page.",
+    "special_routes": "The root or connected pages link to the redirect, robots-disallowed, 410, and 404 routes so the crawler can exercise their admission and lifecycle behavior."
+  }
+}

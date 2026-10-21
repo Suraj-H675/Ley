@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Unicode station labels and export</title>
+  <meta name="description" content="The station uses UTF-8 labels for informal locations while keeping device IDs ASCII and stable.">
+</head>
+<body>
+  <main>
+    <article>
+      <h1>Unicode station labels and export</h1>
+      <p>The station uses UTF-8 labels for informal locations while keeping device IDs ASCII and stable.</p>
+    <section>
+      <h2>Display labels</h2>
+      <p>The eastern window is labeled `北窗` in the volunteer notebook, and the instrument group uses `ΔTₐ` for a temperature difference derived from two probes. These are display labels. The ASCII device ID remains the lookup key because older serial tools accept only a restricted character set.</p>
+    </section>
+    <section>
+      <h2>Normalization</h2>
+      <p>Two strings can look alike while using different Unicode code points. The export preserves the original UTF-8 sequence and records the normalized search label separately when a tool needs one. It does not silently replace a person-entered name with an ASCII approximation.</p>
+    </section>
+    <section>
+      <h2>Review</h2>
+      <p>A CSV round trip checks both byte decoding and visible rendering. A replacement character indicates damaged text, while an accented or CJK label is valid when the original bytes decode correctly. The identifier registry explains which values identify devices and which values are only names shown to volunteers.</p>
+    </section>
+      <section>
+        <h2>Related pages</h2>
+        <ul>
+          <li><a href="csv-export.html">CSV export checks</a></li>
+          <li><a href="data-format.html">Asteria observation record format</a></li>
+          <li><a href="identifier-registry.html">Instrument and record identifier registry</a></li>
+          <li><a href="field-log.html">Field log entry format</a></li>
+        </ul>
+      </section>
+    </article>
+  </main>
+</body>
+</html>

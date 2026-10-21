@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Maintenance serial protocol</title>
+  <meta name="description" content="The serial protocol defines a bounded frame for local maintenance reads from a device.">
+</head>
+<body>
+  <main>
+    <article>
+      <h1>Maintenance serial protocol</h1>
+      <p>The serial protocol defines a bounded frame for local maintenance reads from a device.</p>
+    <section>
+      <h2>Frame layout</h2>
+      <p>A maintenance frame starts with byte `0x7E`, a one-byte device address, a one-byte command, a two-byte payload length, and a checksum. The example status request uses command `0x11` and a zero-length payload. The receiver rejects a frame whose declared length exceeds the local buffer limit.</p>
+    </section>
+    <section>
+      <h2>Response handling</h2>
+      <p>A response repeats the device address and command, then returns a result code and payload. The operator logs the frame sequence and result without copying arbitrary device text into a control command. A timeout can trigger one retry under the maintenance plan, after which the crew records the fault.</p>
+    </section>
+    <section>
+      <h2>Separate channels</h2>
+      <p>This wired protocol is separate from the radio message format. The radio handbook uses a printable station tag and a sequence counter. The identifier registry keeps the device ID stable across both connections, so transport details do not become substitute identities.</p>
+    </section>
+      <section>
+        <h2>Related pages</h2>
+        <ul>
+          <li><a href="radio-handbook.html">Radio control handbook</a></li>
+          <li><a href="clock-sync.html">Session clock synchronization</a></li>
+          <li><a href="identifier-registry.html">Instrument and record identifier registry</a></li>
+          <li><a href="safety-practices.html">General session safety practices</a></li>
+        </ul>
+      </section>
+    </article>
+  </main>
+</body>
+</html>

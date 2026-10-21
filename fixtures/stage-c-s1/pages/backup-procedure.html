@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Session record backup and restore</title>
+  <meta name="description" content="The backup procedure checks that an archived session can be read after a local copy is restored.">
+</head>
+<body>
+  <main>
+    <article>
+      <h1>Session record backup and restore</h1>
+      <p>The backup procedure checks that an archived session can be read after a local copy is restored.</p>
+    <section>
+      <h2>Copy and verify</h2>
+      <p>After a session closes, the recorder copies the raw export and its checksum to the local archive. A second person compares the checksum before the source media is reused. The archive entry includes the copy time and the names of both people who checked it.</p>
+    </section>
+    <section>
+      <h2>Restore check</h2>
+      <p>During the monthly maintenance visit, the crew restores one selected session into a temporary directory. The operator opens the record and checks its row count against the archive note. The test file is removed after the check, while the original and restored checksums remain in the maintenance record.</p>
+    </section>
+    <section>
+      <h2>When a copy differs</h2>
+      <p>A checksum mismatch stops the archive transfer. The crew preserves both copies and records where each came from. It does not overwrite the smaller or older copy based on an assumption that file size determines correctness. The maintenance schedule assigns the follow-up.</p>
+    </section>
+      <section>
+        <h2>Related pages</h2>
+        <ul>
+          <li><a href="maintenance-schedule.html">Routine maintenance schedule</a></li>
+          <li><a href="power-system.html">Operations power system overview</a></li>
+          <li><a href="csv-export.html">CSV export checks</a></li>
+        </ul>
+      </section>
+    </article>
+  </main>
+</body>
+</html>

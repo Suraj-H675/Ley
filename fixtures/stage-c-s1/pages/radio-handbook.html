@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Radio control handbook</title>
+  <meta name="description" content="The fictional radio link carries short control messages between the operations room and field instruments.">
+</head>
+<body>
+  <main>
+    <article>
+      <h1>Radio control handbook</h1>
+      <p>The fictional radio link carries short control messages between the operations room and field instruments.</p>
+    <section>
+      <h2>Message shape</h2>
+      <p>A control message begins with the station tag ARX, a two-digit device number, and a command code. The example `ARX-17:READ` requests a status sample from unit 17. The response repeats the device number and includes a sequence counter, so the recorder can spot a delayed reply without guessing from arrival order.</p>
+    </section>
+    <section>
+      <h2>Retries</h2>
+      <p>The console waits four seconds for a response and retries once with the same sequence number. A second timeout becomes a log entry, not an invitation to send commands indefinitely. If the unit answers after the retry, the recorder keeps both timestamps and marks the later response as delayed.</p>
+    </section>
+    <section>
+      <h2>Clock and wiring</h2>
+      <p>The radio timestamps come from the operations clock. The clock-sync page explains how that display is compared with the session reference. The serial-protocol page describes the wired maintenance connection, which uses a different frame and must not be confused with this radio message format.</p>
+    </section>
+      <section>
+        <h2>Related pages</h2>
+        <ul>
+          <li><a href="serial-protocol.html">Maintenance serial protocol</a></li>
+          <li><a href="clock-sync.html">Session clock synchronization</a></li>
+          <li><a href="identifier-registry.html">Instrument and record identifier registry</a></li>
+          <li><a href="safety-practices.html">General session safety practices</a></li>
+          <li><a href="observatory-index.html">Asteria Ridge Observatory field index</a></li>
+        </ul>
+      </section>
+    </article>
+  </main>
+</body>
+</html>
