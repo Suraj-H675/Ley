@@ -936,25 +936,24 @@ fn read_clock(path: &Path) -> Result<FixtureClockFile, String> {
 
 fn read_json_file<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, String> {
     let metadata = fs::symlink_metadata(path)
-        .map_err(|error| format!("file {:?} is unavailable: {error}", path))?;
+        .map_err(|error| format!("file {path:?} is unavailable: {error}"))?;
     if metadata.file_type().is_symlink()
         || !metadata.is_file()
         || metadata.len() > MAX_INPUT_FILE_BYTES
     {
         return Err(format!(
-            "file {:?} must be a bounded regular file, not a symlink",
-            path
+            "file {path:?} must be a bounded regular file, not a symlink"
         ));
     }
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
     File::open(path)
         .and_then(|file| file.take(MAX_INPUT_FILE_BYTES + 1).read_to_end(&mut bytes))
-        .map_err(|error| format!("could not read file {:?}: {error}", path))?;
+        .map_err(|error| format!("could not read file {path:?}: {error}"))?;
     if bytes.len() as u64 > MAX_INPUT_FILE_BYTES {
-        return Err(format!("file {:?} exceeds its size limit", path));
+        return Err(format!("file {path:?} exceeds its size limit"));
     }
     serde_json::from_slice(&bytes)
-        .map_err(|error| format!("file {:?} is invalid JSON: {error}", path))
+        .map_err(|error| format!("file {path:?} is invalid JSON: {error}"))
 }
 
 fn write_json_atomic<T: Serialize>(path: &Path, value: &T, replace: bool) -> Result<(), String> {
@@ -965,7 +964,7 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T, replace: bool) -> Res
             return Err("replacement target must be a regular file, not a symlink".to_owned());
         }
     } else if fs::symlink_metadata(path).is_ok() {
-        return Err(format!("refusing to overwrite existing file {:?}", path));
+        return Err(format!("refusing to overwrite existing file {path:?}"));
     }
     let parent = path
         .parent()
@@ -1002,7 +1001,7 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T, replace: bool) -> Res
 
 fn prepare_new_root_path(path: &Path) -> Result<PathBuf, String> {
     if fs::symlink_metadata(path).is_ok() {
-        return Err(format!("collection workspace already exists: {:?}", path));
+        return Err(format!("collection workspace already exists: {path:?}"));
     }
     let file_name = path
         .file_name()
