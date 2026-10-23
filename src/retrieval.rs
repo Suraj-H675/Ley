@@ -22,6 +22,7 @@ use crate::analyzer::{AnalyzeError, Analyzer, MAX_TERM_SCALARS};
 use crate::url_key::UrlKey;
 
 pub const RETRIEVAL_CONTRACT_VERSION: u16 = 1;
+pub const DOCUMENT_INSPECTION_CONTRACT_VERSION: u16 = 1;
 pub const PASSAGE_SCHEMA_VERSION: u16 = 1;
 pub const DEFAULT_MAX_HITS: u8 = 8;
 pub const MAX_HITS: u8 = 8;
@@ -34,6 +35,7 @@ pub(crate) const MAX_QUESTION_LITERAL_PHRASES: usize = 8;
 pub(crate) const MAX_QUESTION_LITERAL_BYTES: usize = 128;
 pub(crate) const MAX_QUESTION_PHRASE_STEPS: usize = 25_000_000;
 pub(crate) const MAX_PASSAGE_BYTES: usize = 8192;
+pub const DOCUMENT_INSPECTION_PAGE_BYTES: usize = 64 * 1024;
 pub(crate) const PASSAGE_STEP_BYTES: usize = 4096;
 pub(crate) const MAX_PASSAGES_PER_DOCUMENT: usize = 258;
 pub(crate) const MAX_RESPONSE_PASSAGE_BYTES: usize = 256 * 1024;
@@ -262,6 +264,34 @@ pub struct ResolvedEvidence {
     pub requested_url: String,
     pub effective_url: String,
     pub title: String,
+    pub text: String,
+}
+
+/// A bounded request for one page of the current extracted body named by an
+/// exact passage reference. The server fixes the page size and revalidates the
+/// reference and document visibility for every page.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DocumentInspectionRequest {
+    pub contract_version: u16,
+    pub reference: EvidenceReference,
+    /// Inclusive UTF-8 byte offset in the indexed extracted body.
+    pub offset_byte: u32,
+}
+
+/// One UTF-8-safe page from the current indexed extracted body.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DocumentInspectionPage {
+    pub contract_version: u16,
+    pub reference: EvidenceReference,
+    pub requested_url: String,
+    pub effective_url: String,
+    pub title: String,
+    pub start_byte: u32,
+    pub end_byte: u32,
+    pub total_bytes: u32,
+    pub next_offset_byte: Option<u32>,
     pub text: String,
 }
 

@@ -97,6 +97,19 @@ export interface ResolvedEvidence {
   text: string;
 }
 
+export interface DocumentInspectionPage {
+  contract_version: 1;
+  reference: EvidenceReference;
+  requested_url: string;
+  effective_url: string;
+  title: string;
+  start_byte: number;
+  end_byte: number;
+  total_bytes: number;
+  next_offset_byte: number | null;
+  text: string;
+}
+
 export type QuestionSearchState =
   | { kind: "idle" }
   | { kind: "loading"; question: string }
@@ -107,6 +120,12 @@ export type RevalidationState =
   | { kind: "idle" }
   | { kind: "loading" }
   | { kind: "current"; evidence: ResolvedEvidence }
+  | { kind: "error"; code: string; message: string };
+
+export type DocumentInspectionState =
+  | { kind: "closed" }
+  | { kind: "loading" }
+  | { kind: "ready"; page: DocumentInspectionPage; text: string }
   | { kind: "error"; code: string; message: string };
 
 export type SearchState =

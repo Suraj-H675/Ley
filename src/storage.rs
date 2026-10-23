@@ -17,12 +17,13 @@ use sha2::{Digest, Sha256};
 use crate::analyzer::{ANALYZER_ID, Analyzer, MAX_TERM_SCALARS};
 use crate::html::{HTML_SCHEMA_ID, MAX_DOCUMENT_TOKENS, MAX_FIELDS_BYTES, MAX_TITLE_BYTES};
 use crate::index::{
-    CorpusStatistics as QueryCorpusStatistics, InMemoryIndex, Posting, QueryError, SearchResult,
-    bm25_field_contribution, query_with_segment_postings,
+    CorpusStatistics as QueryCorpusStatistics, InMemoryIndex, IndexedDocument, Posting, QueryError,
+    SearchResult, bm25_field_contribution, query_with_segment_postings,
 };
 use crate::query::parse_query;
 use crate::retrieval::{
-    AnswerAssessment, EvidenceHit, EvidencePassage, EvidenceReference, EvidenceResolveError,
+    AnswerAssessment, DOCUMENT_INSPECTION_CONTRACT_VERSION, DOCUMENT_INSPECTION_PAGE_BYTES,
+    DocumentInspectionPage, EvidenceHit, EvidencePassage, EvidenceReference, EvidenceResolveError,
     InsufficientEvidenceReason, MAX_PASSAGE_BYTES, MAX_RESPONSE_BYTES, MAX_RESPONSE_PASSAGE_BYTES,
     QuestionPlan, QuestionRequest, ResolvedEvidence, RetrievalCompleteness, RetrievalError,
     RetrievalMode, RetrievalRequest, RetrievalResponse, RetrievalStatus,
@@ -1802,6 +1803,92 @@ impl PersistentIndex {
         reference: &EvidenceReference,
         mut clock: impl FnMut() -> Result<u64, StorageError>,
     ) -> Result<ResolvedEvidence, EvidenceResolveError> {
+        self.with_current_evidence_document(reference, &mut clock, |document| {
+            let start = usize::try_from(reference.start_byte)
+                .map_err(|_| EvidenceResolveError::OutOfBounds)?;
+            let end = usize::try_from(reference.end_byte)
+                .map_err(|_| EvidenceResolveError::OutOfBounds)?;
+            if end > document.body.len() || start > end {
+                return Err(EvidenceResolveError::OutOfBounds);
+            }
+            if !document.body.is_char_boundary(start) || !document.body.is_char_boundary(end) {
+                return Err(EvidenceResolveError::NotUtf8Boundary);
+            }
+            let text = document
+                .body
+                .get(start..end)
+                .ok_or(EvidenceResolveError::OutOfBounds)?
+                .to_owned();
+            Ok(ResolvedEvidence {
+                reference: reference.clone(),
+                requested_url: document.id.clone(),
+                effective_url: document.effective_url.clone(),
+                title: document.title.clone(),
+                text,
+            })
+        })
+    }
+
+    pub(crate) fn inspect_document_page(
+        &self,
+        reference: &EvidenceReference,
+        offset_byte: u32,
+    ) -> Result<DocumentInspectionPage, EvidenceResolveError> {
+        self.inspect_document_page_with_clock(reference, offset_byte, system_time_ms)
+    }
+
+    fn inspect_document_page_with_clock(
+        &self,
+        reference: &EvidenceReference,
+        offset_byte: u32,
+        mut clock: impl FnMut() -> Result<u64, StorageError>,
+    ) -> Result<DocumentInspectionPage, EvidenceResolveError> {
+        self.with_current_evidence_document(reference, &mut clock, |document| {
+            let start =
+                usize::try_from(offset_byte).map_err(|_| EvidenceResolveError::OutOfBounds)?;
+            if start >= document.body.len() {
+                return Err(EvidenceResolveError::OutOfBounds);
+            }
+            if !document.body.is_char_boundary(start) {
+                return Err(EvidenceResolveError::NotUtf8Boundary);
+            }
+
+            let total_bytes = u32::try_from(document.body.len())
+                .map_err(|_| EvidenceResolveError::ResourceLimit)?;
+            let mut end = start
+                .saturating_add(DOCUMENT_INSPECTION_PAGE_BYTES)
+                .min(document.body.len());
+            while !document.body.is_char_boundary(end) {
+                end -= 1;
+            }
+            let start_byte = u32::try_from(start).map_err(|_| EvidenceResolveError::OutOfBounds)?;
+            let end_byte = u32::try_from(end).map_err(|_| EvidenceResolveError::OutOfBounds)?;
+            let text = document
+                .body
+                .get(start..end)
+                .ok_or(EvidenceResolveError::OutOfBounds)?
+                .to_owned();
+            Ok(DocumentInspectionPage {
+                contract_version: DOCUMENT_INSPECTION_CONTRACT_VERSION,
+                reference: reference.clone(),
+                requested_url: document.id.clone(),
+                effective_url: document.effective_url.clone(),
+                title: document.title.clone(),
+                start_byte,
+                end_byte,
+                total_bytes,
+                next_offset_byte: (end < document.body.len()).then_some(end_byte),
+                text,
+            })
+        })
+    }
+
+    fn with_current_evidence_document<T>(
+        &self,
+        reference: &EvidenceReference,
+        mut clock: impl FnMut() -> Result<u64, StorageError>,
+        operation: impl FnOnce(&IndexedDocument) -> Result<T, EvidenceResolveError>,
+    ) -> Result<T, EvidenceResolveError> {
         reference.validate_shape_and_identity()?;
         if reference.store_id != self.store_id {
             return Err(EvidenceResolveError::WrongStore);
@@ -1887,18 +1974,7 @@ impl PersistentIndex {
         {
             return Err(EvidenceResolveError::InvalidPassageWindow);
         }
-        let text = document
-            .body
-            .get(start..end)
-            .ok_or(EvidenceResolveError::OutOfBounds)?
-            .to_owned();
-        let resolved = ResolvedEvidence {
-            reference: reference.clone(),
-            requested_url: document.id.clone(),
-            effective_url: document.effective_url.clone(),
-            title: document.title.clone(),
-            text,
-        };
+        let result = operation(document)?;
         let final_gate = self
             .load_public_collection_locked()
             .map_err(map_evidence_storage_error)?;
@@ -1909,7 +1985,7 @@ impl PersistentIndex {
         {
             return Err(EvidenceResolveError::PublicCollectionExpired);
         }
-        Ok(resolved)
+        Ok(result)
     }
 
     fn load_committed_locked(&self) -> Result<Generation, StorageError> {
@@ -5830,6 +5906,78 @@ mod tests {
         assert_eq!(
             store.resolve_evidence(&invalid_boundary),
             Err(EvidenceResolveError::NotUtf8Boundary)
+        );
+    }
+
+    #[test]
+    fn document_inspection_pages_are_bounded_utf8_safe_and_version_bound() {
+        let temp = TempStore::new();
+        let store = PersistentIndex::create(temp.path()).unwrap();
+        let document = key("document-inspection-pages");
+        let prefix = format!("{}x", "w ".repeat((DOCUMENT_INSPECTION_PAGE_BYTES - 1) / 2));
+        assert_eq!(prefix.len(), DOCUMENT_INSPECTION_PAGE_BYTES - 1);
+        let body = format!("{prefix}é{}", " tail".repeat(2000));
+        upsert(
+            &store,
+            &document,
+            document.as_str(),
+            "Long indexed guide",
+            &body,
+        );
+        let reference = store
+            .retrieve(RetrievalRequest::question("tail"))
+            .unwrap()
+            .hits
+            .remove(0)
+            .passage
+            .reference;
+        let initial_generation = store.read_view().unwrap().generation_id();
+
+        let first = store.inspect_document_page(&reference, 0).unwrap();
+        assert_eq!(first.contract_version, DOCUMENT_INSPECTION_CONTRACT_VERSION);
+        assert_eq!(first.reference, reference);
+        assert_eq!(first.requested_url, document.as_str());
+        assert_eq!(first.title, "Long indexed guide");
+        assert_eq!(first.start_byte, 0);
+        assert_eq!(first.end_byte as usize, prefix.len());
+        assert_eq!(first.total_bytes as usize, body.len());
+        assert_eq!(first.next_offset_byte, Some(prefix.len() as u32));
+        assert!(first.text.len() <= DOCUMENT_INSPECTION_PAGE_BYTES);
+        assert!(first.text.is_char_boundary(first.text.len()));
+        assert_eq!(first.text, prefix);
+
+        let second = store
+            .inspect_document_page(&reference, first.next_offset_byte.unwrap())
+            .unwrap();
+        assert_eq!(second.start_byte as usize, prefix.len());
+        assert_eq!(second.next_offset_byte, None);
+        assert!(second.text.len() <= DOCUMENT_INSPECTION_PAGE_BYTES);
+        assert!(second.text.starts_with('é'));
+        assert_eq!(format!("{}{}", first.text, second.text), body);
+
+        assert_eq!(
+            store.inspect_document_page(&reference, prefix.len() as u32 + 1),
+            Err(EvidenceResolveError::NotUtf8Boundary)
+        );
+        assert_eq!(
+            store.inspect_document_page(&reference, u32::MAX),
+            Err(EvidenceResolveError::OutOfBounds)
+        );
+        assert_eq!(
+            store.read_view().unwrap().generation_id(),
+            initial_generation
+        );
+
+        upsert(
+            &store,
+            &document,
+            document.as_str(),
+            "Updated guide",
+            "replacement content",
+        );
+        assert_eq!(
+            store.inspect_document_page(&reference, 0),
+            Err(EvidenceResolveError::VersionSuperseded)
         );
     }
 

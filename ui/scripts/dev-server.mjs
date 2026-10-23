@@ -7,7 +7,11 @@ import path from "node:path";
 const defaultRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../dist");
 const MAX_API_BODY_BYTES = 16 * 1024;
 const MAX_API_RESPONSE_BYTES = 512 * 1024;
-const QUESTION_ROUTES = new Set(["/api/v1/retrieve", "/api/v1/evidence/resolve"]);
+const QUESTION_ROUTES = new Set([
+  "/api/v1/retrieve",
+  "/api/v1/evidence/resolve",
+  "/api/v1/evidence/inspect",
+]);
 
 const mime = new Map([
   [".html", "text/html; charset=utf-8"],

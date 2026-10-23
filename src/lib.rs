@@ -37,9 +37,11 @@ pub use demo::{
     run_controlled_fixture_demo_retained, run_demo, run_demo_with_options,
 };
 pub use retrieval::{
-    AnswerAssessment, EvidenceHit, EvidencePassage, EvidenceReference, EvidenceResolveError,
-    InsufficientEvidenceReason, QuestionRequest, ResolvedEvidence, RetrievalCompleteness,
-    RetrievalError, RetrievalMode, RetrievalRequest, RetrievalResponse, RetrievalStatus,
+    AnswerAssessment, DOCUMENT_INSPECTION_CONTRACT_VERSION, DOCUMENT_INSPECTION_PAGE_BYTES,
+    DocumentInspectionPage, DocumentInspectionRequest, EvidenceHit, EvidencePassage,
+    EvidenceReference, EvidenceResolveError, InsufficientEvidenceReason, QuestionRequest,
+    ResolvedEvidence, RetrievalCompleteness, RetrievalError, RetrievalMode, RetrievalRequest,
+    RetrievalResponse, RetrievalStatus,
 };
 
 pub fn crawl_status_json(

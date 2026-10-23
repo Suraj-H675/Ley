@@ -406,6 +406,21 @@ try {
   assert.deepEqual(apiResolution.reference, initialReference);
   assert.equal(apiResolution.text, apiQuestionByText.get(questions[0]).hits[0].passage.text);
 
+  const inspectionRequest = {
+    contract_version: 1,
+    reference: initialReference,
+    offset_byte: 0,
+  };
+  const inspectionResponse = await typedPost(apiOrigin, "/api/v1/evidence/inspect", inspectionRequest);
+  assert.equal(inspectionResponse.status, 200);
+  assert.match(inspectionResponse.headers.get("cache-control") ?? "", /no-store/i);
+  const apiInspection = await inspectionResponse.json();
+  assert.deepEqual(apiInspection.reference, initialReference);
+  assert.equal(apiInspection.start_byte, 0);
+  assert.equal(Buffer.byteLength(apiInspection.text), apiInspection.end_byte);
+  assert.ok(apiInspection.text.includes("A passage reference should point into the exact extracted body text"));
+  assert.equal(apiInspection.text.includes("<p>"), false, "inspection returns extracted text, not raw HTML");
+
   const stopped = once(apiServer.child, "exit");
   apiServer.child.kill("SIGTERM");
   await stopped;
@@ -500,6 +515,31 @@ try {
 
   const invalidReference = { ...initialReference, start_byte: initialReference.start_byte + 1 };
   await expectTypedError("/api/v1/evidence/resolve", invalidReference, 400, "malformed_reference");
+  await expectTypedError(
+    "/api/v1/evidence/inspect",
+    { ...inspectionRequest, offset_byte: 0xffffffff },
+    400,
+    "invalid_request",
+  );
+  await expectTypedError(
+    "/api/v1/evidence/inspect",
+    { ...inspectionRequest, path: "../../etc/passwd", page_bytes: 999999 },
+    400,
+    "invalid_request",
+  );
+  await expectTypedError(
+    "/api/v1/evidence/inspect",
+    { ...inspectionRequest, contract_version: 99 },
+    422,
+    "unsupported_contract",
+  );
+  await expectTypedError(
+    "/api/v1/evidence/inspect",
+    "x".repeat(16 * 1024 + 1),
+    413,
+    "resource_cap",
+  );
+  await expectChunkedBodyLimit(apiPort, "/api/v1/evidence/inspect");
   const getQuestion = await fetch(apiOrigin + "/api/v1/retrieve", { headers: { origin: apiOrigin } });
   assert.equal(getQuestion.status, 405);
   assert.equal(getQuestion.headers.get("allow"), "POST");
@@ -633,6 +673,7 @@ try {
       );
       const hrefs = await page.locator(".evidence-card a.result-url").evaluateAll((links) => links.map((link) => link.href));
       assert.ok(hrefs.every((href) => ["http:", "https:"].includes(new URL(href).protocol)));
+      assert.equal(await page.locator('.evidence-card a[href*=".invalid"]').count(), 0, "synthetic identities must not appear navigable");
       assert.equal(await page.locator(".results-section img,.results-section script,.results-section [onerror]").count(), 0);
 
       if (questionIndex === 0) {
@@ -648,6 +689,17 @@ try {
         const referenceText = await card.locator(".reference-details").textContent();
         assert.match(referenceText, /Store ID/);
         assert.match(referenceText, /Extracted body UTF-8 bytes/);
+
+        const inspectPromise = page.waitForResponse((candidate) => candidate.url().includes("/api/v1/evidence/inspect"));
+        await card.getByRole("button", { name: "Read current indexed text" }).click();
+        const inspectResponse = await inspectPromise;
+        assert.equal(inspectResponse.status(), 200);
+        assert.deepEqual(await inspectResponse.json(), apiInspection, "browser source inspection uses the same current page");
+        const indexedText = card.locator(".indexed-document-text");
+        await indexedText.waitFor();
+        assert.equal(await indexedText.textContent(), apiInspection.text);
+        assert.equal(await card.locator(".indexed-document img,.indexed-document script,.indexed-document [onerror]").count(), 0);
+        assert.match(await card.locator(".inspection-note").textContent(), /not source HTML or a verified answer/);
       }
 
       if (questionIndex === 0) {
@@ -757,6 +809,34 @@ try {
   assert.equal(await affectedCard.locator(".evidence-passage").count(), 0);
   assert.match(await affectedCard.locator(".passage-heading").textContent(), /Revalidation failed.*prior text hidden/);
   assert.equal(await errorCode.textContent(), "wrong_store");
+
+  const wrongStoreStopped = once(apiServer.child, "exit");
+  apiServer.child.kill("SIGTERM");
+  await wrongStoreStopped;
+  apiServer = start(ley, ["serve", "--store", storePath, "--bind", "127.0.0.1:" + apiPort], { cwd: repoRoot });
+  await waitForHttp(apiOrigin + "/api/health");
+  const openInspection = page.waitForResponse((response) => response.url().includes("/api/v1/evidence/inspect"));
+  await affectedCard.getByRole("button", { name: "Read current indexed text" }).click();
+  const openedInspection = await openInspection;
+  assert.equal(openedInspection.status(), 200);
+  const inspectedTextBeforeFailure = await affectedCard.locator(".indexed-document-text").textContent();
+  assert.ok(inspectedTextBeforeFailure);
+
+  const correctStoreStopped = once(apiServer.child, "exit");
+  apiServer.child.kill("SIGTERM");
+  await correctStoreStopped;
+  apiServer = start(ley, ["serve", "--store", otherStore, "--bind", "127.0.0.1:" + apiPort], { cwd: repoRoot });
+  await waitForHttp(apiOrigin + "/api/health");
+  const staleInspectionPromise = page.waitForResponse((response) => response.url().includes("/api/v1/evidence/inspect"));
+  await affectedCard.getByRole("button", { name: "Revalidate indexed text" }).click();
+  const staleInspection = await staleInspectionPromise;
+  assert.equal(staleInspection.status(), 404);
+  const staleInspectionBody = await staleInspection.text();
+  assert.equal(JSON.parse(staleInspectionBody).error, "wrong_store");
+  assert.equal(staleInspectionBody.includes(inspectedTextBeforeFailure), false);
+  assert.equal(await affectedCard.locator(".indexed-document-text").count(), 0, "old indexed text is hidden after failed revalidation");
+  assert.match(await affectedCard.locator(".verification-message").textContent(), /wrong_store/);
+
   const siblingCard = page.locator(".evidence-card").nth(1);
   assert.equal(await siblingCard.locator(".evidence-passage").count(), 1);
   assert.match(await siblingCard.locator(".passage-heading").textContent(), /Retrieved text · not revalidated/);
@@ -771,6 +851,8 @@ try {
     references: partialCli.hits.map((hit) => hit.passage.reference),
     revalidation_failure: "wrong_store",
     affected_card_prior_text_hidden: await affectedCard.locator(".evidence-passage").count() === 0,
+    inspection_failure: "wrong_store",
+    inspected_text_hidden_after_failure: await affectedCard.locator(".indexed-document-text").count() === 0,
   });
 
   assert.deepEqual(browserErrors, []);

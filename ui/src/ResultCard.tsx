@@ -7,11 +7,11 @@ export function ResultCard({ result }: { result: SearchHit }) {
     <article className="result-card">
       <div className="result-topline">
         <div className="result-url-wrap">
-          <span className="url-mark" aria-hidden="true">↗</span>
+          {href && <span className="url-mark" aria-hidden="true">↗</span>}
           {href ? (
-            <a className="result-url" href={href} target="_blank" rel="noopener noreferrer">{result.id}</a>
+            <a className="result-url" href={href} target="_blank" rel="noopener noreferrer" aria-label="Open external source address; this address is not checked against the indexed text">Open external address · {result.id}</a>
           ) : (
-            <span className="result-url unsafe-url">{result.id}</span>
+            <span className="result-url source-identity">Indexed identity: {result.id}</span>
           )}
         </div>
         <span className="score-pill">{result.score.toFixed(3)} <span>score</span></span>

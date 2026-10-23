@@ -1,6 +1,75 @@
 # Ley
 
-Ley is a single-machine search engine built around its own crawler policy, HTML extraction, text analysis, positional index, query evaluator, and BM25 ranking. Rust libraries provide HTTP/TLS, HTML parsing, persistence primitives, and the local API framework. The browser interface uses React and TypeScript.
+Ley is a single-machine search and evidence-retrieval platform with its own crawler policy, HTML extraction, text analysis, positional index, query evaluator, and BM25 ranking. It can index permitted local folders or run bounded, policy-controlled discovery and crawling. Browser question search returns lexical passage candidates; Ley does not generate or verify answers.
+
+## First useful run
+
+This example indexes the included instructional HTML guide, searches it, and opens the current extracted text in a local browser. The guide is original CC0 1.0 fixture text with no copied third-party pages; see [`fixtures/m3-guide-v1/ATTRIBUTION.txt`](fixtures/m3-guide-v1/ATTRIBUTION.txt). Local collection commands read only these files. They do not crawl or fetch public URLs. The URL prefix is a stable document identity only.
+
+Requirements: Rust 1.88 or newer for the CLI and local API; Node.js 24 or newer with npm for the browser interface and MCP configuration example. The first build and install may download packages from the Rust and npm registries. After the packages are cached, you can use `cargo build --locked --offline --bin ley` and `npm ci --offline --prefix ui` instead. No provider account or API key is needed.
+
+From any directory, clone Ley and start one shell session:
+
+```sh
+git clone https://github.com/Suraj-H675/Ley.git
+cd Ley
+
+cargo build --locked --bin ley
+npm ci --prefix ui
+
+RUN_DIR="$(mktemp -d)"
+STORE="$RUN_DIR/index"
+./target/debug/ley local-collection init \
+  --store "$STORE" \
+  --directory fixtures/m3-guide-v1/html \
+  --url-prefix https://docs.example.invalid/ley-m3-guide-v1/
+./target/debug/ley retrieve --store "$STORE" \
+  --question 'How should ordinary questions differ from advanced Boolean queries?'
+./target/debug/ley local-collection status --store "$STORE"
+./target/debug/ley local-collection sync \
+  --store "$STORE" \
+  --directory fixtures/m3-guide-v1/html \
+  --url-prefix https://docs.example.invalid/ley-m3-guide-v1/
+```
+
+To use the browser, keep that shell session and start the local API and UI:
+
+```sh
+./target/debug/ley serve --store "$STORE" --bind 127.0.0.1:7331 &
+API_PID=$!
+trap 'kill "$API_PID" 2>/dev/null || true' EXIT INT TERM
+npm run dev --prefix ui
+```
+
+Open `http://127.0.0.1:4173`. Search for a question, choose **Read current indexed text**, and browse the plain extracted text in bounded pages. The reader checks the same evidence reference against current store state on every page. If the document changes or is removed, it hides previously displayed text and reports the current status. The source identity is shown separately; reserved or synthetic addresses such as `.invalid` are not links. Passage matches remain lexical candidates, and answer assessment remains `not_assessed`.
+
+For a folder you control, set `SOURCE_DIR` to a directory containing UTF-8 HTML you have the right to store, then use a new store path:
+
+Edit or remove HTML in your own `$SOURCE_DIR` before you run `sync`. Do not edit the tracked CC0 fixture in place. Copy it to a separate directory if you want to experiment with changes.
+
+```sh
+SOURCE_DIR="$HOME/DeveloperDocs"
+STORE_PARENT="$(mktemp -d)"
+STORE="$STORE_PARENT/index"
+./target/debug/ley local-collection init \
+  --store "$STORE" --directory "$SOURCE_DIR" \
+  --url-prefix 'https://docs.example.invalid/developer-docs/'
+./target/debug/ley local-collection sync \
+  --store "$STORE" --directory "$SOURCE_DIR" \
+  --url-prefix 'https://docs.example.invalid/developer-docs/'
+./target/debug/ley local-collection status --store "$STORE"
+```
+
+For an MCP-compatible client using the `mcpServers` configuration format, print a configuration containing the actual absolute binary and store paths, then add the JSON to the host's MCP settings:
+
+```sh
+export LEY_STORE="$STORE"
+node --input-type=module -e 'import { realpathSync } from "node:fs"; console.log(JSON.stringify({mcpServers:{ley:{command:realpathSync("target/debug/ley"),args:["mcp","--store",realpathSync(process.env.LEY_STORE)]}}},null,2))'
+```
+
+The stdio server exposes the existing read-only `search_evidence` and `resolve_evidence` tools against that same store. It does not add an inspection tool or call a model provider.
+
+## Advanced and historical documentation
 
 Gates 0 through 7 are accepted. The Gate 7 baseline, [4add0306](https://github.com/Suraj-H675/Ley/commit/4add0306fd6a84c96a41da42b63a42b174003b32), integrates the retained crawler-to-CLI/API/Chromium path, independent reference comparisons, repeatable offline benchmarks, and the Gate 0 through 6 regression suite. The original Ley source code is licensed under MIT (see [Licensing](#licensing)); technical acceptance did not authorize a tagged release. The checked-in public policy remains disabled. A bounded collection demonstrated a three-page Rust documentation index on 2026-10-14. Its original temporary corpus and runtime artifacts are now unavailable; the historical acceptance is retained with this limitation. The original request budget is unavailable, and no further public requests are authorized.
 
@@ -208,7 +277,9 @@ The response contains `contract_version`, `mode`, `generation_id`, `status`, `co
 
 Resolve the exact current passage with `POST /api/v1/evidence/resolve`, sending the `reference` object itself with the same headers. The result has that same reference and current title, URLs, and text. The resolver checks the current manifest and store visibility on every request; it rejects malformed, wrong-store, non-live, revoked, superseded, and expired references without returning historical text. A retrieval response is a copy already delivered to its caller and cannot be recalled after a later tombstone.
 
-Both typed endpoints accept only `POST`, exact `application/json` Content-Type and Accept values, identity encoding, and at most 16 KiB of request JSON while consuming the body. Duplicate or unknown fields are rejected. Unsafe POSTs require a matching loopback Host and same-origin Origin; the UI proxy checks the browser's UI origin and uses a fixed local API origin when forwarding. The API never accepts a store path or write operation. Successes and errors use `Cache-Control: no-store`; responses are capped at 512 KiB. Errors have finite JSON codes: `invalid_request` (400), `unsupported_contract` (422), `malformed_reference` (400), `wrong_store` (404), `not_live`, `revoked`, `version_superseded`, and `public_collection_expired` (410), `resource_cap` (429, or 413 for an oversized request body), `storage_fault` (503), `unsupported_media_type` (415), and `not_acceptable` (406). Host and Origin boundary failures are 403; unsupported methods are 405.
+Read the current indexed extracted body with `POST /api/v1/evidence/inspect`. Send a strict JSON request containing `contract_version: 1`, the exact `reference` from a retrieval hit, and `offset_byte` (start with `0`). Each response returns a UTF-8-safe page of at most 65,536 bytes, its exclusive byte range, total body length, current title and source identities, and `next_offset_byte` when another page remains. The page size is fixed by the server. Each page rechecks the same store, passage window, current visibility, revocation, expiry, and content version as evidence resolution. The request cannot name a file path, URL, document version independent of the reference, or page size. Responses contain extracted text, not raw HTML. A changed, removed, revoked, or expired reference returns its typed error and no prior text.
+
+All three typed routes accept only `POST`, exact `application/json` Content-Type and Accept values, identity encoding, and at most 16 KiB of request JSON while consuming the body. Duplicate or unknown fields are rejected. Unsafe POSTs require a matching loopback Host and same-origin Origin; the UI proxy checks the browser's UI origin and uses a fixed local API origin when forwarding. The API never accepts a store path or write operation. Successes and errors use `Cache-Control: no-store`; responses are capped at 512 KiB. Errors have finite JSON codes: `invalid_request` (400), `unsupported_contract` (422), `malformed_reference` (400), `wrong_store` (404), `not_live`, `revoked`, `version_superseded`, and `public_collection_expired` (410), `resource_cap` (429, or 413 for an oversized request body), `storage_fault` (503), `unsupported_media_type` (415), and `not_acceptable` (406). Host and Origin boundary failures are 403; unsupported methods are 405.
 
 The CLI calls the same Rust retrieval and resolver methods and serializes the same response fields in deterministic pretty JSON. Save a reference from the retrieval response, then pass it to the resolver:
 
@@ -222,7 +293,7 @@ cargo run --locked -- resolve-evidence --store "$DEMO_DIR/index" \
   --reference-file "$DEMO_DIR/reference.json"
 ```
 
-For a local API, start `cargo run --locked -- serve --store "$DEMO_DIR/index" --bind 127.0.0.1:7331` in one terminal. Send only to that loopback listener. The browser UI uses actual network requests through its local same-origin proxy. The offline end-to-end verifier compares parsed CLI, API, and browser retrieval results, checks passage text and reference identity, and retains browser screenshots and structured evidence at its selected output directory.
+For a local API, start `cargo run --locked -- serve --store "$DEMO_DIR/index" --bind 127.0.0.1:7331` in one terminal. Send only to that loopback listener. The browser UI uses actual network requests through its local same-origin proxy. The offline end-to-end verifier compares CLI, API, and browser retrieval results, checks passage text and reference identity, exercises current indexed-text inspection and stale-text hiding, and retains browser screenshots and structured evidence at its selected output directory.
 
 The current frozen M2 evaluation remains a product limitation: 14 of 48 top-three passages independently supported their query, and all 4 negative queries returned irrelevant text. M3 does not change ranking or add a relevance threshold. Title boilerplate and weak lexical matches can still appear; no answer verification, citation authentication, or confidence estimate is provided.
 

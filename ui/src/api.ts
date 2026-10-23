@@ -1,6 +1,7 @@
 import type {
   EvidenceHit,
   EvidenceReference,
+  DocumentInspectionPage,
   FieldExplanation,
   MatchSummary,
   ResolvedEvidence,
@@ -15,6 +16,8 @@ import type {
 const API_RESULT_LIMIT = 20;
 const QUESTION_RESULT_LIMIT = 8;
 const MAX_PASSAGE_BYTES = 8192;
+const MAX_DOCUMENT_INSPECTION_PAGE_BYTES = 64 * 1024;
+const MAX_INDEXED_BODY_BYTES = 1024 * 1024;
 
 export class SearchApiError extends Error {}
 
@@ -74,6 +77,25 @@ export async function resolveEvidence(
   return payload;
 }
 
+export async function inspectDocumentPage(
+  reference: EvidenceReference,
+  offsetByte: number,
+  signal: AbortSignal,
+): Promise<DocumentInspectionPage> {
+  if (!Number.isSafeInteger(offsetByte) || offsetByte < 0) {
+    throw new QuestionApiError("invalid_request", messageForQuestionError("invalid_request"));
+  }
+  const payload = await typedPost("/api/v1/evidence/inspect", {
+    contract_version: 1,
+    reference,
+    offset_byte: offsetByte,
+  }, signal);
+  if (!isDocumentInspectionPage(payload, reference, offsetByte)) {
+    throw new QuestionApiError("invalid_response", "Ley returned indexed text the interface could not read.");
+  }
+  return payload;
+}
+
 async function typedPost(path: string, body: unknown, signal: AbortSignal): Promise<unknown> {
   let response: Response;
   try {
@@ -97,7 +119,7 @@ async function typedPost(path: string, body: unknown, signal: AbortSignal): Prom
 
 export function messageForQuestionError(code: string): string {
   const messages: Record<string, string> = {
-    invalid_request: "That question or evidence reference is not valid. Check its format and try again.",
+    invalid_request: "That request is not valid. Check the question or evidence reference and try again.",
     unsupported_contract: "This Ley server does not support that retrieval or evidence contract version.",
     malformed_reference: "This evidence reference is malformed. No passage text was shown.",
     wrong_store: "This evidence reference belongs to a different index. No passage text was shown.",
@@ -105,7 +127,7 @@ export function messageForQuestionError(code: string): string {
     revoked: "This source has been revoked. No passage text was shown.",
     version_superseded: "This passage belongs to an older source version. No passage text was shown.",
     public_collection_expired: "This collection has expired. No passage text was shown.",
-    resource_cap: "Ley stopped this request at its resource limit. Try a shorter question.",
+    resource_cap: "Ley stopped this request at its configured resource limit.",
     storage_fault: "Ley could not read the current index. Check the local store and try again.",
     unsupported_media_type: "Ley rejected the request media type.",
     not_acceptable: "Ley could not return the requested response type.",
@@ -120,6 +142,19 @@ export function safeResultUrl(value: string): string | null {
   try {
     const url = new URL(value);
     if ((url.protocol !== "http:" && url.protocol !== "https:") || url.username || url.password) {
+      return null;
+    }
+    const hostname = url.hostname.toLowerCase().replace(/\.$/, "");
+    const reservedDomains = [
+      "invalid", "test", "example", "localhost", "local",
+      "example.com", "example.net", "example.org",
+    ];
+    if (
+      !hostname.includes(".") ||
+      hostname.startsWith("[") ||
+      /^(?:\d{1,3}\.){3}\d{1,3}$/.test(hostname) ||
+      reservedDomains.some((domain) => hostname === domain || hostname.endsWith(`.${domain}`))
+    ) {
       return null;
     }
     return url.href;
@@ -182,6 +217,33 @@ function isResolvedEvidence(value: unknown): value is ResolvedEvidence {
     typeof value.text === "string" && new TextEncoder().encode(value.text).byteLength <= MAX_PASSAGE_BYTES &&
     byteLength(value.text) === value.reference.end_byte - value.reference.start_byte
   );
+}
+
+function isDocumentInspectionPage(
+  value: unknown,
+  reference: EvidenceReference,
+  requestedOffset: number,
+): value is DocumentInspectionPage {
+  if (
+    !isRecord(value) || value.contract_version !== 1 || !isReference(value.reference) ||
+    !sameReference(value.reference, reference) || value.requested_url !== reference.requested_url ||
+    typeof value.effective_url !== "string" || value.effective_url.length > 2048 ||
+    typeof value.title !== "string" || value.title.length > 4096 ||
+    !isCount(value.start_byte) || value.start_byte !== requestedOffset ||
+    !isCount(value.end_byte) || !isCount(value.total_bytes) || value.total_bytes === 0 ||
+    value.total_bytes > MAX_INDEXED_BODY_BYTES || value.end_byte <= value.start_byte ||
+    value.end_byte > value.total_bytes ||
+    value.end_byte - value.start_byte > MAX_DOCUMENT_INSPECTION_PAGE_BYTES ||
+    typeof value.text !== "string" ||
+    new TextEncoder().encode(value.text).byteLength !== value.end_byte - value.start_byte
+  ) {
+    return false;
+  }
+  return value.next_offset_byte === null
+    ? value.end_byte === value.total_bytes
+    : isCount(value.next_offset_byte) &&
+      value.next_offset_byte === value.end_byte &&
+      value.end_byte < value.total_bytes;
 }
 
 function sameReference(left: EvidenceReference, right: EvidenceReference): boolean {

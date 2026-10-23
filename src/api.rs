@@ -14,7 +14,10 @@ use serde::de::DeserializeOwned;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::index::{MatchEvidence, SearchResult, StatisticsSource};
-use crate::retrieval::{EvidenceReference, EvidenceResolveError, RetrievalError, RetrievalRequest};
+use crate::retrieval::{
+    DOCUMENT_INSPECTION_CONTRACT_VERSION, DocumentInspectionRequest, EvidenceReference,
+    EvidenceResolveError, RetrievalError, RetrievalRequest,
+};
 use crate::storage::{PersistentIndex, ReadView, StorageError};
 
 pub const DEFAULT_BIND: SocketAddr =
@@ -292,6 +295,7 @@ fn router_with_state(state: ApiState) -> Router {
         .route("/api/search", any(search))
         .route("/api/v1/retrieve", any(retrieve_v1))
         .route("/api/v1/evidence/resolve", any(resolve_evidence_v1))
+        .route("/api/v1/evidence/inspect", any(inspect_evidence_v1))
         .fallback(not_found)
         .with_state(state)
 }
@@ -419,6 +423,45 @@ async fn resolve_evidence_v1(State(state): State<ApiState>, request: Request<Bod
     };
     match resolution {
         Ok(response) => typed_success(&response),
+        Err(error) => error.response(),
+    }
+}
+
+async fn inspect_evidence_v1(State(state): State<ApiState>, request: Request<Body>) -> Response {
+    let require_origin = request.method() == Method::POST;
+    if let Some(error) = validate_local_authority(&request, state.port, require_origin) {
+        return local_authority_error(error);
+    }
+    if request.method() != Method::POST {
+        return method_not_allowed_for("POST");
+    }
+    if let Err(error) = validate_json_headers(&request, MAX_TYPED_REQUEST_BYTES) {
+        return error.response();
+    }
+    let permit = match acquire_storage_permit(&state) {
+        Ok(permit) => permit,
+        Err(BlockingFailure::Saturated) => return ClientFailure::ResourceCap.response(),
+        Err(BlockingFailure::WorkerFailed) => return ClientFailure::StorageFault.response(),
+    };
+    let inspection =
+        match read_json_body::<DocumentInspectionRequest>(request, MAX_TYPED_REQUEST_BYTES).await {
+            Ok(request) => request,
+            Err(error) => return error.response(),
+        };
+    if inspection.contract_version != DOCUMENT_INSPECTION_CONTRACT_VERSION {
+        return ClientFailure::UnsupportedContract.response();
+    }
+    let page = match run_storage_with_permit(state.index, permit, move |index| {
+        index.inspect_document_page(&inspection.reference, inspection.offset_byte)
+    })
+    .await
+    {
+        Ok(result) => result.map_err(map_inspection_failure),
+        Err(BlockingFailure::Saturated) => Err(ClientFailure::ResourceCap),
+        Err(BlockingFailure::WorkerFailed) => Err(ClientFailure::StorageFault),
+    };
+    match page {
+        Ok(page) => typed_success(&page),
         Err(error) => error.response(),
     }
 }
@@ -596,6 +639,15 @@ fn map_resolve_failure(error: EvidenceResolveError) -> ClientFailure {
         EvidenceResolveError::CorruptStorage | EvidenceResolveError::StorageUnavailable => {
             ClientFailure::StorageFault
         }
+    }
+}
+
+fn map_inspection_failure(error: EvidenceResolveError) -> ClientFailure {
+    match error {
+        EvidenceResolveError::OutOfBounds | EvidenceResolveError::NotUtf8Boundary => {
+            ClientFailure::InvalidRequest
+        }
+        other => map_resolve_failure(other),
     }
 }
 
@@ -1222,6 +1274,126 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn typed_document_inspection_returns_bounded_current_extracted_text() {
+        let (temp, store, _) = populated_index();
+        let reference = store
+            .retrieve(crate::retrieval::RetrievalRequest::question(
+                "rust retrieval",
+            ))
+            .unwrap()
+            .hits
+            .remove(0)
+            .passage
+            .reference;
+        let initial_generation = store.read_view().unwrap().generation_id();
+        let expected_page = store.inspect_document_page(&reference, 0).unwrap();
+        assert_eq!(
+            expected_page.text,
+            "Rust retrieval uses a small Ley-owned inverted index."
+        );
+        assert_eq!(expected_page.next_offset_byte, None);
+
+        let app = router(Arc::new(store), DEFAULT_BIND.port());
+        let request = crate::retrieval::DocumentInspectionRequest {
+            contract_version: crate::retrieval::DOCUMENT_INSPECTION_CONTRACT_VERSION,
+            reference: reference.clone(),
+            offset_byte: 0,
+        };
+        let response = app
+            .clone()
+            .oneshot(typed_post(
+                "/api/v1/evidence/inspect",
+                serde_json::to_vec(&request).unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let bytes = axum::body::to_bytes(response.into_body(), super::MAX_RESPONSE_BYTES)
+            .await
+            .unwrap();
+        assert!(bytes.len() <= super::MAX_RESPONSE_BYTES);
+        let page: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(page, serde_json::to_value(expected_page).unwrap());
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains(&temp.path().to_string_lossy().to_string())
+        );
+
+        let mut invalid_offset = request.clone();
+        invalid_offset.offset_byte = u32::MAX;
+        let response = app
+            .clone()
+            .oneshot(typed_post(
+                "/api/v1/evidence/inspect",
+                serde_json::to_vec(&invalid_offset).unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["error"],
+            "invalid_request"
+        );
+
+        let mut unknown_field = serde_json::to_value(&request).unwrap();
+        unknown_field["path"] = serde_json::Value::String("../../etc/passwd".to_owned());
+        unknown_field["page_bytes"] = serde_json::Value::Number(999_999.into());
+        let response = app
+            .clone()
+            .oneshot(typed_post(
+                "/api/v1/evidence/inspect",
+                serde_json::to_vec(&unknown_field).unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["error"],
+            "invalid_request"
+        );
+        assert!(!String::from_utf8_lossy(&bytes).contains("/etc/passwd"));
+
+        let mut unsupported_contract = request.clone();
+        unsupported_contract.contract_version += 1;
+        let response = app
+            .clone()
+            .oneshot(typed_post(
+                "/api/v1/evidence/inspect",
+                serde_json::to_vec(&unsupported_contract).unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["error"],
+            "unsupported_contract"
+        );
+
+        let response = app
+            .oneshot(typed_post(
+                "/api/v1/evidence/inspect",
+                vec![b'x'; super::MAX_TYPED_REQUEST_BYTES + 1],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let reopened = PersistentIndex::open(temp.path().join("index")).unwrap();
+        assert_eq!(
+            reopened.read_view().unwrap().generation_id(),
+            initial_generation
+        );
+    }
+
+    #[tokio::test]
     async fn typed_routes_reject_unsafe_headers_unknown_json_and_overflow_without_text() {
         let (_temp, store, _) = populated_index();
         let app = router(Arc::new(store), DEFAULT_BIND.port());
@@ -1384,6 +1556,28 @@ mod tests {
                 .oneshot(typed_post(
                     "/api/v1/evidence/resolve",
                     serde_json::to_vec(reference).unwrap(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::GONE);
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            let bytes = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(error["error"], *expected_code);
+            assert!(!String::from_utf8_lossy(&bytes).contains("old passage text"));
+
+            let inspection = crate::retrieval::DocumentInspectionRequest {
+                contract_version: crate::retrieval::DOCUMENT_INSPECTION_CONTRACT_VERSION,
+                reference: reference.clone(),
+                offset_byte: 0,
+            };
+            let response = app
+                .clone()
+                .oneshot(typed_post(
+                    "/api/v1/evidence/inspect",
+                    serde_json::to_vec(&inspection).unwrap(),
                 ))
                 .await
                 .unwrap();
