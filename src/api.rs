@@ -1060,6 +1060,11 @@ mod tests {
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
                 .collect(),
+            fetch_permission: None,
+            storage_permission: None,
+            index_permission: None,
+            display_permission: None,
+            removal_contact: None,
         };
         store
             .install_public_collection_gate(&gate, notice, 10)

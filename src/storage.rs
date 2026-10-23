@@ -43,12 +43,13 @@ const LEASE_KEY_NAME: &str = "LEASE_KEY";
 const LOCK_NAME: &str = "LOCK";
 const CURRENT_NAME: &str = "CURRENT";
 const PUBLIC_COLLECTION_NAME: &str = "PUBLIC_COLLECTION";
-const PUBLIC_NOTICE_NAME: &str = "rust-stdlib-documentation-MIT.txt";
+const PUBLIC_NOTICE_STORE_BASENAME: &str = "rust-stdlib-documentation-MIT.txt";
 const MANAGED_RESERVATION_NAME: &str = ".LOCAL_COLLECTION_RESERVATION";
 const MANAGED_RESERVATION_TEMP_NAME: &str = ".LOCAL_COLLECTION_RESERVATION.tmp";
 const MANAGED_OWNER_STATE_NAME: &str = "LOCAL_COLLECTION";
 const MAX_PUBLIC_COLLECTION_BYTES: usize = 16 * 1024;
 const MAX_PUBLIC_NOTICE_BYTES: usize = 16 * 1024;
+const MAX_PUBLIC_PERMISSION_TEXT_BYTES: usize = 1024;
 const STORE_MAGIC: &[u8; 8] = b"LEYSTOR3";
 const LEASE_KEY_MAGIC: &[u8; 8] = b"LEYMACK3";
 const CURRENT_MAGIC: &[u8; 8] = b"LEYHEAD3";
@@ -341,6 +342,15 @@ struct SegmentedSnapshot {
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct PublicPermissionEvidence {
+    pub granted: bool,
+    pub basis: String,
+    pub evidence: String,
+    pub reviewed_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct PublicCollectionGate {
     pub policy_sha256: String,
     pub source_id: String,
@@ -352,6 +362,16 @@ pub(crate) struct PublicCollectionGate {
     pub source_version: String,
     pub notice_file: String,
     pub notice_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetch_permission: Option<PublicPermissionEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_permission: Option<PublicPermissionEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_permission: Option<PublicPermissionEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_permission: Option<PublicPermissionEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removal_contact: Option<String>,
 }
 
 impl PublicCollectionGate {
@@ -364,6 +384,11 @@ impl PublicCollectionGate {
             && self.source_version == other.source_version
             && self.notice_file == other.notice_file
             && self.notice_sha256 == other.notice_sha256
+            && self.fetch_permission == other.fetch_permission
+            && self.storage_permission == other.storage_permission
+            && self.index_permission == other.index_permission
+            && self.display_permission == other.display_permission
+            && self.removal_contact == other.removal_contact
     }
 }
 
@@ -1274,7 +1299,7 @@ impl PersistentIndex {
         }
         let notice = if gate.is_some() {
             Some(read_bounded_file(
-                &source_index.path.join(PUBLIC_NOTICE_NAME),
+                &source_index.path.join(PUBLIC_NOTICE_STORE_BASENAME),
                 MAX_PUBLIC_NOTICE_BYTES,
             )?)
         } else {
@@ -1314,7 +1339,7 @@ impl PersistentIndex {
         )?;
         if let (Some(_gate), Some(notice), Some(record)) = (&gate, &notice, &public_record) {
             create_private_file(&stage_path.join(PUBLIC_COLLECTION_NAME), record)?;
-            create_private_file(&stage_path.join(PUBLIC_NOTICE_NAME), notice)?;
+            create_private_file(&stage_path.join(PUBLIC_NOTICE_STORE_BASENAME), notice)?;
         }
         sync_directory(&stage_path)?;
 
@@ -1397,12 +1422,8 @@ impl PersistentIndex {
         notice: &[u8],
         now_ms: u64,
     ) -> Result<(), StorageError> {
-        validate_public_collection_gate(gate)?;
-        if notice.is_empty()
-            || notice.len() > MAX_PUBLIC_NOTICE_BYTES
-            || sha256(notice) != decode_sha256(&gate.notice_sha256)?
-            || gate.installed_at_ms > now_ms
-        {
+        validate_public_collection_admission(gate, notice)?;
+        if gate.installed_at_ms > now_ms {
             return Err(StorageError::PublicCollectionConflict);
         }
 
@@ -1421,8 +1442,10 @@ impl PersistentIndex {
             if now_ms >= existing.visible_until_ms {
                 return Err(StorageError::PublicCollectionExpired);
             }
-            let stored_notice =
-                read_bounded_file(&self.path.join(PUBLIC_NOTICE_NAME), MAX_PUBLIC_NOTICE_BYTES)?;
+            let stored_notice = read_bounded_file(
+                &self.path.join(PUBLIC_NOTICE_STORE_BASENAME),
+                MAX_PUBLIC_NOTICE_BYTES,
+            )?;
             if stored_notice != notice {
                 return Err(corrupt(
                     "public source notice differs from its admitted copy",
@@ -2315,9 +2338,11 @@ impl PersistentIndex {
         let bytes = read_bounded_file(&path, MAX_PUBLIC_COLLECTION_BYTES)?;
         let mac_key = self.read_lease_mac_key_locked()?;
         let gate = decode_public_collection_record(&bytes, self.store_id, &mac_key)?;
-        let notice =
-            read_bounded_file(&self.path.join(PUBLIC_NOTICE_NAME), MAX_PUBLIC_NOTICE_BYTES)?;
-        if sha256(&notice) != decode_sha256(&gate.notice_sha256)? {
+        let notice = read_bounded_file(
+            &self.path.join(PUBLIC_NOTICE_STORE_BASENAME),
+            MAX_PUBLIC_NOTICE_BYTES,
+        )?;
+        if !valid_public_notice(&notice) || sha256(&notice) != decode_sha256(&gate.notice_sha256)? {
             return Err(corrupt("public source notice checksum mismatch"));
         }
         Ok(Some(gate))
@@ -2341,7 +2366,7 @@ impl PersistentIndex {
     }
 
     fn install_public_notice(&self, notice: &[u8]) -> Result<(), StorageError> {
-        let path = self.path.join(PUBLIC_NOTICE_NAME);
+        let path = self.path.join(PUBLIC_NOTICE_STORE_BASENAME);
         match fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.file_type().is_file() => {
                 if read_bounded_file(&path, MAX_PUBLIC_NOTICE_BYTES)? != notice {
@@ -3448,16 +3473,97 @@ fn validate_public_collection_gate(gate: &PublicCollectionGate) -> Result<(), St
         })
         || gate.installed_at_ms == 0
         || gate.visible_until_ms <= gate.installed_at_ms
-        || gate.license != "MIT"
+        || gate.license.trim().is_empty()
+        || gate.license.len() > 256
+        || gate.license.chars().any(char::is_control)
         || gate.source_version.is_empty()
         || gate.source_version.len() > 200
         || gate.source_version.chars().any(char::is_control)
-        || gate.notice_file != PUBLIC_NOTICE_NAME
+        || !is_safe_notice_file_name(&gate.notice_file)
         || !is_lower_sha256(&gate.notice_sha256)
+        || !valid_permission_metadata(gate)
     {
         return Err(StorageError::PublicCollectionConflict);
     }
     Ok(())
+}
+
+pub(crate) fn validate_public_collection_admission(
+    gate: &PublicCollectionGate,
+    notice: &[u8],
+) -> Result<(), StorageError> {
+    validate_public_collection_gate(gate)?;
+    if !valid_public_notice(notice) || sha256(notice) != decode_sha256(&gate.notice_sha256)? {
+        return Err(StorageError::PublicCollectionConflict);
+    }
+    let record = PublicCollectionRecord {
+        schema: "ley-public-collection-v1".to_owned(),
+        store_id: [0; 16],
+        gate: gate.clone(),
+        mac: "0".repeat(64),
+    };
+    let bytes = serde_json::to_vec(&record).map_err(|_| StorageError::PublicCollectionConflict)?;
+    if bytes.len() > MAX_PUBLIC_COLLECTION_BYTES {
+        return Err(StorageError::PublicCollectionConflict);
+    }
+    Ok(())
+}
+
+fn valid_permission_metadata(gate: &PublicCollectionGate) -> bool {
+    let permissions = [
+        &gate.fetch_permission,
+        &gate.storage_permission,
+        &gate.index_permission,
+        &gate.display_permission,
+    ];
+    if permissions.iter().all(|permission| permission.is_none()) && gate.removal_contact.is_none() {
+        return true;
+    }
+    let Some(removal_contact) = gate.removal_contact.as_deref() else {
+        return false;
+    };
+    if removal_contact.trim().is_empty()
+        || removal_contact.len() > 512
+        || removal_contact.chars().any(char::is_control)
+    {
+        return false;
+    }
+    permissions.iter().all(|permission| {
+        permission.as_ref().is_some_and(|permission| {
+            permission.granted
+                && permission.reviewed_at_ms > 0
+                && permission.reviewed_at_ms <= gate.installed_at_ms
+                && valid_public_permission_text(&permission.basis)
+                && valid_public_permission_text(&permission.evidence)
+        })
+    })
+}
+
+fn valid_public_permission_text(value: &str) -> bool {
+    !value.trim().is_empty()
+        && value.len() <= MAX_PUBLIC_PERMISSION_TEXT_BYTES
+        && !value.chars().any(char::is_control)
+}
+
+fn valid_public_notice(bytes: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    !text.trim().is_empty()
+        && bytes.len() <= MAX_PUBLIC_NOTICE_BYTES
+        && !text
+            .chars()
+            .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+}
+
+fn is_safe_notice_file_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name != "."
+        && name != ".."
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 fn is_lower_sha256(value: &str) -> bool {
@@ -5222,11 +5328,16 @@ mod tests {
             visible_until_ms,
             license: "MIT".to_owned(),
             source_version: "rustdoc test fixture".to_owned(),
-            notice_file: PUBLIC_NOTICE_NAME.to_owned(),
+            notice_file: PUBLIC_NOTICE_STORE_BASENAME.to_owned(),
             notice_sha256: sha256(notice)
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
                 .collect(),
+            fetch_permission: None,
+            storage_permission: None,
+            index_permission: None,
+            display_permission: None,
+            removal_contact: None,
         }
     }
 
@@ -5255,7 +5366,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            fs::read(store.path.join(PUBLIC_NOTICE_NAME)).unwrap(),
+            fs::read(store.path.join(PUBLIC_NOTICE_STORE_BASENAME)).unwrap(),
             notice
         );
         assert_eq!(
@@ -5319,6 +5430,51 @@ mod tests {
             store.install_public_collection_gate(&public_gate(notice, 10, 40), notice, 10),
             Err(StorageError::PublicCollectionConflict)
         ));
+    }
+
+    #[test]
+    fn public_collection_persists_custom_terms_and_permission_evidence() {
+        let temp = TempStore::new();
+        let store = PersistentIndex::create(temp.path()).unwrap();
+        let notice = b"Publisher terms notice, authored storage fixture.\n";
+        let mut gate = public_gate(notice, 10, 40);
+        gate.license = "Publisher terms, reviewed offline".to_owned();
+        gate.notice_file = "source-notice.txt".to_owned();
+        let permission = || PublicPermissionEvidence {
+            granted: true,
+            basis: "authored storage fixture only".to_owned(),
+            evidence: "not a real permission grant".to_owned(),
+            reviewed_at_ms: 1,
+        };
+        gate.fetch_permission = Some(permission());
+        gate.storage_permission = Some(permission());
+        gate.index_permission = Some(permission());
+        gate.display_permission = Some(permission());
+        gate.removal_contact = Some("operator@example.org".to_owned());
+
+        store
+            .install_public_collection_gate(&gate, notice, 10)
+            .unwrap();
+        assert_eq!(
+            fs::read(store.path.join(PUBLIC_NOTICE_STORE_BASENAME)).unwrap(),
+            notice
+        );
+        let restored = {
+            let _lock = store.lock_shared().unwrap();
+            store.load_public_collection_locked().unwrap().unwrap()
+        };
+        assert_eq!(restored, gate);
+        assert_eq!(restored.license, "Publisher terms, reviewed offline");
+    }
+
+    #[test]
+    fn public_collection_preflight_rejects_gate_larger_than_record_budget() {
+        let notice = b"Publisher terms notice.\n";
+        let mut gate = public_gate(notice, 10, 40);
+        gate.path_prefixes = (0..64)
+            .map(|index| format!("/{}-{index}", "x".repeat(2000)))
+            .collect();
+        assert!(validate_public_collection_admission(&gate, notice).is_err());
     }
 
     fn write_lease_bundle(root: &Path, leases: &[Vec<u8>]) {
@@ -6477,7 +6633,7 @@ mod tests {
             &encode_public_collection_record(store_id, &gate, &lease_mac_key).unwrap(),
         )
         .unwrap();
-        create_private_file(&root.join(PUBLIC_NOTICE_NAME), notice).unwrap();
+        create_private_file(&root.join(PUBLIC_NOTICE_STORE_BASENAME), notice).unwrap();
         let store = PersistentIndex {
             path: fs::canonicalize(root).unwrap(),
             store_id,
@@ -6782,7 +6938,7 @@ mod tests {
         let source_store_bytes = fs::read(source.path().join(STORE_NAME)).unwrap();
         let (store_id, _) = decode_store(&source_store_bytes).unwrap();
         let record = fs::read(source.path().join(PUBLIC_COLLECTION_NAME)).unwrap();
-        let notice = fs::read(source.path().join(PUBLIC_NOTICE_NAME)).unwrap();
+        let notice = fs::read(source.path().join(PUBLIC_NOTICE_STORE_BASENAME)).unwrap();
 
         let report = PersistentIndex::reindex_gate3(source.path(), destination.path()).unwrap();
         assert_eq!(report.source_generation, 7);
@@ -6801,7 +6957,7 @@ mod tests {
             record
         );
         assert_eq!(
-            fs::read(destination.path().join(PUBLIC_NOTICE_NAME)).unwrap(),
+            fs::read(destination.path().join(PUBLIC_NOTICE_STORE_BASENAME)).unwrap(),
             notice
         );
         let view = migrated.read_view().unwrap();

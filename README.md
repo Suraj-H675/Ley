@@ -421,9 +421,44 @@ The reference verifier checks its finite authored corpus. It is not a general we
 
 ## Public collection policy
 
-`policy/public-sources.json` remains disabled. Its only entry covers three exact plain-text Rust standard-library pages: [`String`](https://doc.rust-lang.org/stable/std/string/struct.String.html), [`HashMap`](https://doc.rust-lang.org/stable/std/collections/struct.HashMap.html), and [`Iterator`](https://doc.rust-lang.org/stable/std/iter/trait.Iterator.html). Read-only licensing research on 2026-10-14 inspected those pages and Rust's [official licensing page](https://rust-lang.org/policies/licenses/), linked from the [Rust policy page](https://rust-lang.org/policies/). The licensing page says official Rust projects, including the website, are generally dual-licensed Apache-2.0 OR MIT. The reviewed candidate selects MIT and records fetch, storage, index, and display license bases. This is a license basis, not a signed permission statement or legal certification.
+`policy/public-sources.json` stays disabled and uses schema `ley-public-sources-v2`. It is an example shape, not an approved policy for another site. A public collection admits one source. Review fetch, storage, indexing, and display permission separately. Record the exact source scope, terms basis, evidence, reviewer time, version, expiry, retention, removal contact, and request budgets. A license label or `granted: true` value records your assessment. Ley does not verify legal rights.
 
-The hosted pages report `rustdoc 1.99.0 (b940084d7, 2026-09-28)`. The installed Rust 1.97.0 toolchain notice is separate attribution evidence and is not treated as the hosted pages' revision. The full copyright and MIT permission notice is in [`notices/rust-stdlib-documentation-MIT.txt`](notices/rust-stdlib-documentation-MIT.txt). The UI links to that notice, and an admitted store receives a private copy before the crawler can admit a source. Results link to their source pages. The candidate excludes images, logos, and third-party material.
+Ley also reads the legacy `ley-public-sources-v1` format for existing approved collections. V1 accepts only `license: MIT` with `notice_file: rust-stdlib-documentation-MIT.txt` and uses the bundled Rust notice. It has no external notice path or digest. Keep the exact v1 policy and approval hash to resume its store. Rewriting it as v2 changes the policy digest and does not match the store's existing admission.
+
+To prepare an operator-owned policy, copy the disabled JSON to a private directory and replace its source facts. Keep a plain-text notice beside the JSON. Set `notice_file` to that notice's leaf filename and set `notice_sha256` to its lowercase SHA-256. The filename cannot contain a directory path. Ley reads only that sibling file, up to 16 KiB, and requires nonempty UTF-8 text without control characters. The policy SHA-256 covers the expected notice hash. The policy filename is metadata, not a store path. For compatibility, Ley stores the verified bytes under its existing internal sidecar name, `rust-stdlib-documentation-MIT.txt`.
+
+For example, a source entry can record a terms label and the sibling notice like this. These values describe a shape only and grant no permission.
+
+```json
+{
+  "license": "Publisher terms, reviewed by the operator",
+  "source_version": "documentation build reviewed by the operator",
+  "notice_file": "source-notice.txt",
+  "notice_sha256": "REPLACE_WITH_64_LOWERCASE_HEX_DIGITS"
+}
+```
+
+Hash the exact files, then run the no-network preflight with the policy digest you reviewed.
+
+```sh
+sha256sum ./source-notice.txt
+sha256sum ./public-sources.json
+cargo run --locked -- policy validate --policy ./public-sources.json --approved-policy-sha256 "REPLACE_WITH_POLICY_SHA256"
+```
+
+`policy validate` first checks the exact policy bytes against the supplied approval hash. Only then does it read the named sibling notice and check its hash and current scope. It opens no store or frontier. Success does not establish that the source owner granted permission. The checked-in policy remains disabled.
+
+The `crawl-public` command sends public HTTP requests. Run it only after separate operator authorization for the exact source, operations, scope, budget, and policy digest. This example makes requests if you replace the placeholders with valid paths and approval values.
+
+```sh
+cargo run --locked -- crawl-public --policy /private/public-sources.json --store /private/new-store --frontier /private/new-frontier.sqlite --requests 1 --approved-policy-sha256 "REVIEWED_POLICY_SHA256" --allow-public-requests
+```
+
+Use `crawl-status` to inspect a collection and `revoke-source` to stop current display through a tombstone. Reads stop after the earlier of collection retention and policy expiry. A changed policy cannot replace an installed gate; create a new collection after fresh review. Revocation does not physically erase prior immutable generations or event records. The current API and UI do not expose the stored notice beside results, so do not approve display terms that require a notice with each excerpt.
+
+The checked-in entry covers three exact plain-text Rust standard-library pages: [`String`](https://doc.rust-lang.org/stable/std/string/struct.String.html), [`HashMap`](https://doc.rust-lang.org/stable/std/collections/struct.HashMap.html), and [`Iterator`](https://doc.rust-lang.org/stable/std/iter/trait.Iterator.html). Read-only licensing research on 2026-10-14 inspected those pages and Rust's [official licensing page](https://rust-lang.org/policies/licenses/), linked from the [Rust policy page](https://rust-lang.org/policies/). That page says official Rust projects, including the website, are generally dual-licensed Apache-2.0 OR MIT. The disabled candidate records historical fetch, storage, and indexing evidence. Its display grant is false because the current API and UI do not show the stored notice. This policy is not a signed permission statement or legal certification.
+
+The hosted pages report `rustdoc 1.99.0 (b940084d7, 2026-09-28)`. The installed Rust 1.97.0 toolchain notice is separate attribution evidence and is not treated as the hosted pages' revision. The full copyright and MIT permission notice remains in [`notices/rust-stdlib-documentation-MIT.txt`](notices/rust-stdlib-documentation-MIT.txt). The byte-identical [`policy/source-notice.txt`](policy/source-notice.txt) copy lets the disabled sample policy load its notice from a safe sibling path. An admitted store keeps a private notice copy under its stable internal sidecar name. Results link to their source pages. The candidate excludes images, logos, and third-party material.
 
 On 2026-10-14, one bounded collection ran with a private enabled copy of the reviewed policy in two invocations. The first fetched only `robots.txt` and made no page progress because the scheduler stopped at the one-second origin delay. After that scheduler defect was corrected, a three-request continuation used the same store and frontier to fetch the admitted pages over validated HTTPS. All four responses returned HTTP 200. The robots response body measured 382 wire bytes and 382 decoded bytes. The three page bodies measured 159,419 wire bytes and 1,581,999 decoded bytes together. Across both invocations, body totals were 159,801 wire bytes and 1,582,381 decoded bytes. These counts exclude headers and TLS or protocol framing.
 

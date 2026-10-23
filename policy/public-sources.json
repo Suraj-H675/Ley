@@ -1,5 +1,5 @@
 {
-  "schema": "ley-public-sources-v1",
+  "schema": "ley-public-sources-v2",
   "enabled": false,
   "identity": "LeyBot/0.1.0",
   "contact": "https://github.com/Suraj-H675/Ley/issues",
@@ -25,25 +25,26 @@
       },
       "storage_permission": {
         "granted": true,
-        "basis": "MIT permits copying and distribution when the copyright and permission notices travel with copies. Retain the full notice beside private corpus data and expose it beside displayed excerpts. A removal request stops current display; immutable historical bytes remain private under the license.",
-        "evidence": "Work read-only review 2026-10-14 inspected the three exact seeds and the official Rust licensing page. Retained notice: notices/rust-stdlib-documentation-MIT.txt. Local COPYRIGHT-library.html SHA-256 0a65bb747c49c7bb816cbc7188319bd6e4e8d08091c1190b8a3c0971c47968ed supports Rust attribution and notes contributor copyright and file exceptions.",
+        "basis": "Retain the full notice with private corpus data. The current API and UI do not expose this stored notice beside results, so display remains unapproved until the operator reviews whether excerpts may be shown without a per-result notice.",
+        "evidence": "Work read-only review 2026-10-14 inspected the three exact seeds and the official Rust licensing page. The policy-local notice copy is policy/source-notice.txt and matches notices/rust-stdlib-documentation-MIT.txt. Local COPYRIGHT-library.html SHA-256 0a65bb747c49c7bb816cbc7188319bd6e4e8d08091c1190b8a3c0971c47968ed supports Rust attribution and notes contributor copyright and file exceptions.",
         "reviewed_at_ms": 1791966032000
       },
       "index_permission": {
         "granted": true,
-        "basis": "MIT permits use, modification, and distribution of copies or substantial portions with the required notices. Ley indexes only the admitted plain-text fields and keeps source links and the full MIT notice with results.",
+        "basis": "Retain the full notice with private indexed content. The policy does not claim that any excerpts may be displayed without satisfying the applicable notice terms.",
         "evidence": "Work read-only review 2026-10-14 inspected the three exact standard-library pages, their hosted rustdoc 1.99.0 (b940084d7, 2026-09-28) identity, and https://rust-lang.org/policies/licenses/. Images, logos, and third-party material are excluded.",
         "reviewed_at_ms": 1791966032000
       },
       "display_permission": {
-        "granted": true,
-        "basis": "MIT permits distribution of the reviewed plain-text documentation with its copyright and permission notices. Each displayed result links to its source and the UI provides the full local notice. Images, logos, and other third-party material are excluded.",
-        "evidence": "Work read-only review 2026-10-14 inspected the three exact hosted pages and https://rust-lang.org/policies/licenses/. The official Rust policy describes official Rust projects, including the website, as generally dual-licensed Apache-2.0 OR MIT.",
+        "granted": false,
+        "basis": "This candidate does not expose the source notice alongside displayed excerpts. Do not grant display permission for terms that require a notice with each display.",
+        "evidence": "The checked-in policy stays disabled. An operator must review all display terms and use a client that presents required attribution before granting display permission.",
         "reviewed_at_ms": 1791966032000
       },
       "license": "MIT",
       "source_version": "rustdoc 1.99.0 (b940084d7, 2026-09-28)",
-      "notice_file": "rust-stdlib-documentation-MIT.txt",
+      "notice_file": "source-notice.txt",
+      "notice_sha256": "00a6a0169d5440bb0db6c06983c7067b1cbb3f2a56339d30d09fd6996e65bd4a",
       "robots": "obey",
       "removal_contact": "https://github.com/Suraj-H675/Ley/issues",
       "retention_days": 30,

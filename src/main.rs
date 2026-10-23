@@ -310,6 +310,17 @@ fn main() -> ExitCode {
             }
         };
     }
+    if command == "policy" {
+        let Some(action) = args.next() else {
+            eprintln!("policy requires the validate action");
+            return ExitCode::from(2);
+        };
+        if action != "validate" {
+            eprintln!("unknown policy action: {action:?}");
+            return ExitCode::from(2);
+        }
+        return run_policy_validate(args);
+    }
     if command == "crawl-status" {
         return run_crawl_status(args);
     }
@@ -367,23 +378,28 @@ fn main() -> ExitCode {
             eprintln!("--requests must be between 1 and 12");
             return ExitCode::from(2);
         }
-        let policy = match ley::public_policy::PublicCrawlPolicy::load(&policy_path) {
+        let policy = match ley::public_policy::PublicCrawlPolicy::load_approved(
+            &policy_path,
+            &approved_hash,
+        ) {
             Ok(policy) => policy,
+            Err(ley::public_policy::PublicPolicyError::ApprovalMismatch) => {
+                eprintln!(
+                    "crawl-public policy hash does not match the supplied Work-approved SHA-256"
+                );
+                return ExitCode::from(2);
+            }
             Err(error) => {
                 eprintln!("ley: {error}");
                 return ExitCode::FAILURE;
             }
         };
-        if !policy.matches_sha256(&approved_hash) {
-            eprintln!("crawl-public policy hash does not match the supplied Work-approved SHA-256");
-            return ExitCode::from(2);
-        }
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis()
             .min(u64::MAX as u128) as u64;
-        if let Err(error) = policy.validate_enabled(now_ms) {
+        if let Err(error) = policy.validate_for_crawl(now_ms) {
             eprintln!("ley: {error}");
             return ExitCode::FAILURE;
         }
@@ -490,6 +506,51 @@ fn run_crawl_status(mut args: impl Iterator<Item = String>) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn run_policy_validate(mut args: impl Iterator<Item = String>) -> ExitCode {
+    let mut policy_path = None;
+    let mut approved_hash = None;
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--policy" if policy_path.is_none() => policy_path = args.next(),
+            "--approved-policy-sha256" if approved_hash.is_none() => approved_hash = args.next(),
+            _ => {
+                eprintln!("unknown or repeated policy validate argument: {argument:?}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let (Some(policy_path), Some(approved_hash)) = (policy_path, approved_hash) else {
+        eprintln!("policy validate requires --policy and --approved-policy-sha256");
+        return ExitCode::from(2);
+    };
+    let policy =
+        match ley::public_policy::PublicCrawlPolicy::load_approved(&policy_path, &approved_hash) {
+            Ok(policy) => policy,
+            Err(ley::public_policy::PublicPolicyError::ApprovalMismatch) => {
+                eprintln!("policy SHA-256 does not match the supplied operator approval");
+                return ExitCode::from(2);
+            }
+            Err(error) => {
+                eprintln!("ley: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64;
+    if let Err(error) = policy.validate_for_crawl(now_ms) {
+        eprintln!("ley: {error}");
+        return ExitCode::FAILURE;
+    }
+    println!("Policy fields and source notice hash are valid for one source.");
+    println!("Approved policy SHA-256: {}", policy.sha256());
+    println!("No request was sent and no store or frontier was opened.");
+    println!("Validation records operator evidence; it does not verify legal rights.");
+    ExitCode::SUCCESS
 }
 
 fn run_ingest_html(mut args: impl Iterator<Item = String>) -> ExitCode {
@@ -647,7 +708,7 @@ fn read_evidence_reference(path: &str) -> Result<EvidenceReference, ley::api::Cl
 
 fn print_usage() {
     println!(
-        "Ley Search Engine\n\nUsage:\n  cargo run --locked -- demo [--query EXPR] [--explain]\n  cargo run --locked -- controlled-demo [--retain-dir NEW_PATH]\n  cargo run --locked -- fixture-index --store PATH\n  cargo run --locked -- ingest-html --store NEW_PATH --directory DIR --url-prefix URL\n  cargo run --locked -- retrieve --store PATH --question TEXT [--max-hits 1..8]\n  cargo run --locked -- resolve-evidence --store PATH --reference-file PATH|-\n  cargo run --locked -- search --store PATH --query EXPR\n  cargo run --locked -- serve --store PATH [--bind 127.0.0.1:7331]\n  cargo run --locked -- compact --store PATH\n  cargo run --locked -- reindex-gate3 --source OLD --destination NEW\n  cargo run --locked -- revoke-source --store PATH --frontier PATH --source-id ID\n  cargo run --locked -- crawl-public --policy PATH --store PATH --frontier PATH --requests 1..12 --approved-policy-sha256 HASH --allow-public-requests\n\nThe controlled demo uses an owned loopback fixture; --retain-dir keeps its persistent index and frontier under a new directory. fixture-index creates authored synthetic documents without network access. ingest-html reads bounded UTF-8 HTML from an operator-selected local directory into a new store and does not fetch URLs. retrieve runs the versioned ordinary-question contract and prints typed passage candidates; resolve-evidence reads a bounded JSON reference from a file or stdin and revalidates it against the current store. search remains the advanced Boolean/phrase DSL. serve binds to loopback and exposes read-only health, legacy search, question retrieval, passage resolution, and bounded indexed-document inspection routes. Typed routes use POST /api/v1/retrieve, POST /api/v1/evidence/resolve, and POST /api/v1/evidence/inspect. The Gate 6 store appends immutable segments and compacts them explicitly; some aggregate segment limits recommend compact when merging can help, while live-corpus and retained lifecycle-history limits do not because compaction cannot reduce them. reindex-gate3 copies a stopped Gate 3 store to a separate destination and preserves the source bytes. Public crawling requires an enabled reviewed policy and an explicit hash approval. Search queries support terms, phrases, AND, OR, and implicit AND."
+        "Ley Search Engine\n\nUsage:\n  cargo run --locked -- demo [--query EXPR] [--explain]\n  cargo run --locked -- controlled-demo [--retain-dir NEW_PATH]\n  cargo run --locked -- fixture-index --store PATH\n  cargo run --locked -- ingest-html --store NEW_PATH --directory DIR --url-prefix URL\n  cargo run --locked -- retrieve --store PATH --question TEXT [--max-hits 1..8]\n  cargo run --locked -- resolve-evidence --store PATH --reference-file PATH|-\n  cargo run --locked -- search --store PATH --query EXPR\n  cargo run --locked -- serve --store PATH [--bind 127.0.0.1:7331]\n  cargo run --locked -- compact --store PATH\n  cargo run --locked -- reindex-gate3 --source OLD --destination NEW\n  cargo run --locked -- revoke-source --store PATH --frontier PATH --source-id ID\n  cargo run --locked -- policy validate --policy PATH --approved-policy-sha256 HASH\n  cargo run --locked -- crawl-public --policy PATH --store PATH --frontier PATH --requests 1..12 --approved-policy-sha256 HASH --allow-public-requests\n\nThe controlled demo uses an owned loopback fixture; --retain-dir keeps its persistent index and frontier under a new directory. fixture-index creates authored synthetic documents without network access. ingest-html reads bounded UTF-8 HTML from an operator-selected local directory into a new store and does not fetch URLs. retrieve runs the versioned ordinary-question contract and prints typed passage candidates; resolve-evidence reads a bounded JSON reference from a file or stdin and revalidates it against the current store. search remains the advanced Boolean/phrase DSL. serve binds to loopback and exposes read-only health, legacy search, question retrieval, passage resolution, and bounded indexed-document inspection routes. Typed routes use POST /api/v1/retrieve, POST /api/v1/evidence/resolve, and POST /api/v1/evidence/inspect. The Gate 6 store appends immutable segments and compacts them explicitly; some aggregate segment limits recommend compact when merging can help, while live-corpus and retained lifecycle-history limits do not because compaction cannot reduce them. reindex-gate3 copies a stopped Gate 3 store to a separate destination and preserves the source bytes. policy validate checks one enabled source and its notice without network or store access. crawl-public sends bounded public requests only with an enabled reviewed policy, its exact approval digest, and explicit request opt-in. Search queries support terms, phrases, AND, OR, and implicit AND."
     );
     println!(
         "  cargo run --locked -- local-collection init --store NEW_PATH --directory DIR --url-prefix URL\n  cargo run --locked -- local-collection sync --store PATH --directory DIR --url-prefix URL\n  cargo run --locked -- local-collection status --store PATH\n\nManaged local collection initialization and sync are offline. The caller is responsible for rights to retain supplied content. HTTP(S) URLs are document identities only and are never fetched."

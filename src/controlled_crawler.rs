@@ -2127,6 +2127,13 @@ pub(crate) fn run_public_crawl(
         .map(|source| source.authority(policy.identity(), policy.contact()))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| CrawlError::Policy(error.to_string()))?;
+    let gate = policy
+        .collection_gate(now)
+        .map_err(|error: PublicPolicyError| CrawlError::Policy(error.to_string()))?;
+    let notice = policy
+        .notice_bytes()
+        .map_err(|error: PublicPolicyError| CrawlError::Policy(error.to_string()))?;
+    crate::storage::validate_public_collection_admission(&gate, notice)?;
     let index = match fs::symlink_metadata(index_path) {
         Ok(_) => Arc::new(PersistentIndex::open(index_path)?),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -2134,12 +2141,6 @@ pub(crate) fn run_public_crawl(
         }
         Err(error) => return Err(CrawlError::Io(error)),
     };
-    let gate = policy
-        .collection_gate(now)
-        .map_err(|error| CrawlError::Policy(error.to_string()))?;
-    let notice = policy
-        .notice_bytes()
-        .map_err(|error| CrawlError::Policy(error.to_string()))?;
     index.install_public_collection_gate(&gate, notice, now)?;
     let mut crawler = ControlledCrawler::<SystemResolver, SystemClock>::open_system_with_public(
         frontier_path,

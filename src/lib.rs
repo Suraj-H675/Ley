@@ -165,6 +165,7 @@ pub fn run_managed_local_collection_cli(args: Vec<String>) -> Result<String, Str
 #[cfg(test)]
 mod tests {
     use super::{public_policy::PublicCrawlPolicy, run_public_crawl};
+    use sha2::{Digest, Sha256};
 
     #[test]
     fn public_library_entry_requires_opt_in_and_exact_hash_before_opening_paths() {
@@ -183,7 +184,17 @@ mod tests {
             include_bytes!("../policy/public-sources.json"),
         )
         .unwrap();
-        let policy = PublicCrawlPolicy::load(&policy_path).unwrap();
+        std::fs::write(
+            directory.join("source-notice.txt"),
+            include_bytes!("../policy/source-notice.txt"),
+        )
+        .unwrap();
+        let policy_bytes = std::fs::read(&policy_path).unwrap();
+        let approved_sha256 = Sha256::digest(&policy_bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let policy = PublicCrawlPolicy::load_approved(&policy_path, &approved_sha256).unwrap();
         let store = directory.join("store");
         let frontier = directory.join("frontier.sqlite");
 
