@@ -99,6 +99,13 @@ const LEASE_TAG_BYTES: usize = 32;
 const MAX_LEASE_TOKEN_BYTES: usize = LEASE_HEADER_BYTES + MAX_URL_KEY_BYTES + LEASE_TAG_BYTES;
 const PUBLIC_COLLECTION_DOMAIN: &[u8] = b"ley-public-collection-v1\0";
 
+#[cfg(test)]
+thread_local! {
+    static LAST_QUESTION_WORK: std::cell::Cell<(usize, usize)> = const {
+        std::cell::Cell::new((0, 0))
+    };
+}
+
 type StoreId = [u8; 16];
 type VersionId = [u8; 32];
 type LeaseMacKey = [u8; 32];
@@ -604,6 +611,9 @@ impl PersistentIndex {
 
     pub(crate) fn managed_snapshot(&self) -> Result<ManagedStoreSnapshot, ManagedStorageError> {
         let _lock = self.lock_shared()?;
+        if self.load_public_collection_locked()?.is_some() {
+            return Err(ManagedStorageError::Conflict);
+        }
         let snapshot = self.load_snapshot_locked()?;
         let mut controls = BTreeMap::new();
         for (key, control) in &snapshot.manifest.controls {
@@ -915,11 +925,22 @@ impl PersistentIndex {
             writer: Mutex::new(()),
         };
         let lock = FileLock::new_shared_read_only(&store.path.join(LOCK_NAME))?;
+        let public_gate = store.load_public_collection_locked()?;
         let snapshot = store.load_snapshot_locked()?;
+        let live_document_keys = snapshot
+            .documents
+            .values()
+            .filter(|document| {
+                public_gate
+                    .as_ref()
+                    .is_none_or(|gate| public_gate_contains_document(gate, document))
+            })
+            .map(|document| document.id.clone())
+            .collect();
         Ok(ReadOnlyIndexInspection {
             store_id,
             generation_id: snapshot.manifest.generation_id,
-            live_document_keys: snapshot.documents.into_keys().collect(),
+            live_document_keys,
             _lock: lock,
         })
     }
@@ -1115,6 +1136,17 @@ impl PersistentIndex {
             return Err(StorageError::StaleFence);
         }
         let revoked = manifest_is_revoked(&control);
+        if !revoked {
+            if let Some(document) = prepared_document.as_ref() {
+                let public_gate = self.load_public_collection_locked()?;
+                if public_gate
+                    .as_ref()
+                    .is_some_and(|gate| !public_gate_contains_document(gate, document))
+                {
+                    return Err(StorageError::PublicCollectionConflict);
+                }
+            }
+        }
         let old_document = current_snapshot.documents.get(&key_text).cloned();
         let mut new_segment = None;
         match intent {
@@ -1193,6 +1225,8 @@ impl PersistentIndex {
         let _lock = self.lock_exclusive()?;
         self.ensure_no_managed_reservation_locked()?;
         let snapshot = self.load_snapshot_locked()?;
+        let public_gate = self.load_public_collection_locked()?;
+        validate_public_documents_in_scope(public_gate.as_ref(), snapshot.documents.values())?;
         let current = &snapshot.manifest;
         let old_segments = current
             .segments
@@ -1320,6 +1354,14 @@ impl PersistentIndex {
             None
         };
 
+        let documents = legacy
+            .index
+            .documents()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        validate_public_documents_in_scope(gate.as_ref(), documents.iter())?;
+
         let destination_name = destination_path
             .file_name()
             .ok_or_else(|| {
@@ -1349,12 +1391,6 @@ impl PersistentIndex {
         }
         sync_directory(&stage_path)?;
 
-        let documents = legacy
-            .index
-            .documents()
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
         let mut manifest = Manifest {
             generation_id: legacy.id,
             parent_id: legacy.parent_id,
@@ -1483,13 +1519,15 @@ impl PersistentIndex {
 
     pub(crate) fn read_view_at(&self, now_ms: u64) -> Result<ReadView, StorageError> {
         let _lock = self.lock_shared()?;
-        let public_visible_until_ms = self
-            .load_public_collection_locked()?
-            .map(|gate| gate.visible_until_ms);
+        let public_gate = self.load_public_collection_locked()?;
+        let public_visible_until_ms = public_gate.as_ref().map(|gate| gate.visible_until_ms);
         if public_visible_until_ms.is_some_and(|deadline| now_ms >= deadline) {
             return Err(StorageError::PublicCollectionExpired);
         }
-        let snapshot = self.load_snapshot_locked()?;
+        let mut snapshot = self.load_snapshot_locked()?;
+        if let Some(gate) = public_gate.as_ref() {
+            filter_snapshot_to_public_scope(&mut snapshot, gate)?;
+        }
         Ok(ReadView {
             snapshot: Arc::new(snapshot),
             public_visible_until_ms,
@@ -1554,8 +1592,43 @@ impl PersistentIndex {
             return Ok(response);
         }
 
-        let (descriptors, skipped_segments) = select_question_segments(&manifest.segments, &seed)
-            .map_err(map_retrieval_storage_error)?;
+        let (mut descriptors, mut skipped_segments) =
+            select_question_segments(&manifest.segments, &seed)
+                .map_err(map_retrieval_storage_error)?;
+        if gate.is_some() {
+            let max_document_count = manifest
+                .segments
+                .iter()
+                .map(|descriptor| u64::from(descriptor.document_count))
+                .max()
+                .unwrap_or(0);
+            let scope_ordinal_reserve = max_document_count
+                .checked_mul(std::mem::size_of::<u32>() as u64)
+                .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Vec<u32>>() as u64))
+                .ok_or(RetrievalError::CorruptStorage)?;
+            let Some(mut selected_estimate) =
+                descriptors.iter().try_fold(0u64, |total, descriptor| {
+                    total.checked_add(segment_memory_estimate(descriptor)?)
+                })
+            else {
+                return Err(RetrievalError::CorruptStorage);
+            };
+            while selected_estimate
+                .checked_add(scope_ordinal_reserve)
+                .is_none_or(|total| total > MAX_QUESTION_SEGMENT_MEMORY_ESTIMATE)
+            {
+                let Some(descriptor) = descriptors.pop() else {
+                    return Err(RetrievalError::ResourceLimit);
+                };
+                selected_estimate = selected_estimate
+                    .checked_sub(
+                        segment_memory_estimate(&descriptor)
+                            .ok_or(RetrievalError::CorruptStorage)?,
+                    )
+                    .ok_or(RetrievalError::CorruptStorage)?;
+                skipped_segments = true;
+            }
+        }
         partial |= skipped_segments;
 
         let mut segments = Vec::with_capacity(descriptors.len());
@@ -1574,7 +1647,29 @@ impl PersistentIndex {
 
         let mut sampled_by_segment = vec![BTreeSet::<u32>::new(); segments.len()];
         let mut posting_probes = 0usize;
+        #[cfg(test)]
+        let mut scope_documents_checked = 0usize;
         for (segment_index, (segment_id, segment)) in segments.iter().enumerate() {
+            let scoped_ordinals = if let Some(public_gate) = &gate {
+                let mut ordinals = Vec::new();
+                ordinals
+                    .try_reserve_exact(segment.documents.len())
+                    .map_err(|_| RetrievalError::ResourceLimit)?;
+                for (ordinal, document) in segment.documents.iter().enumerate() {
+                    #[cfg(test)]
+                    {
+                        scope_documents_checked += 1;
+                    }
+                    if public_gate_contains_document(public_gate, document) {
+                        ordinals.push(
+                            u32::try_from(ordinal).map_err(|_| RetrievalError::CorruptStorage)?,
+                        );
+                    }
+                }
+                Some(ordinals)
+            } else {
+                None
+            };
             for term in &plan.candidate_terms {
                 let Some(records) = segment.postings.get(term) else {
                     continue;
@@ -1585,14 +1680,45 @@ impl PersistentIndex {
                 }
                 let term_seed = sample_term_seed(&seed, term, *segment_id);
                 let probe_budget = MAX_QUESTION_POSTING_PROBES - posting_probes;
-                let (ordinals, probes) = sample_question_postings(
-                    records,
-                    segment.documents.len(),
-                    &term_seed,
-                    probe_budget,
-                );
+                let (ordinals, probes, omitted_authorized_documents) =
+                    if let Some(scoped_ordinals) = scoped_ordinals.as_ref() {
+                        if scoped_ordinals.len() == segment.documents.len() {
+                            let (ordinals, probes) = sample_question_postings(
+                                records,
+                                segment.documents.len(),
+                                &term_seed,
+                                probe_budget,
+                            );
+                            (ordinals, probes, false)
+                        } else {
+                            let ordinals = sample_scoped_document_ordinals(
+                                scoped_ordinals,
+                                &term_seed,
+                                probe_budget,
+                            );
+                            let probes = ordinals.len();
+                            let matched_ordinals = ordinals
+                                .into_iter()
+                                .filter(|ordinal| records.contains_key(ordinal))
+                                .collect::<Vec<_>>();
+                            (matched_ordinals, probes, scoped_ordinals.len() > probes)
+                        }
+                    } else {
+                        let (ordinals, probes) = sample_question_postings(
+                            records,
+                            segment.documents.len(),
+                            &term_seed,
+                            probe_budget,
+                        );
+                        (ordinals, probes, false)
+                    };
                 posting_probes = posting_probes.saturating_add(probes);
-                if ordinals.len() < records.len() {
+                if omitted_authorized_documents
+                    || (scoped_ordinals
+                        .as_ref()
+                        .is_none_or(|scoped| scoped.len() == segment.documents.len())
+                        && ordinals.len() < records.len())
+                {
                     partial = true;
                 }
                 for ordinal in ordinals {
@@ -1608,6 +1734,8 @@ impl PersistentIndex {
                 }
             }
         }
+        #[cfg(test)]
+        LAST_QUESTION_WORK.with(|work| work.set((scope_documents_checked, posting_probes)));
 
         let mut admitted_by_segment = Vec::<Vec<u32>>::with_capacity(segments.len());
         if !segments.is_empty() {
@@ -2011,6 +2139,12 @@ impl PersistentIndex {
         }
         if !manifest_document_is_live(&manifest, document, live.segment_id, live.ordinal)
             .map_err(map_evidence_storage_error)?
+        {
+            return Err(EvidenceResolveError::NotLive);
+        }
+        if collection
+            .as_ref()
+            .is_some_and(|value| !public_gate_contains_document(&value.gate, document))
         {
             return Err(EvidenceResolveError::NotLive);
         }
@@ -2670,6 +2804,29 @@ fn sample_question_postings(
         }
     }
     (ordinals.into_iter().collect(), probes)
+}
+
+fn sample_scoped_document_ordinals(
+    eligible_ordinals: &[u32],
+    seed: &[u8; 32],
+    probe_budget: usize,
+) -> Vec<u32> {
+    const SAMPLE_COUNT: usize = 8;
+
+    let sample_count = eligible_ordinals.len().min(SAMPLE_COUNT).min(probe_budget);
+    if sample_count == 0 {
+        return Vec::new();
+    }
+    let start = u64::from_be_bytes(seed[..8].try_into().expect("fixed hash length"))
+        % eligible_ordinals.len() as u64;
+    let start = start as usize;
+    let mut ordinals = Vec::with_capacity(sample_count);
+    for sample in 0..sample_count {
+        let offset = sample * eligible_ordinals.len() / sample_count;
+        ordinals.push(eligible_ordinals[(start + offset) % eligible_ordinals.len()]);
+    }
+    ordinals.sort_unstable();
+    ordinals
 }
 
 fn question_bm25_score(
@@ -3687,6 +3844,49 @@ fn public_gate_contains_document(gate: &PublicCollectionGate, document: &Indexed
                     .iter()
                     .any(|prefix| crate::url_key::path_is_within_prefix(url.path(), prefix))
         })
+}
+
+fn validate_public_documents_in_scope<'a>(
+    gate: Option<&PublicCollectionGate>,
+    documents: impl IntoIterator<Item = &'a IndexedDocument>,
+) -> Result<(), StorageError> {
+    if let Some(gate) = gate {
+        if documents
+            .into_iter()
+            .any(|document| !public_gate_contains_document(gate, document))
+        {
+            return Err(corrupt(
+                "public collection contains a document outside its authenticated scope",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn filter_snapshot_to_public_scope(
+    snapshot: &mut SegmentedSnapshot,
+    gate: &PublicCollectionGate,
+) -> Result<(), StorageError> {
+    let out_of_scope = snapshot
+        .documents
+        .values()
+        .filter(|document| !public_gate_contains_document(gate, document))
+        .map(|document| document.id.clone())
+        .collect::<Vec<_>>();
+
+    for key in out_of_scope {
+        let document = snapshot
+            .documents
+            .remove(&key)
+            .ok_or_else(|| corrupt("out-of-scope document disappeared from the snapshot"))?;
+        if snapshot.manifest.live.remove(&key).is_none() {
+            return Err(corrupt(
+                "out-of-scope document is missing from the live manifest",
+            ));
+        }
+        remove_document_statistics(&mut snapshot.manifest.statistics, &document)?;
+    }
+    Ok(())
 }
 
 fn is_safe_notice_file_name(name: &str) -> bool {
@@ -5697,7 +5897,7 @@ mod tests {
     }
 
     #[test]
-    fn source_transparency_is_local_or_withheld_when_public_scope_does_not_match() {
+    fn public_scope_rejects_mixed_identity_upserts_without_consuming_the_fence() {
         let local_temp = TempStore::new();
         let local = PersistentIndex::create(local_temp.path()).unwrap();
         let local_reference = source_reference(
@@ -5717,21 +5917,241 @@ mod tests {
         public
             .install_public_collection_gate(&gate, notice, now_ms)
             .unwrap();
-        for (requested, effective) in [
-            (
-                "https://docs.example.org/private/requested-outside-effective-in",
-                "https://docs.example.org/docs/effective",
+
+        let requested_outside =
+            UrlKey::parse("https://docs.example.org/private/requested-outside").unwrap();
+        let effective_inside = "https://docs.example.org/docs/effective-inside";
+        let requested_lease = public.issue_fence(&requested_outside).unwrap();
+        let before_requested_rejection = store_file_snapshot(&public.path);
+        assert!(matches!(
+            public.apply(
+                &requested_lease,
+                Intent::Upsert {
+                    effective_url: effective_inside.to_owned(),
+                    title: "outside requested identity".to_owned(),
+                    body: "scope rejection marker".to_owned(),
+                },
             ),
-            (
-                "https://docs.example.org/docs/requested",
-                "https://other.example/content",
+            Err(StorageError::PublicCollectionConflict)
+        ));
+        assert_eq!(
+            store_file_snapshot(&public.path),
+            before_requested_rejection,
+            "rejected requested URL must not publish a generation or segment"
+        );
+
+        let requested_inside =
+            UrlKey::parse("https://docs.example.org/docs/requested-inside").unwrap();
+        let effective_outside = "https://other.example/content";
+        let effective_lease = public.issue_fence(&requested_inside).unwrap();
+        let before_effective_rejection = store_file_snapshot(&public.path);
+        assert!(matches!(
+            public.apply(
+                &effective_lease,
+                Intent::Upsert {
+                    effective_url: effective_outside.to_owned(),
+                    title: "outside effective identity".to_owned(),
+                    body: "scope rejection marker".to_owned(),
+                },
             ),
+            Err(StorageError::PublicCollectionConflict)
+        ));
+        assert_eq!(
+            store_file_snapshot(&public.path),
+            before_effective_rejection,
+            "rejected redirect target must not publish a generation or segment"
+        );
+
+        let valid_effective = "https://docs.example.org:443/docs/requested-inside";
+        assert_eq!(
+            public
+                .apply(
+                    &effective_lease,
+                    Intent::Upsert {
+                        effective_url: valid_effective.to_owned(),
+                        title: "in scope after retry".to_owned(),
+                        body: "scope retry marker".to_owned(),
+                    },
+                )
+                .unwrap(),
+            ApplyOutcome::Applied,
+            "rejected upsert must not consume the current fence"
+        );
+        assert_eq!(
+            public
+                .apply(
+                    &effective_lease,
+                    Intent::Upsert {
+                        effective_url: valid_effective.to_owned(),
+                        title: "in scope after retry".to_owned(),
+                        body: "scope retry marker".to_owned(),
+                    },
+                )
+                .unwrap(),
+            ApplyOutcome::AlreadyApplied
+        );
+        let valid = public
+            .retrieve(RetrievalRequest::question("scope retry marker"))
+            .unwrap();
+        assert_eq!(valid.hits.len(), 1);
+        assert_eq!(valid.hits[0].effective_url, valid_effective);
+        assert_eq!(
+            public
+                .resolve_evidence(&valid.hits[0].passage.reference)
+                .unwrap()
+                .text,
+            valid.hits[0].passage.text
+        );
+
+        let default_port = UrlKey::parse("https://docs.example.org:443/docs/default-port").unwrap();
+        let document = test_document(
+            default_port.as_str(),
+            "https://docs.example.org:443/docs/default-port",
+            "title",
+            "body",
+        );
+        assert!(public_gate_contains_document(&gate, &document));
+        for outside in [
+            "https://docs.example.org/docs-private/article",
+            "https://docs.example.org/docs%2fprivate/article",
+            "https://docs.example.org/docs/%2e%2e/private",
         ] {
-            let reference =
-                source_reference(&public, requested, effective, "source transparency marker");
-            let response = public.source_transparency(&reference).unwrap();
-            assert_eq!(response.source, SourceAttribution::AttributionWithheld);
+            let document = test_document(
+                "https://docs.example.org/docs/in-scope",
+                outside,
+                "title",
+                "body",
+            );
+            assert!(
+                !public_gate_contains_document(&gate, &document),
+                "unexpectedly accepted effective URL {outside}"
+            );
         }
+    }
+
+    #[test]
+    fn public_scope_filters_historical_records_from_every_read_surface_and_keeps_cleanup() {
+        let temp = TempStore::new();
+        let store = PersistentIndex::create(temp.path()).unwrap();
+        let now_ms = system_time_ms().unwrap();
+        let notice = b"Authored test notice for historical scope filtering.\n";
+        let gate = notice_bound_public_gate(notice, now_ms, now_ms + 60_000);
+        store
+            .install_public_collection_gate(&gate, notice, now_ms)
+            .unwrap();
+
+        let in_scope_key = UrlKey::parse("https://docs.example.org/docs/current").unwrap();
+        upsert(
+            &store,
+            &in_scope_key,
+            in_scope_key.as_str(),
+            "Authorized page title",
+            "authorized_scope_marker answer text shared_scope_term",
+        );
+        let pinned_before_bad_row = store.read_view().unwrap();
+
+        let requested_out_key =
+            UrlKey::parse("https://docs.example.org/private/historic-requested").unwrap();
+        let (requested_out_lease, requested_out_reference) = persist_historical_public_upsert(
+            &store,
+            &requested_out_key,
+            "https://docs.example.org/docs/effective",
+            "Hidden requested title",
+            "requested_scope_secret_marker must not appear shared_scope_term",
+        );
+        let effective_out_key =
+            UrlKey::parse("https://docs.example.org/docs/historic-effective").unwrap();
+        let (effective_out_lease, effective_out_reference) = persist_historical_public_upsert(
+            &store,
+            &effective_out_key,
+            "https://elsewhere.example/private/target",
+            "Hidden effective title",
+            "effective_scope_secret_marker must not appear shared_scope_term",
+        );
+
+        let before_reads = store_file_snapshot(&store.path);
+        let view = store.read_view().unwrap();
+        assert_eq!(view.document_count(), 1);
+        assert!(view.document(&requested_out_key).is_none());
+        assert!(view.document(&effective_out_key).is_none());
+        assert_eq!(view.query("authorized_scope_marker").unwrap().len(), 1);
+        assert_eq!(
+            view.query("requested_scope_secret_marker").unwrap().len(),
+            0
+        );
+        assert_eq!(
+            view.query("effective_scope_secret_marker").unwrap().len(),
+            0
+        );
+        let scored = view.query("authorized_scope_marker").unwrap();
+        assert_eq!(scored[0].explanation.document_count, 1);
+        assert_eq!(scored[0].title, "Authorized page title");
+        let shared = view.query("shared_scope_term").unwrap();
+        assert_eq!(shared.len(), 1);
+        assert_eq!(shared[0].explanation.terms[0].body.document_frequency, 1);
+        assert_eq!(
+            pinned_before_bad_row.document(&requested_out_key),
+            None,
+            "a pinned generation predating a bad row must not acquire it"
+        );
+        assert_eq!(pinned_before_bad_row.document_count(), 1);
+
+        let requested_out_search = store
+            .retrieve(RetrievalRequest::question("requested_scope_secret_marker"))
+            .unwrap();
+        assert!(requested_out_search.hits.is_empty());
+        let effective_out_search = store
+            .retrieve(RetrievalRequest::question("effective_scope_secret_marker"))
+            .unwrap();
+        assert!(effective_out_search.hits.is_empty());
+        for reference in [&requested_out_reference, &effective_out_reference] {
+            assert_eq!(
+                store.resolve_evidence(reference),
+                Err(EvidenceResolveError::NotLive)
+            );
+            assert_eq!(
+                store.inspect_document_page(reference, 0),
+                Err(EvidenceResolveError::NotLive)
+            );
+            assert_eq!(
+                store.source_transparency(reference),
+                Err(EvidenceResolveError::NotLive),
+                "scope denial must block content and not degrade into withheld attribution"
+            );
+        }
+        assert_eq!(
+            PersistentIndex::inspect_read_only(&store.path)
+                .unwrap()
+                .live_document_keys,
+            BTreeSet::from([in_scope_key.as_str().to_owned()])
+        );
+        assert!(matches!(
+            store.managed_snapshot(),
+            Err(ManagedStorageError::Conflict)
+        ));
+        assert!(matches!(
+            store.compact(),
+            Err(StorageError::CorruptCommitted(_))
+        ));
+        assert_eq!(store_file_snapshot(&store.path), before_reads);
+
+        for (key, lease) in [
+            (requested_out_key, requested_out_lease),
+            (effective_out_key, effective_out_lease),
+        ] {
+            let cleanup = store.issue_fence(&key).unwrap();
+            assert!(cleanup.fence() > lease.fence());
+            assert_eq!(
+                store.apply(&cleanup, Intent::Tombstone).unwrap(),
+                ApplyOutcome::Applied
+            );
+        }
+        assert_eq!(store.read_view().unwrap().document_count(), 1);
+        assert_eq!(
+            store.resolve_evidence(&requested_out_reference),
+            Err(EvidenceResolveError::NotLive)
+        );
+        store.compact().unwrap();
     }
 
     #[test]
@@ -6216,6 +6636,192 @@ mod tests {
         lease
     }
 
+    fn test_document(id: &str, effective_url: &str, title: &str, body: &str) -> IndexedDocument {
+        let mut index = InMemoryIndex::new();
+        index
+            .upsert_fields(
+                id.to_owned(),
+                effective_url.to_owned(),
+                title.to_owned(),
+                body.to_owned(),
+            )
+            .unwrap();
+        index.documents().get(id).unwrap().clone()
+    }
+
+    fn persist_historical_public_upsert(
+        store: &PersistentIndex,
+        key: &UrlKey,
+        effective_url: &str,
+        title: &str,
+        body: &str,
+    ) -> (FenceLease, EvidenceReference) {
+        let lease = store.issue_fence(key).unwrap();
+        let document = test_document(key.as_str(), effective_url, title, body);
+        let version = decode_version_id(&document.version_id).unwrap();
+        let _writer = store.writer.lock().unwrap();
+        let _lock = store.lock_exclusive().unwrap();
+        let current = store.load_snapshot_locked().unwrap();
+        let mut next = next_manifest(&current.manifest).unwrap();
+        next.controls
+            .get_mut(key.as_str())
+            .unwrap()
+            .terminal
+            .insert(lease.fence.get(), TerminalRecord::Upsert(version));
+        add_document_statistics(&mut next.statistics, &document).unwrap();
+        let segment_id = next.next_segment_id;
+        next.next_segment_id += 1;
+        let segment = Segment::from_documents(segment_id, vec![document.clone()]).unwrap();
+        next.live.insert(
+            key.as_str().to_owned(),
+            manifest::LiveReference {
+                segment_id,
+                ordinal: 0,
+                version,
+            },
+        );
+        next.segments.push(segment.descriptor.clone());
+        store
+            .publish_manifest_locked(&next, Some(&segment))
+            .unwrap();
+        let reference = EvidenceReference::new(
+            store.store_id,
+            key.as_str().to_owned(),
+            version,
+            0,
+            body.len(),
+        )
+        .unwrap();
+        (lease, reference)
+    }
+
+    fn persist_historical_public_segment(
+        store: &PersistentIndex,
+        segment_id: u64,
+        documents: Vec<IndexedDocument>,
+    ) {
+        let segment = Segment::from_documents(segment_id, documents).unwrap();
+        let _writer = store.writer.lock().unwrap();
+        let _lock = store.lock_exclusive().unwrap();
+        let current = store.load_manifest_locked().unwrap();
+        let mut next = next_manifest(&current).unwrap();
+        for (ordinal, document) in segment.documents.iter().enumerate() {
+            let version = decode_version_id(&document.version_id).unwrap();
+            next.controls.insert(
+                document.id.clone(),
+                ControlRecord {
+                    high_water: 1,
+                    terminal: BTreeMap::from([(1, TerminalRecord::Upsert(version))]),
+                    policy: BTreeMap::new(),
+                },
+            );
+            add_document_statistics(&mut next.statistics, document).unwrap();
+            next.live.insert(
+                document.id.clone(),
+                manifest::LiveReference {
+                    segment_id,
+                    ordinal: u32::try_from(ordinal).unwrap(),
+                    version,
+                },
+            );
+        }
+        next.segments.push(segment.descriptor.clone());
+        next.segments.sort_by_key(|descriptor| descriptor.id);
+        next.next_segment_id = segment_id + 1;
+        store
+            .publish_manifest_locked(&next, Some(&segment))
+            .unwrap();
+    }
+
+    fn historical_scope_budget_fixture(
+        target_positions: &[usize],
+        all_authorized: bool,
+        segment_count: u64,
+        documents_per_segment: usize,
+    ) -> (TempStore, PersistentIndex, Vec<String>, String) {
+        const QUERY: &str = "scopeprobeaa scopeprobeab scopeprobeac scopeprobead scopeprobeae scopeprobeaf scopeprobeag scopeprobeah scopeprobeai scopeprobeaj scopeprobeak scopeprobeal scopeprobeam scopeprobean scopeprobeao scopeprobeap scopeprobeaq scopeprobear scopeprobeas scopeprobeat scopeprobeau scopeprobeav scopeprobeaw scopeprobeax scopeprobeay scopeprobeaz scopeprobeba scopeprobebb scopeprobebc scopeprobebd scopeprobebe targetmarker";
+
+        let temp = TempStore::new();
+        let store = PersistentIndex::create(temp.path()).unwrap();
+        let now_ms = system_time_ms().unwrap();
+        let notice = b"Authored offline scope sampler fixture notice.\n";
+        let gate = notice_bound_public_gate(notice, now_ms, now_ms + 3_600_000);
+        store
+            .install_public_collection_gate(&gate, notice, now_ms)
+            .unwrap();
+
+        let plan = plan_question(QUERY).unwrap();
+        assert_eq!(plan.normalized_terms.len(), 32);
+        assert!(plan.candidate_terms.len() >= 32);
+        let seed = question_sample_seed(store.store_id, &plan);
+        let mut ordered_ids = (1..=segment_count).collect::<Vec<_>>();
+        ordered_ids.sort_by(|left, right| {
+            sample_segment_key(&seed, *left)
+                .cmp(&sample_segment_key(&seed, *right))
+                .then_with(|| left.cmp(right))
+        });
+        let target_ids = target_positions
+            .iter()
+            .map(|position| ordered_ids[*position])
+            .collect::<Vec<_>>();
+        let mut target_urls = Vec::new();
+
+        for segment_id in 1..=segment_count {
+            let mut documents = Vec::with_capacity(documents_per_segment);
+            for slot in 0..documents_per_segment {
+                let is_target = all_authorized || (target_ids.contains(&segment_id) && slot == 0);
+                let (requested, effective) = if is_target {
+                    let target = format!(
+                        "https://docs.example.org/docs/authorized-target-{segment_id:02}-{slot:02}"
+                    );
+                    target_urls.push(target.clone());
+                    (
+                        target,
+                        format!(
+                            "https://docs.example.org/docs/effective-target-{segment_id:02}-{slot:02}"
+                        ),
+                    )
+                } else if slot % 2 == 0 {
+                    (
+                        format!(
+                            "https://docs.example.org/private/requested-out-{segment_id:02}-{slot:02}"
+                        ),
+                        format!(
+                            "https://docs.example.org/docs/effective-in-{segment_id:02}-{slot:02}"
+                        ),
+                    )
+                } else {
+                    (
+                        format!(
+                            "https://docs.example.org/docs/requested-in-{segment_id:02}-{slot:02}"
+                        ),
+                        format!(
+                            "https://outside.example.org/docs/effective-out-{segment_id:02}-{slot:02}"
+                        ),
+                    )
+                };
+                documents.push(test_document(
+                    &requested,
+                    &effective,
+                    "Scope sampler fixture",
+                    QUERY,
+                ));
+            }
+            persist_historical_public_segment(&store, segment_id, documents);
+        }
+
+        (temp, store, target_urls, QUERY.to_owned())
+    }
+
+    fn retain_scope_fixture(store: &PersistentIndex, destination: &Path) {
+        fs::create_dir(destination).unwrap();
+        for entry in fs::read_dir(&store.path).unwrap() {
+            let entry = entry.unwrap();
+            assert!(entry.file_type().unwrap().is_file());
+            fs::copy(entry.path(), destination.join(entry.file_name())).unwrap();
+        }
+    }
+
     #[test]
     fn ordinary_question_retrieval_is_typed_and_preserves_the_legacy_dsl() {
         let temp = TempStore::new();
@@ -6280,6 +6886,96 @@ mod tests {
             store.retrieve(RetrievalRequest::question("\"unterminated")),
             Err(RetrievalError::UnterminatedQuote)
         ));
+    }
+
+    #[test]
+    fn public_question_retrieval_does_not_spend_posting_budget_on_hidden_rows() {
+        let (_temp, store, expected_urls, question) =
+            historical_scope_budget_fixture(&[0, 17, 34], false, 35, 8);
+        if let Some(destination) = std::env::var_os("LEY_SCOPE_SATURATED_STORE_EXPORT") {
+            let (_export_temp, export_store, _, _) =
+                historical_scope_budget_fixture(&[34], false, 35, 8);
+            retain_scope_fixture(&export_store, Path::new(&destination));
+        }
+        if let Some(destination) = std::env::var_os("LEY_SCOPE_NON_SATURATED_STORE_EXPORT") {
+            let (_export_temp, export_store, export_urls, export_question) =
+                historical_scope_budget_fixture(&[2], false, 32, 1);
+            let export_response = export_store
+                .retrieve(RetrievalRequest::question(&export_question))
+                .unwrap();
+            assert_eq!(export_response.hits.len(), 1);
+            assert_eq!(export_response.hits[0].requested_url, export_urls[0]);
+            retain_scope_fixture(&export_store, Path::new(&destination));
+        }
+        let before_reads = store_file_snapshot(&store.path);
+
+        let response = store
+            .retrieve(RetrievalRequest::question(&question))
+            .unwrap();
+        let actual_urls = response
+            .hits
+            .iter()
+            .map(|hit| hit.requested_url.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(response.status, RetrievalStatus::RetrievedText);
+        assert_eq!(
+            actual_urls,
+            expected_urls.into_iter().collect::<BTreeSet<_>>()
+        );
+        assert_eq!(response.completeness, RetrievalCompleteness::Complete);
+        let (scope_checks, posting_probes) = LAST_QUESTION_WORK.with(std::cell::Cell::get);
+        eprintln!("scope_checks={scope_checks} posting_probes={posting_probes}");
+        assert_eq!(scope_checks, 35 * 8);
+        assert_eq!(posting_probes, 96);
+        assert!(posting_probes <= MAX_QUESTION_POSTING_PROBES);
+        for hit in &response.hits {
+            let resolved = store.resolve_evidence(&hit.passage.reference).unwrap();
+            assert_eq!(resolved.requested_url, hit.requested_url);
+            assert_eq!(
+                resolved.reference.content_version,
+                hit.passage.reference.content_version
+            );
+            assert!(resolved.text.contains("scopeprobeaa"));
+        }
+        assert_eq!(store_file_snapshot(&store.path), before_reads);
+    }
+
+    #[test]
+    fn public_question_retrieval_skips_hidden_only_segments_and_keeps_full_scope_sampler() {
+        let (_invalid_temp, invalid_store, _, question) =
+            historical_scope_budget_fixture(&[], false, 35, 8);
+        let invalid_response = invalid_store
+            .retrieve(RetrievalRequest::question(&question))
+            .unwrap();
+        assert!(invalid_response.hits.is_empty());
+        assert_eq!(
+            invalid_response.status,
+            RetrievalStatus::NoRelevantTextMatch
+        );
+        let (scope_checks, posting_probes) = LAST_QUESTION_WORK.with(std::cell::Cell::get);
+        assert_eq!(scope_checks, 35 * 8);
+        assert_eq!(posting_probes, 0);
+
+        let (_authorized_temp, authorized_store, _, question) =
+            historical_scope_budget_fixture(&[], true, 35, 8);
+        let authorized_response = authorized_store
+            .retrieve(RetrievalRequest::question(&question))
+            .unwrap();
+        assert!(!authorized_response.hits.is_empty());
+        assert!(authorized_response.hits.iter().all(|hit| {
+            hit.requested_url
+                .starts_with("https://docs.example.org/docs/")
+                && hit
+                    .effective_url
+                    .starts_with("https://docs.example.org/docs/")
+        }));
+        assert_eq!(
+            authorized_response.completeness,
+            RetrievalCompleteness::Partial
+        );
+        let (scope_checks, posting_probes) = LAST_QUESTION_WORK.with(std::cell::Cell::get);
+        assert_eq!(scope_checks, 35 * 8);
+        assert_eq!(posting_probes, MAX_QUESTION_POSTING_PROBES);
     }
 
     #[test]
@@ -6882,12 +7578,12 @@ mod tests {
         let notice = b"owned test collection notice";
         store
             .install_public_collection_gate(
-                &public_gate(notice, current, deadline),
+                &notice_bound_public_gate(notice, current, deadline),
                 notice,
                 current,
             )
             .unwrap();
-        let document = key("expiring-reference");
+        let document = UrlKey::parse("https://docs.example.org/docs/expiring-reference").unwrap();
         upsert(
             &store,
             &document,
@@ -7102,6 +7798,13 @@ mod tests {
     }
 
     fn write_gate3_fixture(root: &Path) -> (Vec<u8>, Vec<u8>) {
+        write_gate3_fixture_with_effective(
+            root,
+            "https://doc.rust-lang.org/stable/std/string/struct.String.html",
+        )
+    }
+
+    fn write_gate3_fixture_with_effective(root: &Path, effective_url: &str) -> (Vec<u8>, Vec<u8>) {
         create_store_directory(root).unwrap();
         create_private_file(&root.join(LOCK_NAME), &[]).unwrap();
         let store_id = [0x43; 16];
@@ -7114,7 +7817,7 @@ mod tests {
         index
             .upsert_fields(
                 key.as_str().to_owned(),
-                key.as_str().to_owned(),
+                effective_url.to_owned(),
                 title.clone(),
                 body.clone(),
             )
@@ -7530,6 +8233,24 @@ mod tests {
             Err(StorageError::StoreAlreadyExists)
         ));
         assert_eq!(file_inventory(source.path()), before);
+    }
+
+    #[test]
+    fn gate3_migration_rejects_out_of_scope_public_documents_before_staging() {
+        let source = TempStore::new();
+        let destination = TempStore::new();
+        write_gate3_fixture_with_effective(
+            source.path(),
+            "https://elsewhere.example/private/redirect-target",
+        );
+        let before = file_inventory(source.path());
+
+        assert!(matches!(
+            PersistentIndex::reindex_gate3(source.path(), destination.path()),
+            Err(StorageError::CorruptCommitted(_))
+        ));
+        assert_eq!(file_inventory(source.path()), before);
+        assert!(!destination.path().exists());
     }
 
     #[cfg(unix)]
