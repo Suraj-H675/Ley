@@ -418,8 +418,18 @@ try {
   assert.deepEqual(apiInspection.reference, initialReference);
   assert.equal(apiInspection.start_byte, 0);
   assert.equal(Buffer.byteLength(apiInspection.text), apiInspection.end_byte);
-  assert.ok(apiInspection.text.includes("A passage reference should point into the exact extracted body text"));
+  assert.ok(apiInspection.text.length > 0, "inspection returns text from the document selected by this question");
   assert.equal(apiInspection.text.includes("<p>"), false, "inspection returns extracted text, not raw HTML");
+
+  const sourceRequest = { contract_version: 1, reference: initialReference };
+  const sourceResponse = await typedPost(apiOrigin, "/api/v1/evidence/source", sourceRequest);
+  assert.equal(sourceResponse.status, 200);
+  assert.match(sourceResponse.headers.get("cache-control") ?? "", /no-store/i);
+  const apiSource = await sourceResponse.json();
+  assert.deepEqual(apiSource.reference, initialReference);
+  assert.equal(apiSource.requested_url, initialReference.requested_url);
+  assert.deepEqual(apiSource.source, { kind: "local_index" });
+  assert.equal(JSON.stringify(apiSource).includes(storePath), false, "source transparency never returns local filesystem paths");
 
   const stopped = once(apiServer.child, "exit");
   apiServer.child.kill("SIGTERM");
@@ -655,9 +665,28 @@ try {
       await cards.first().waitFor();
       assert.equal(await cards.count(), body.hits.length);
       await page.waitForFunction((expectedUrls) => {
-        const urls = [...document.querySelectorAll(".evidence-card .result-url")].map((element) => element.textContent);
-        return urls.length === expectedUrls.length && urls.every((url, index) => url === expectedUrls[index]);
+        const labels = [...document.querySelectorAll(".evidence-card .result-url")]
+          .map((element) => element.textContent?.trim() ?? "");
+        return labels.length === expectedUrls.length &&
+          labels.every((label, index) => label.endsWith(expectedUrls[index]));
       }, body.hits.map((hit) => hit.requested_url));
+      const displayedAddresses = await page.locator(".evidence-card .result-url").evaluateAll((elements) =>
+        elements.map((element) => ({
+          text: element.textContent?.trim() ?? "",
+          href: element instanceof HTMLAnchorElement ? element.href : null,
+        })),
+      );
+      assert.equal(displayedAddresses.length, body.hits.length);
+      for (const [index, hit] of body.hits.entries()) {
+        const address = displayedAddresses[index];
+        assert.ok(address.text.endsWith(hit.requested_url), "visible source label preserves the requested identity");
+        if (address.href === null) {
+          assert.equal(address.text, "Indexed identity: " + hit.requested_url);
+        } else {
+          assert.equal(address.text, "Open external address · " + hit.requested_url);
+          assert.equal(address.href, new URL(hit.requested_url).href);
+        }
+      }
       const card = cards.first();
       assert.equal((await card.locator(".result-title").textContent()).trim(), body.hits[0].title);
       assert.equal(await card.locator(".result-title img").count(), 0);
@@ -667,10 +696,6 @@ try {
       assert.equal((await card.locator(".evidence-passage").textContent()).trim(), body.hits[0].passage.text);
       assert.ok((await card.locator(".candidate-label").textContent()).includes("Lexical candidate"));
       assert.match(await page.locator(".question-metadata").textContent(), /not_assessed/);
-      assert.deepEqual(
-        await page.locator(".evidence-card .result-url").allTextContents(),
-        body.hits.map((hit) => hit.requested_url),
-      );
       const hrefs = await page.locator(".evidence-card a.result-url").evaluateAll((links) => links.map((link) => link.href));
       assert.ok(hrefs.every((href) => ["http:", "https:"].includes(new URL(href).protocol)));
       assert.equal(await page.locator('.evidence-card a[href*=".invalid"]').count(), 0, "synthetic identities must not appear navigable");
@@ -685,7 +710,7 @@ try {
         await card.locator(".evidence-passage").waitFor();
         assert.match(await card.locator(".passage-heading").textContent(), /current index state/);
         assert.equal((await card.locator(".evidence-passage").textContent()).trim(), cliResolution.text);
-        await card.locator("summary", { hasText: "Provenance and reference" }).click();
+        await card.locator("summary", { hasText: "Evidence reference" }).click();
         const referenceText = await card.locator(".reference-details").textContent();
         assert.match(referenceText, /Store ID/);
         assert.match(referenceText, /Extracted body UTF-8 bytes/);
@@ -696,10 +721,73 @@ try {
         assert.equal(inspectResponse.status(), 200);
         assert.deepEqual(await inspectResponse.json(), apiInspection, "browser source inspection uses the same current page");
         const indexedText = card.locator(".indexed-document-text");
-        await indexedText.waitFor();
+        await indexedText.waitFor({ state: "visible" });
+        await card.getByRole("button", { name: "Revalidate indexed text" }).waitFor({ state: "visible" });
+        assert.equal(await card.locator(".verification-message[role=alert]").count(), 0, "a valid inspection response renders the ready state");
         assert.equal(await indexedText.textContent(), apiInspection.text);
         assert.equal(await card.locator(".indexed-document img,.indexed-document script,.indexed-document [onerror]").count(), 0);
         assert.match(await card.locator(".inspection-note").textContent(), /not source HTML or a verified answer/);
+
+        const sourcePromise = page.waitForResponse((candidate) => candidate.url().includes("/api/v1/evidence/source"));
+        const sourceDisclosure = card.locator(".source-disclosure");
+        await sourceDisclosure.locator("summary").click();
+        const sourceResponse = await sourcePromise;
+        assert.equal(sourceResponse.status(), 200);
+        assert.deepEqual(await sourceResponse.json(), apiSource, "browser local attribution uses the current source response");
+        assert.match(await sourceDisclosure.textContent(), /No public-source attribution is recorded/);
+        await sourceDisclosure.locator("summary").click();
+
+        const hostileNotice = "Authored browser fixture <script>window.noticeExecuted = true</script>";
+        let noticeDeadline = Date.now() + 60_000;
+        await page.route("**/api/v1/evidence/source", async (route) => {
+          await route.fulfill({
+            status: 200,
+            contentType: "application/json",
+            headers: { "cache-control": "no-store" },
+            body: JSON.stringify({
+              contract_version: 1,
+              reference: initialReference,
+              requested_url: apiInspection.requested_url,
+              effective_url: apiInspection.effective_url,
+              source: {
+                kind: "operator_source",
+                policy_format: "notice_bound_v2",
+                source_id: "authored-browser-fixture",
+                origin: "https://docs.example.org",
+                license_label: "Authored terms",
+                source_version: "fixture-v1",
+                installed_at_ms: Date.now() - 1000,
+                visible_until_ms: noticeDeadline,
+                display_permission_reviewed_at_ms: Date.now() - 2000,
+                notice_sha256: "a".repeat(64),
+                notice_text: hostileNotice,
+              },
+            }),
+          });
+        });
+        const hostileResponsePromise = page.waitForResponse((candidate) => candidate.url().includes("/api/v1/evidence/source"));
+        await sourceDisclosure.locator("summary").click();
+        const hostileResponse = await hostileResponsePromise;
+        assert.equal(hostileResponse.status(), 200);
+        const notice = sourceDisclosure.locator(".source-notice-text");
+        await notice.waitFor();
+        assert.equal(await notice.textContent(), hostileNotice);
+        assert.equal(await sourceDisclosure.locator("script,[onerror]").count(), 0, "notice markup remains plain text");
+        await sourceDisclosure.locator("summary").click();
+        await sourceDisclosure.locator(".source-notice-text").waitFor({ state: "detached", timeout: 2500 });
+        assert.equal(await sourceDisclosure.locator(".source-notice-text").count(), 0, "closing disclosure clears notice text");
+        assert.equal(await page.evaluate(() => window.noticeExecuted ?? false), false, "notice text does not execute");
+        noticeDeadline = Date.now() + 1500;
+        const expiryResponsePromise = page.waitForResponse((candidate) => candidate.url().includes("/api/v1/evidence/source"));
+        await sourceDisclosure.locator("summary").click();
+        assert.equal((await expiryResponsePromise).status(), 200);
+        await sourceDisclosure.locator(".source-notice-text").waitFor();
+        await page.waitForFunction(() =>
+          document.querySelector(".source-disclosure .source-notice-text") === null &&
+          document.querySelector(".source-disclosure .error-code")?.textContent === "public_collection_expired",
+        );
+        await sourceDisclosure.locator("summary").click();
+        await page.unroute("**/api/v1/evidence/source");
       }
 
       if (questionIndex === 0) {
@@ -711,6 +799,16 @@ try {
           await page.screenshot({ path: screenshot, fullPage: true });
           screenshotPaths.push(screenshot);
         }
+        const sourceSummary = page.locator(".source-disclosure summary");
+        await sourceSummary.focus();
+        const keyboardSourcePromise = page.waitForResponse((candidate) => candidate.url().includes("/api/v1/evidence/source"));
+        await page.keyboard.press("Enter");
+        const keyboardSource = await keyboardSourcePromise;
+        assert.equal(keyboardSource.status(), 200);
+        assert.equal(await card.locator(".source-disclosure").evaluate((element) => element.open), true);
+        assert.ok(await page.evaluate(() => document.documentElement.scrollWidth) <= 320, "open source disclosure overflowed the 320px viewport");
+        await page.keyboard.press("Enter");
+        assert.equal(await card.locator(".source-disclosure .source-notice-text").count(), 0, "keyboard close clears notice text");
       }
     } else {
       assert.equal(await cards.count(), 0);

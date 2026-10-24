@@ -39,9 +39,10 @@ pub use demo::{
 pub use retrieval::{
     AnswerAssessment, DOCUMENT_INSPECTION_CONTRACT_VERSION, DOCUMENT_INSPECTION_PAGE_BYTES,
     DocumentInspectionPage, DocumentInspectionRequest, EvidenceHit, EvidencePassage,
-    EvidenceReference, EvidenceResolveError, InsufficientEvidenceReason, QuestionRequest,
-    ResolvedEvidence, RetrievalCompleteness, RetrievalError, RetrievalMode, RetrievalRequest,
-    RetrievalResponse, RetrievalStatus,
+    EvidenceReference, EvidenceResolveError, InsufficientEvidenceReason, PublicSourcePolicyFormat,
+    QuestionRequest, ResolvedEvidence, RetrievalCompleteness, RetrievalError, RetrievalMode,
+    RetrievalRequest, RetrievalResponse, RetrievalStatus, SOURCE_TRANSPARENCY_CONTRACT_VERSION,
+    SourceAttribution, SourceTransparencyRequest, SourceTransparencyResponse,
 };
 
 pub fn crawl_status_json(

@@ -11,6 +11,7 @@ const QUESTION_ROUTES = new Set([
   "/api/v1/retrieve",
   "/api/v1/evidence/resolve",
   "/api/v1/evidence/inspect",
+  "/api/v1/evidence/source",
 ]);
 
 const mime = new Map([

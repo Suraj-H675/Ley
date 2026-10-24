@@ -11,6 +11,7 @@ import type {
   SearchHit,
   SearchResponse,
   TermExplanation,
+  SourceTransparencyResponse,
 } from "./types";
 
 const API_RESULT_LIMIT = 20;
@@ -18,6 +19,7 @@ const QUESTION_RESULT_LIMIT = 8;
 const MAX_PASSAGE_BYTES = 8192;
 const MAX_DOCUMENT_INSPECTION_PAGE_BYTES = 64 * 1024;
 const MAX_INDEXED_BODY_BYTES = 1024 * 1024;
+const MAX_PUBLIC_NOTICE_BYTES = 16 * 1024;
 
 export class SearchApiError extends Error {}
 
@@ -92,6 +94,20 @@ export async function inspectDocumentPage(
   }, signal);
   if (!isDocumentInspectionPage(payload, reference, offsetByte)) {
     throw new QuestionApiError("invalid_response", "Ley returned indexed text the interface could not read.");
+  }
+  return payload;
+}
+
+export async function getSourceTransparency(
+  reference: EvidenceReference,
+  signal: AbortSignal,
+): Promise<SourceTransparencyResponse> {
+  const payload = await typedPost("/api/v1/evidence/source", {
+    contract_version: 1,
+    reference,
+  }, signal);
+  if (!isSourceTransparencyResponse(payload, reference)) {
+    throw new QuestionApiError("invalid_response", "Ley returned source attribution the interface could not read.");
   }
   return payload;
 }
@@ -246,6 +262,39 @@ function isDocumentInspectionPage(
       value.end_byte < value.total_bytes;
 }
 
+function isSourceTransparencyResponse(
+  value: unknown,
+  reference: EvidenceReference,
+): value is SourceTransparencyResponse {
+  if (
+    !isRecord(value) || value.contract_version !== 1 || !isReference(value.reference) ||
+    !sameReference(value.reference, reference) || value.requested_url !== reference.requested_url ||
+    typeof value.effective_url !== "string" || value.effective_url.length > 2048 ||
+    !isRecord(value.source) || typeof value.source.kind !== "string"
+  ) {
+    return false;
+  }
+  const source = value.source;
+  if (source.kind === "local_index" || source.kind === "attribution_withheld") {
+    return hasExactKeys(source, ["kind"]);
+  }
+  return (
+    hasExactKeys(
+      source,
+      ["kind", "policy_format", "source_id", "origin", "license_label", "source_version", "installed_at_ms", "visible_until_ms", "notice_sha256", "notice_text"],
+      ["display_permission_reviewed_at_ms"],
+    ) &&
+    source.kind === "operator_source" &&
+    (source.policy_format === "legacy_v1" || source.policy_format === "notice_bound_v2") &&
+    isBoundedString(source.source_id, 128) && isBoundedString(source.origin, 2048) &&
+    isBoundedString(source.license_label, 256) && isBoundedString(source.source_version, 256) &&
+    isCount(source.installed_at_ms) && isCount(source.visible_until_ms) &&
+    (source.display_permission_reviewed_at_ms === undefined || isCount(source.display_permission_reviewed_at_ms)) &&
+    typeof source.notice_sha256 === "string" && /^[0-9a-f]{64}$/.test(source.notice_sha256) &&
+    typeof source.notice_text === "string" && byteLength(source.notice_text) <= MAX_PUBLIC_NOTICE_BYTES
+  );
+}
+
 function sameReference(left: EvidenceReference, right: EvidenceReference): boolean {
   return (
     left.store_id.every((value, index) => value === right.store_id[index]) &&
@@ -353,6 +402,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function hasExactKeys(value: Record<string, unknown>, required: string[], optional: string[] = []): boolean {
+  const keys = Object.keys(value);
+  return required.every((key) => Object.hasOwn(value, key)) &&
+    keys.every((key) => required.includes(key) || optional.includes(key));
+}
+
 function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.length <= 64 && value.every((item) => typeof item === "string");
 }
@@ -363,4 +418,8 @@ function isCount(value: unknown): value is number {
 
 function isFiniteNumber(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value);
+}
+
+function isBoundedString(value: unknown, maximumBytes: number): value is string {
+  return typeof value === "string" && byteLength(value) <= maximumBytes;
 }

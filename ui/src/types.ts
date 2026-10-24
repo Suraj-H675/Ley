@@ -110,6 +110,33 @@ export interface DocumentInspectionPage {
   text: string;
 }
 
+export type PublicSourcePolicyFormat = "legacy_v1" | "notice_bound_v2";
+
+export type SourceAttribution =
+  | { kind: "local_index" }
+  | { kind: "attribution_withheld" }
+  | {
+    kind: "operator_source";
+    policy_format: PublicSourcePolicyFormat;
+    source_id: string;
+    origin: string;
+    license_label: string;
+    source_version: string;
+    installed_at_ms: number;
+    visible_until_ms: number;
+    display_permission_reviewed_at_ms?: number;
+    notice_sha256: string;
+    notice_text: string;
+  };
+
+export interface SourceTransparencyResponse {
+  contract_version: 1;
+  reference: EvidenceReference;
+  requested_url: string;
+  effective_url: string;
+  source: SourceAttribution;
+}
+
 export type QuestionSearchState =
   | { kind: "idle" }
   | { kind: "loading"; question: string }

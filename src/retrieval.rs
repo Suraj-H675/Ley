@@ -23,6 +23,7 @@ use crate::url_key::UrlKey;
 
 pub const RETRIEVAL_CONTRACT_VERSION: u16 = 1;
 pub const DOCUMENT_INSPECTION_CONTRACT_VERSION: u16 = 1;
+pub const SOURCE_TRANSPARENCY_CONTRACT_VERSION: u16 = 1;
 pub const PASSAGE_SCHEMA_VERSION: u16 = 1;
 pub const DEFAULT_MAX_HITS: u8 = 8;
 pub const MAX_HITS: u8 = 8;
@@ -293,6 +294,57 @@ pub struct DocumentInspectionPage {
     pub total_bytes: u32,
     pub next_offset_byte: Option<u32>,
     pub text: String,
+}
+
+/// A request for source metadata and, when authorized, the retained plain-text notice
+/// associated with one exact evidence reference.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SourceTransparencyRequest {
+    pub contract_version: u16,
+    pub reference: EvidenceReference,
+}
+
+/// Current indexed identity and the source-attribution state for an exact reference.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SourceTransparencyResponse {
+    pub contract_version: u16,
+    pub reference: EvidenceReference,
+    pub requested_url: String,
+    pub effective_url: String,
+    pub source: SourceAttribution,
+}
+
+/// Public-facing projection of the current collection state.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SourceAttribution {
+    /// This index has no authenticated public source record.
+    LocalIndex,
+    /// A public record exists, but its disclosure conditions were not met.
+    AttributionWithheld,
+    /// A current authenticated public record authorizes displaying its notice.
+    OperatorSource {
+        policy_format: PublicSourcePolicyFormat,
+        source_id: String,
+        origin: String,
+        license_label: String,
+        source_version: String,
+        installed_at_ms: u64,
+        visible_until_ms: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        display_permission_reviewed_at_ms: Option<u64>,
+        notice_sha256: String,
+        notice_text: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicSourcePolicyFormat {
+    LegacyV1,
+    NoticeBoundV2,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

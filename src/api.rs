@@ -16,7 +16,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use crate::index::{MatchEvidence, SearchResult, StatisticsSource};
 use crate::retrieval::{
     DOCUMENT_INSPECTION_CONTRACT_VERSION, DocumentInspectionRequest, EvidenceReference,
-    EvidenceResolveError, RetrievalError, RetrievalRequest,
+    EvidenceResolveError, RetrievalError, RetrievalRequest, SOURCE_TRANSPARENCY_CONTRACT_VERSION,
+    SourceTransparencyRequest,
 };
 use crate::storage::{PersistentIndex, ReadView, StorageError};
 
@@ -296,6 +297,7 @@ fn router_with_state(state: ApiState) -> Router {
         .route("/api/v1/retrieve", any(retrieve_v1))
         .route("/api/v1/evidence/resolve", any(resolve_evidence_v1))
         .route("/api/v1/evidence/inspect", any(inspect_evidence_v1))
+        .route("/api/v1/evidence/source", any(source_transparency_v1))
         .fallback(not_found)
         .with_state(state)
 }
@@ -462,6 +464,45 @@ async fn inspect_evidence_v1(State(state): State<ApiState>, request: Request<Bod
     };
     match page {
         Ok(page) => typed_success(&page),
+        Err(error) => error.response(),
+    }
+}
+
+async fn source_transparency_v1(State(state): State<ApiState>, request: Request<Body>) -> Response {
+    let require_origin = request.method() == Method::POST;
+    if let Some(error) = validate_local_authority(&request, state.port, require_origin) {
+        return local_authority_error(error);
+    }
+    if request.method() != Method::POST {
+        return method_not_allowed_for("POST");
+    }
+    if let Err(error) = validate_json_headers(&request, MAX_TYPED_REQUEST_BYTES) {
+        return error.response();
+    }
+    let permit = match acquire_storage_permit(&state) {
+        Ok(permit) => permit,
+        Err(BlockingFailure::Saturated) => return ClientFailure::ResourceCap.response(),
+        Err(BlockingFailure::WorkerFailed) => return ClientFailure::StorageFault.response(),
+    };
+    let source_request =
+        match read_json_body::<SourceTransparencyRequest>(request, MAX_TYPED_REQUEST_BYTES).await {
+            Ok(request) => request,
+            Err(error) => return error.response(),
+        };
+    if source_request.contract_version != SOURCE_TRANSPARENCY_CONTRACT_VERSION {
+        return ClientFailure::UnsupportedContract.response();
+    }
+    let source = match run_storage_with_permit(state.index, permit, move |index| {
+        index.source_transparency(&source_request.reference)
+    })
+    .await
+    {
+        Ok(result) => result.map_err(map_resolve_failure),
+        Err(BlockingFailure::Saturated) => Err(ClientFailure::ResourceCap),
+        Err(BlockingFailure::WorkerFailed) => Err(ClientFailure::StorageFault),
+    };
+    match source {
+        Ok(source) => typed_success(&source),
         Err(error) => error.response(),
     }
 }
@@ -995,7 +1036,7 @@ mod tests {
         DEFAULT_BIND, QueryParameterError, make_search_response, parse_query_parameter, router,
         router_with_state,
     };
-    use crate::storage::{Intent, PersistentIndex, PublicCollectionGate};
+    use crate::storage::{Intent, PersistentIndex, PublicCollectionGate, PublicPermissionEvidence};
     use crate::url_key::UrlKey;
     use sha2::{Digest, Sha256};
 
@@ -1396,6 +1437,128 @@ mod tests {
             reopened.read_view().unwrap().generation_id(),
             initial_generation
         );
+    }
+
+    #[tokio::test]
+    async fn typed_source_transparency_returns_only_verified_public_attribution() {
+        let temp = TempStore::new();
+        let store = PersistentIndex::create(temp.path().join("index")).unwrap();
+        let notice = b"Authored offline notice.\n<script>plain text only</script>";
+        let permission = PublicPermissionEvidence {
+            granted: true,
+            basis: "private basis sentinel".to_owned(),
+            evidence: "private review sentinel".to_owned(),
+            reviewed_at_ms: 9,
+        };
+        let gate = PublicCollectionGate {
+            policy_sha256: "a".repeat(64),
+            source_id: "authored-offline-source".to_owned(),
+            origin: "https://docs.example.org".to_owned(),
+            path_prefixes: vec!["/docs/".to_owned()],
+            installed_at_ms: 10,
+            visible_until_ms: u64::MAX,
+            license: "Authored non-MIT terms".to_owned(),
+            source_version: "fixture-v1".to_owned(),
+            notice_file: "source-notice.txt".to_owned(),
+            notice_sha256: Sha256::digest(notice)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+            fetch_permission: Some(permission.clone()),
+            storage_permission: Some(permission.clone()),
+            index_permission: Some(permission.clone()),
+            display_permission: Some(permission),
+            removal_contact: Some("private-contact@example.test".to_owned()),
+        };
+        store
+            .install_public_collection_gate(&gate, notice, 10)
+            .unwrap();
+        let key = UrlKey::parse("https://docs.example.org/docs/current").unwrap();
+        let lease = store.issue_fence(&key).unwrap();
+        store
+            .apply(
+                &lease,
+                Intent::Upsert {
+                    effective_url: "https://docs.example.org/docs/effective".to_owned(),
+                    title: "Current indexed source".to_owned(),
+                    body: "source transparency marker".to_owned(),
+                },
+            )
+            .unwrap();
+        let reference = store
+            .retrieve(crate::retrieval::RetrievalRequest::question(
+                "transparency marker",
+            ))
+            .unwrap()
+            .hits
+            .remove(0)
+            .passage
+            .reference;
+        let app = router(Arc::new(store), DEFAULT_BIND.port());
+        let request = crate::retrieval::SourceTransparencyRequest {
+            contract_version: crate::retrieval::SOURCE_TRANSPARENCY_CONTRACT_VERSION,
+            reference: reference.clone(),
+        };
+        let response = app
+            .clone()
+            .oneshot(typed_post(
+                "/api/v1/evidence/source",
+                serde_json::to_vec(&request).unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let bytes = axum::body::to_bytes(response.into_body(), super::MAX_RESPONSE_BYTES)
+            .await
+            .unwrap();
+        assert!(bytes.len() <= super::MAX_RESPONSE_BYTES);
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(body.contains("Authored offline notice."));
+        assert!(body.contains("authored-offline-source"));
+        assert!(body.contains("Authored non-MIT terms"));
+        assert!(!body.contains("private basis sentinel"));
+        assert!(!body.contains("private review sentinel"));
+        assert!(!body.contains("private-contact@example.test"));
+        assert!(!body.contains(&temp.path().to_string_lossy().to_string()));
+
+        let mut unsupported = request;
+        unsupported.contract_version += 1;
+        let response = app
+            .clone()
+            .oneshot(typed_post(
+                "/api/v1/evidence/source",
+                serde_json::to_vec(&unsupported).unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["error"],
+            "unsupported_contract"
+        );
+
+        let response = app
+            .oneshot(typed_post_with_origin(
+                "https://attacker.example",
+                "/api/v1/evidence/source",
+                serde_json::to_vec(&request_for(reference)).unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    fn request_for(
+        reference: crate::retrieval::EvidenceReference,
+    ) -> crate::retrieval::SourceTransparencyRequest {
+        crate::retrieval::SourceTransparencyRequest {
+            contract_version: crate::retrieval::SOURCE_TRANSPARENCY_CONTRACT_VERSION,
+            reference,
+        }
     }
 
     #[tokio::test]

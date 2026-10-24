@@ -1,12 +1,19 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type SyntheticEvent } from "react";
 import {
+  getSourceTransparency,
   inspectDocumentPage,
   messageForQuestionError,
   QuestionApiError,
   resolveEvidence,
   safeResultUrl,
 } from "./api";
-import type { DocumentInspectionState, EvidenceHit, RevalidationState } from "./types";
+import type {
+  DocumentInspectionState,
+  EvidenceHit,
+  EvidenceReference,
+  RevalidationState,
+  SourceAttribution,
+} from "./types";
 
 export function EvidenceCard({ hit }: { hit: EvidenceHit }) {
   const [revalidation, setRevalidation] = useState<RevalidationState>({ kind: "idle" });
@@ -136,6 +143,7 @@ export function EvidenceCard({ hit }: { hit: EvidenceHit }) {
           </dl>
           <pre className="indexed-document-text" tabIndex={0} aria-label="Current indexed extracted text">{inspection.text}</pre>
           <p className="inspection-note">This is plain extracted text from the local index, not source HTML or a verified answer. The identity address may not be publicly reachable.</p>
+          <SourceDisclosure reference={hit.passage.reference} />
         </section>
       )}
 
@@ -185,6 +193,140 @@ export function EvidenceCard({ hit }: { hit: EvidenceHit }) {
       </div>
     </article>
   );
+}
+
+type SourceDisclosureState =
+  | { kind: "idle" }
+  | { kind: "loading" }
+  | { kind: "ready"; source: SourceAttribution }
+  | { kind: "error"; code: string; message: string };
+
+function SourceDisclosure({ reference }: { reference: EvidenceReference }) {
+  const [state, setState] = useState<SourceDisclosureState>({ kind: "idle" });
+  const controller = useRef<AbortController | null>(null);
+
+  useEffect(() => () => controller.current?.abort(), []);
+
+  useEffect(() => {
+    if (state.kind !== "ready" || state.source.kind !== "operator_source") return;
+    const deadline = state.source.visible_until_ms;
+    let timer: number | undefined;
+    const expireIfNeeded = () => {
+      if (Date.now() < deadline) return false;
+      controller.current?.abort();
+      setState({
+        kind: "error",
+        code: "public_collection_expired",
+        message: messageForSourceError("public_collection_expired"),
+      });
+      return true;
+    };
+    const scheduleExpiry = () => {
+      window.clearTimeout(timer);
+      if (expireIfNeeded()) return;
+      timer = window.setTimeout(
+        scheduleExpiry,
+        Math.min(deadline - Date.now(), 2_147_000_000),
+      );
+    };
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") scheduleExpiry();
+    };
+    scheduleExpiry();
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      window.clearTimeout(timer);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
+  }, [state]);
+
+  async function load() {
+    controller.current?.abort();
+    const current = new AbortController();
+    controller.current = current;
+    setState({ kind: "loading" });
+    try {
+      const response = await getSourceTransparency(reference, current.signal);
+      if (current.signal.aborted) return;
+      if (response.source.kind === "operator_source" && response.source.visible_until_ms <= Date.now()) {
+        throw new QuestionApiError("public_collection_expired", messageForQuestionError("public_collection_expired"));
+      }
+      setState({ kind: "ready", source: response.source });
+    } catch (error) {
+      if (current.signal.aborted) return;
+      const code = error instanceof QuestionApiError ? error.code : "storage_fault";
+      setState({ kind: "error", code, message: messageForSourceError(code) });
+    }
+  }
+
+  function onToggle(event: SyntheticEvent<HTMLDetailsElement>) {
+    if (event.currentTarget.open) {
+      void load();
+      return;
+    }
+    controller.current?.abort();
+    controller.current = null;
+    setState({ kind: "idle" });
+  }
+
+  return (
+    <details className="source-disclosure" onToggle={onToggle}>
+      <summary>Source and attribution</summary>
+      {state.kind === "loading" && <p role="status">Checking current source record. Previously loaded notice text is hidden.</p>}
+      {state.kind === "error" && (
+        <div className="source-error" role="alert">
+          <p>{state.message} <span className="error-code">{state.code}</span></p>
+          <button type="button" onClick={() => void load()}>Check source again</button>
+        </div>
+      )}
+      {state.kind === "ready" && <SourceAttributionView source={state.source} />}
+    </details>
+  );
+}
+
+function messageForSourceError(code: string): string {
+  const messages: Record<string, string> = {
+    malformed_reference: "This evidence reference is malformed. No source attribution is shown.",
+    wrong_store: "This evidence reference belongs to a different index. No source attribution is shown.",
+    not_live: "This source is no longer in the current index. Its source notice is hidden.",
+    revoked: "This source has been revoked. Its source notice is hidden.",
+    version_superseded: "This evidence reference is for an older source version. Its source notice is hidden.",
+    public_collection_expired: "This public collection has expired. Its source notice is hidden.",
+  };
+  return messages[code] ?? messageForQuestionError(code);
+}
+
+function SourceAttributionView({ source }: { source: SourceAttribution }) {
+  if (source.kind === "local_index") {
+    return <p>This document is in the local index. No public-source attribution is recorded.</p>;
+  }
+  if (source.kind === "attribution_withheld") {
+    return <p>A current source record exists, but its attribution is unavailable.</p>;
+  }
+  return (
+    <div className="source-attribution">
+      <dl className="inspection-provenance">
+        <div><dt>Source record</dt><dd>{source.source_id}</dd></div>
+        <div><dt>Origin</dt><dd>{source.origin}</dd></div>
+        <div><dt>License or terms label</dt><dd>{source.license_label}</dd></div>
+        <div><dt>Source version</dt><dd>{source.source_version}</dd></div>
+        <div><dt>Installed</dt><dd>{formatTimestamp(source.installed_at_ms)}</dd></div>
+        <div><dt>Visible until</dt><dd>{formatTimestamp(source.visible_until_ms)}</dd></div>
+        {source.display_permission_reviewed_at_ms !== undefined && (
+          <div><dt>Display review recorded</dt><dd>{formatTimestamp(source.display_permission_reviewed_at_ms)}</dd></div>
+        )}
+        <div><dt>Retained notice SHA-256</dt><dd>{source.notice_sha256}</dd></div>
+      </dl>
+      <p className="source-attribution-caveat">These source permissions are operator declarations, not legal certification. A notice alone does not prove rights to fetch, store, index, or display the content.</p>
+      <h4>Verified retained notice · plain text</h4>
+      <pre className="source-notice-text" tabIndex={0}>{source.notice_text}</pre>
+    </div>
+  );
+}
+
+function formatTimestamp(timestamp: number): string {
+  const date = new Date(timestamp);
+  return Number.isNaN(date.getTime()) ? "Invalid timestamp" : date.toISOString();
 }
 
 function hex(bytes: number[]): string {

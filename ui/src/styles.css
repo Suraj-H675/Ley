@@ -132,6 +132,17 @@ a.result-url:hover { color: #374a33; text-decoration: underline; text-underline-
 .indexed-document-text { box-sizing: border-box; max-height: min(55vh, 520px); min-height: 120px; overflow: auto; margin: 7px 0 0; padding: 13px 14px; color: #444840; background: #f7f6f1; border: 1px solid #e0dfd8; border-left: 3px solid #9aa891; border-radius: 0 7px 7px 0; font-family: var(--mono); font-size: 11px; line-height: 1.65; white-space: pre-wrap; overflow-wrap: anywhere; }
 .indexed-document-text:focus-visible { outline: 3px solid #a8b89f; outline-offset: 2px; }
 .inspection-note { margin: 7px 0 0; color: var(--muted); font-size: 10px; line-height: 1.5; }
+.source-disclosure { min-width: 0; margin-top: 13px; padding: 10px 12px; background: #fbfaf6; border: 1px solid #e5e3db; border-radius: 7px; }
+.source-disclosure summary { color: #465840; font-size: 11px; font-weight: 600; cursor: pointer; }
+.source-disclosure summary:focus-visible { outline: 3px solid #a8b89f; outline-offset: 3px; }
+.source-disclosure > p, .source-attribution-caveat { margin: 10px 0 0; color: var(--muted); font-size: 10px; line-height: 1.55; overflow-wrap: anywhere; }
+.source-error p { margin: 10px 0 0; color: #655343; font-size: 10px; line-height: 1.55; overflow-wrap: anywhere; }
+.source-error button { margin-top: 8px; padding: 6px 9px; color: #40533c; background: #f2f5ef; border: 1px solid #d6dfd2; border-radius: 6px; font-size: 10px; font-weight: 600; cursor: pointer; }
+.source-error button:focus-visible { outline: 3px solid #a8b89f; outline-offset: 3px; }
+.source-attribution { min-width: 0; }
+.source-attribution h4 { margin: 12px 0 5px; color: #42463f; font-size: 10px; font-weight: 600; }
+.source-notice-text { max-height: min(45vh, 380px); overflow: auto; margin: 0; padding: 11px; color: #444840; background: #f7f6f1; border: 1px solid #e0dfd8; border-radius: 6px; font-family: var(--mono); font-size: 10px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
+.source-notice-text:focus-visible { outline: 3px solid #a8b89f; outline-offset: 2px; }
 .verification-message { margin: 7px 0 0; padding: 11px 13px; color: #655343; background: #f7f1e7; border-radius: 7px; font-size: 11px; line-height: 1.55; overflow-wrap: anywhere; }
 .evidence-matches { display: grid; gap: 4px; margin-top: 10px; color: #61705c; font-family: var(--mono); font-size: 10px; overflow-wrap: anywhere; }
 .evidence-matches p { margin: 0; }

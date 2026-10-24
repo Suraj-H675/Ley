@@ -25,9 +25,10 @@ use crate::retrieval::{
     AnswerAssessment, DOCUMENT_INSPECTION_CONTRACT_VERSION, DOCUMENT_INSPECTION_PAGE_BYTES,
     DocumentInspectionPage, EvidenceHit, EvidencePassage, EvidenceReference, EvidenceResolveError,
     InsufficientEvidenceReason, MAX_PASSAGE_BYTES, MAX_RESPONSE_BYTES, MAX_RESPONSE_PASSAGE_BYTES,
-    QuestionPlan, QuestionRequest, ResolvedEvidence, RetrievalCompleteness, RetrievalError,
-    RetrievalMode, RetrievalRequest, RetrievalResponse, RetrievalStatus,
-    match_passage_text_bounded, passage_windows, plan_question,
+    PublicSourcePolicyFormat, QuestionPlan, QuestionRequest, ResolvedEvidence,
+    RetrievalCompleteness, RetrievalError, RetrievalMode, RetrievalRequest, RetrievalResponse,
+    RetrievalStatus, SourceAttribution, SourceTransparencyResponse, match_passage_text_bounded,
+    passage_windows, plan_question,
 };
 use crate::url_key::{MAX_URL_KEY_BYTES, UrlKey};
 
@@ -372,6 +373,11 @@ pub(crate) struct PublicCollectionGate {
     pub display_permission: Option<PublicPermissionEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub removal_contact: Option<String>,
+}
+
+struct LoadedPublicCollection {
+    gate: PublicCollectionGate,
+    notice: Vec<u8>,
 }
 
 impl PublicCollectionGate {
@@ -1826,7 +1832,7 @@ impl PersistentIndex {
         reference: &EvidenceReference,
         mut clock: impl FnMut() -> Result<u64, StorageError>,
     ) -> Result<ResolvedEvidence, EvidenceResolveError> {
-        self.with_current_evidence_document(reference, &mut clock, |document| {
+        self.with_current_evidence_document(reference, &mut clock, |document, _collection| {
             let start = usize::try_from(reference.start_byte)
                 .map_err(|_| EvidenceResolveError::OutOfBounds)?;
             let end = usize::try_from(reference.end_byte)
@@ -1852,6 +1858,34 @@ impl PersistentIndex {
         })
     }
 
+    /// Project current source attribution for one exact evidence reference.
+    pub fn source_transparency(
+        &self,
+        reference: &EvidenceReference,
+    ) -> Result<SourceTransparencyResponse, EvidenceResolveError> {
+        self.source_transparency_with_clock(reference, system_time_ms)
+    }
+
+    fn source_transparency_with_clock(
+        &self,
+        reference: &EvidenceReference,
+        mut clock: impl FnMut() -> Result<u64, StorageError>,
+    ) -> Result<SourceTransparencyResponse, EvidenceResolveError> {
+        self.with_current_evidence_document(reference, &mut clock, |document, collection| {
+            let source = match collection {
+                None => SourceAttribution::LocalIndex,
+                Some(collection) => public_source_attribution(collection, document)?,
+            };
+            Ok(SourceTransparencyResponse {
+                contract_version: crate::retrieval::SOURCE_TRANSPARENCY_CONTRACT_VERSION,
+                reference: reference.clone(),
+                requested_url: document.id.clone(),
+                effective_url: document.effective_url.clone(),
+                source,
+            })
+        })
+    }
+
     pub(crate) fn inspect_document_page(
         &self,
         reference: &EvidenceReference,
@@ -1866,7 +1900,7 @@ impl PersistentIndex {
         offset_byte: u32,
         mut clock: impl FnMut() -> Result<u64, StorageError>,
     ) -> Result<DocumentInspectionPage, EvidenceResolveError> {
-        self.with_current_evidence_document(reference, &mut clock, |document| {
+        self.with_current_evidence_document(reference, &mut clock, |document, _collection| {
             let start =
                 usize::try_from(offset_byte).map_err(|_| EvidenceResolveError::OutOfBounds)?;
             if start >= document.body.len() {
@@ -1910,7 +1944,10 @@ impl PersistentIndex {
         &self,
         reference: &EvidenceReference,
         mut clock: impl FnMut() -> Result<u64, StorageError>,
-        operation: impl FnOnce(&IndexedDocument) -> Result<T, EvidenceResolveError>,
+        operation: impl FnOnce(
+            &IndexedDocument,
+            Option<&LoadedPublicCollection>,
+        ) -> Result<T, EvidenceResolveError>,
     ) -> Result<T, EvidenceResolveError> {
         reference.validate_shape_and_identity()?;
         if reference.store_id != self.store_id {
@@ -1920,13 +1957,13 @@ impl PersistentIndex {
             return Err(EvidenceResolveError::InvalidPassageWindow);
         }
         let _lock = self.lock_shared().map_err(map_evidence_storage_error)?;
-        let gate = self
-            .load_public_collection_locked()
+        let collection = self
+            .load_public_collection_with_notice_locked()
             .map_err(map_evidence_storage_error)?;
         let now_ms = clock().map_err(map_evidence_storage_error)?;
-        if gate
+        if collection
             .as_ref()
-            .is_some_and(|value| now_ms >= value.visible_until_ms)
+            .is_some_and(|value| now_ms >= value.gate.visible_until_ms)
         {
             return Err(EvidenceResolveError::PublicCollectionExpired);
         }
@@ -1997,11 +2034,14 @@ impl PersistentIndex {
         {
             return Err(EvidenceResolveError::InvalidPassageWindow);
         }
-        let result = operation(document)?;
+        let result = operation(document, collection.as_ref())?;
         let final_gate = self
-            .load_public_collection_locked()
+            .load_public_collection_gate_locked()
             .map_err(map_evidence_storage_error)?;
         let final_now_ms = clock().map_err(map_evidence_storage_error)?;
+        if final_gate.as_ref() != collection.as_ref().map(|value| &value.gate) {
+            return Err(EvidenceResolveError::CorruptStorage);
+        }
         if final_gate
             .as_ref()
             .is_some_and(|value| final_now_ms >= value.visible_until_ms)
@@ -2316,6 +2356,30 @@ impl PersistentIndex {
     }
 
     fn load_public_collection_locked(&self) -> Result<Option<PublicCollectionGate>, StorageError> {
+        Ok(self
+            .load_public_collection_with_notice_locked()?
+            .map(|collection| collection.gate))
+    }
+
+    fn load_public_collection_with_notice_locked(
+        &self,
+    ) -> Result<Option<LoadedPublicCollection>, StorageError> {
+        let Some(gate) = self.load_public_collection_gate_locked()? else {
+            return Ok(None);
+        };
+        let notice = read_bounded_file(
+            &self.path.join(PUBLIC_NOTICE_STORE_BASENAME),
+            MAX_PUBLIC_NOTICE_BYTES,
+        )?;
+        if !valid_public_notice(&notice) || sha256(&notice) != decode_sha256(&gate.notice_sha256)? {
+            return Err(corrupt("public source notice checksum mismatch"));
+        }
+        Ok(Some(LoadedPublicCollection { gate, notice }))
+    }
+
+    fn load_public_collection_gate_locked(
+        &self,
+    ) -> Result<Option<PublicCollectionGate>, StorageError> {
         let store_bytes = read_bounded_file(&self.path.join(STORE_NAME), STORE_BYTES)?;
         let (store_id, requires_public_gate) = decode_store(&store_bytes)?;
         if store_id != self.store_id {
@@ -2338,13 +2402,6 @@ impl PersistentIndex {
         let bytes = read_bounded_file(&path, MAX_PUBLIC_COLLECTION_BYTES)?;
         let mac_key = self.read_lease_mac_key_locked()?;
         let gate = decode_public_collection_record(&bytes, self.store_id, &mac_key)?;
-        let notice = read_bounded_file(
-            &self.path.join(PUBLIC_NOTICE_STORE_BASENAME),
-            MAX_PUBLIC_NOTICE_BYTES,
-        )?;
-        if !valid_public_notice(&notice) || sha256(&notice) != decode_sha256(&gate.notice_sha256)? {
-            return Err(corrupt("public source notice checksum mismatch"));
-        }
         Ok(Some(gate))
     }
 
@@ -3554,6 +3611,82 @@ fn valid_public_notice(bytes: &[u8]) -> bool {
         && !text
             .chars()
             .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+}
+
+fn public_source_attribution(
+    collection: &LoadedPublicCollection,
+    document: &IndexedDocument,
+) -> Result<SourceAttribution, EvidenceResolveError> {
+    let gate = &collection.gate;
+    if !public_gate_contains_document(gate, document) {
+        return Ok(SourceAttribution::AttributionWithheld);
+    }
+    let notice_text = std::str::from_utf8(&collection.notice)
+        .map_err(|_| EvidenceResolveError::CorruptStorage)?
+        .to_owned();
+    let bundled_legacy_notice =
+        include_bytes!("../notices/rust-stdlib-documentation-MIT.txt").as_slice();
+    let legacy_v1 = gate.license == "MIT"
+        && gate.notice_file == PUBLIC_NOTICE_STORE_BASENAME
+        && gate.fetch_permission.is_none()
+        && gate.storage_permission.is_none()
+        && gate.index_permission.is_none()
+        && gate.display_permission.is_none()
+        && gate.removal_contact.is_none()
+        && collection.notice.as_slice() == bundled_legacy_notice;
+    if legacy_v1 {
+        return Ok(SourceAttribution::OperatorSource {
+            policy_format: PublicSourcePolicyFormat::LegacyV1,
+            source_id: gate.source_id.clone(),
+            origin: gate.origin.clone(),
+            license_label: gate.license.clone(),
+            source_version: gate.source_version.clone(),
+            installed_at_ms: gate.installed_at_ms,
+            visible_until_ms: gate.visible_until_ms,
+            display_permission_reviewed_at_ms: None,
+            notice_sha256: gate.notice_sha256.clone(),
+            notice_text,
+        });
+    }
+
+    let Some(display_permission) = gate
+        .display_permission
+        .as_ref()
+        .filter(|permission| permission.granted)
+    else {
+        return Ok(SourceAttribution::AttributionWithheld);
+    };
+
+    Ok(SourceAttribution::OperatorSource {
+        policy_format: PublicSourcePolicyFormat::NoticeBoundV2,
+        source_id: gate.source_id.clone(),
+        origin: gate.origin.clone(),
+        license_label: gate.license.clone(),
+        source_version: gate.source_version.clone(),
+        installed_at_ms: gate.installed_at_ms,
+        visible_until_ms: gate.visible_until_ms,
+        display_permission_reviewed_at_ms: Some(display_permission.reviewed_at_ms),
+        notice_sha256: gate.notice_sha256.clone(),
+        notice_text,
+    })
+}
+
+fn public_gate_contains_document(gate: &PublicCollectionGate, document: &IndexedDocument) -> bool {
+    [document.id.as_str(), document.effective_url.as_str()]
+        .into_iter()
+        .all(|identity| {
+            let Ok(key) = UrlKey::parse(identity) else {
+                return false;
+            };
+            let Ok(url) = key.to_url() else {
+                return false;
+            };
+            url.origin().ascii_serialization() == gate.origin
+                && gate
+                    .path_prefixes
+                    .iter()
+                    .any(|prefix| crate::url_key::path_is_within_prefix(url.path(), prefix))
+        })
 }
 
 fn is_safe_notice_file_name(name: &str) -> bool {
@@ -5339,6 +5472,390 @@ mod tests {
             display_permission: None,
             removal_contact: None,
         }
+    }
+
+    fn notice_bound_public_gate(
+        notice: &[u8],
+        installed_at_ms: u64,
+        visible_until_ms: u64,
+    ) -> PublicCollectionGate {
+        let mut gate = public_gate(notice, installed_at_ms, visible_until_ms);
+        gate.source_id = "authored-offline-source".to_owned();
+        gate.origin = "https://docs.example.org".to_owned();
+        gate.path_prefixes = vec!["/docs/".to_owned()];
+        gate.license = "Authored non-MIT terms label".to_owned();
+        gate.source_version = "authored-fixture-v1".to_owned();
+        gate.notice_file = "source-notice.txt".to_owned();
+        let permission = PublicPermissionEvidence {
+            granted: true,
+            basis: "private fixture review basis".to_owned(),
+            evidence: "private fixture review note".to_owned(),
+            reviewed_at_ms: installed_at_ms - 1,
+        };
+        gate.fetch_permission = Some(permission.clone());
+        gate.storage_permission = Some(permission.clone());
+        gate.index_permission = Some(permission.clone());
+        gate.display_permission = Some(permission);
+        gate.removal_contact = Some("private-removal@example.test".to_owned());
+        gate
+    }
+
+    fn store_file_snapshot(path: &Path) -> BTreeMap<String, Vec<u8>> {
+        fs::read_dir(path)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                assert!(entry.file_type().unwrap().is_file());
+                (
+                    entry.file_name().to_string_lossy().into_owned(),
+                    fs::read(entry.path()).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    fn source_reference(
+        store: &PersistentIndex,
+        requested_url: &str,
+        effective_url: &str,
+        body: &str,
+    ) -> EvidenceReference {
+        let key = UrlKey::parse(requested_url).unwrap();
+        upsert(
+            store,
+            &key,
+            effective_url,
+            "Source transparency fixture",
+            body,
+        );
+        store
+            .retrieve(RetrievalRequest::question("transparency marker"))
+            .unwrap()
+            .hits
+            .into_iter()
+            .find(|hit| hit.requested_url == requested_url)
+            .unwrap()
+            .passage
+            .reference
+    }
+
+    #[test]
+    fn source_transparency_returns_verified_v2_notice_without_private_review_fields_or_writes() {
+        let temp = TempStore::new();
+        let store = PersistentIndex::create(temp.path()).unwrap();
+        let now_ms = system_time_ms().unwrap();
+        let notice = b"Authored test notice.\n<script>alert('plain text')</script>";
+        let gate = notice_bound_public_gate(notice, now_ms, now_ms + 60_000);
+        store
+            .install_public_collection_gate(&gate, notice, now_ms)
+            .unwrap();
+        let reference = source_reference(
+            &store,
+            "https://docs.example.org/docs/requested",
+            "https://docs.example.org/docs/effective",
+            "source transparency marker",
+        );
+        let before = store_file_snapshot(&store.path);
+
+        let response = store.source_transparency(&reference).unwrap();
+
+        assert_eq!(response.contract_version, 1);
+        assert_eq!(response.reference, reference);
+        assert_eq!(
+            response.requested_url,
+            "https://docs.example.org/docs/requested"
+        );
+        assert_eq!(
+            response.effective_url,
+            "https://docs.example.org/docs/effective"
+        );
+        match &response.source {
+            SourceAttribution::OperatorSource {
+                policy_format,
+                source_id,
+                origin,
+                license_label,
+                source_version,
+                installed_at_ms,
+                visible_until_ms,
+                display_permission_reviewed_at_ms,
+                notice_sha256,
+                notice_text,
+            } => {
+                assert_eq!(*policy_format, PublicSourcePolicyFormat::NoticeBoundV2);
+                assert_eq!(source_id, "authored-offline-source");
+                assert_eq!(origin, "https://docs.example.org");
+                assert_eq!(license_label, "Authored non-MIT terms label");
+                assert_eq!(source_version, "authored-fixture-v1");
+                assert_eq!(*installed_at_ms, now_ms);
+                assert_eq!(*visible_until_ms, now_ms + 60_000);
+                assert_eq!(*display_permission_reviewed_at_ms, Some(now_ms - 1));
+                assert_eq!(notice_sha256, &hex_lowercase(&sha256(notice)));
+                assert_eq!(notice_text.as_bytes(), notice);
+            }
+            other => panic!("unexpected source state: {other:?}"),
+        }
+        let wire = serde_json::to_string(&response).unwrap();
+        for private_value in [
+            "private fixture review basis",
+            "private fixture review note",
+            "private-removal@example.test",
+            "source-notice.txt",
+            "policy_sha256",
+            "fetch_permission",
+        ] {
+            assert!(!wire.contains(private_value), "leaked {private_value}");
+        }
+        assert_eq!(store_file_snapshot(&store.path), before);
+    }
+
+    #[test]
+    fn source_transparency_returns_only_the_exact_legacy_notice_for_legacy_gate_shape() {
+        let temp = TempStore::new();
+        let store = PersistentIndex::create(temp.path()).unwrap();
+        let now_ms = system_time_ms().unwrap();
+        let notice = include_bytes!("../notices/rust-stdlib-documentation-MIT.txt");
+        let mut gate = public_gate(notice, now_ms, now_ms + 60_000);
+        gate.source_id = "legacy-rust-source".to_owned();
+        gate.origin = "https://docs.example.org".to_owned();
+        gate.path_prefixes = vec!["/docs/".to_owned()];
+        gate.source_version = "legacy-fixture-v1".to_owned();
+        store
+            .install_public_collection_gate(&gate, notice, now_ms)
+            .unwrap();
+        let reference = source_reference(
+            &store,
+            "https://docs.example.org/docs/legacy",
+            "https://docs.example.org/docs/legacy",
+            "source transparency marker",
+        );
+
+        let response = store.source_transparency(&reference).unwrap();
+
+        match &response.source {
+            SourceAttribution::OperatorSource {
+                policy_format,
+                license_label,
+                display_permission_reviewed_at_ms,
+                notice_sha256,
+                notice_text,
+                ..
+            } => {
+                assert_eq!(*policy_format, PublicSourcePolicyFormat::LegacyV1);
+                assert_eq!(license_label, "MIT");
+                assert_eq!(*display_permission_reviewed_at_ms, None);
+                assert_eq!(notice_sha256, &hex_lowercase(&sha256(notice)));
+                assert_eq!(notice_text.as_bytes(), notice);
+            }
+            other => panic!("unexpected source state: {other:?}"),
+        }
+        let wire = serde_json::to_value(&response).unwrap();
+        assert!(
+            wire["source"]
+                .get("display_permission_reviewed_at_ms")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn source_transparency_projection_withholds_missing_or_false_v2_display_permission() {
+        let temp = TempStore::new();
+        let store = PersistentIndex::create(temp.path()).unwrap();
+        let now_ms = system_time_ms().unwrap();
+        let notice = b"Authored test notice for display permission checks.\n";
+        let gate = notice_bound_public_gate(notice, now_ms, now_ms + 60_000);
+        store
+            .install_public_collection_gate(&gate, notice, now_ms)
+            .unwrap();
+        let url = "https://docs.example.org/docs/display-permission";
+        let key = UrlKey::parse(url).unwrap();
+        source_reference(&store, url, url, "source transparency marker");
+        let view = store.read_view().unwrap();
+        let document = view.document(&key).unwrap();
+        let _lock = store.lock_shared().unwrap();
+        let loaded = store
+            .load_public_collection_with_notice_locked()
+            .unwrap()
+            .unwrap();
+
+        let mut denied = LoadedPublicCollection {
+            gate: loaded.gate.clone(),
+            notice: loaded.notice.clone(),
+        };
+        denied.gate.display_permission.as_mut().unwrap().granted = false;
+        assert_eq!(
+            public_source_attribution(&denied, &document).unwrap(),
+            SourceAttribution::AttributionWithheld
+        );
+
+        let mut missing = loaded;
+        missing.gate.display_permission = None;
+        assert_eq!(
+            public_source_attribution(&missing, &document).unwrap(),
+            SourceAttribution::AttributionWithheld
+        );
+    }
+
+    #[test]
+    fn source_transparency_is_local_or_withheld_when_public_scope_does_not_match() {
+        let local_temp = TempStore::new();
+        let local = PersistentIndex::create(local_temp.path()).unwrap();
+        let local_reference = source_reference(
+            &local,
+            "https://fixtures.example.test/local",
+            "https://fixtures.example.test/local",
+            "source transparency marker",
+        );
+        let local_response = local.source_transparency(&local_reference).unwrap();
+        assert_eq!(local_response.source, SourceAttribution::LocalIndex);
+
+        let public_temp = TempStore::new();
+        let public = PersistentIndex::create(public_temp.path()).unwrap();
+        let now_ms = system_time_ms().unwrap();
+        let notice = b"Authored test notice for scope checks.\n";
+        let gate = notice_bound_public_gate(notice, now_ms, now_ms + 60_000);
+        public
+            .install_public_collection_gate(&gate, notice, now_ms)
+            .unwrap();
+        for (requested, effective) in [
+            (
+                "https://docs.example.org/private/requested-outside-effective-in",
+                "https://docs.example.org/docs/effective",
+            ),
+            (
+                "https://docs.example.org/docs/requested",
+                "https://other.example/content",
+            ),
+        ] {
+            let reference =
+                source_reference(&public, requested, effective, "source transparency marker");
+            let response = public.source_transparency(&reference).unwrap();
+            assert_eq!(response.source, SourceAttribution::AttributionWithheld);
+        }
+    }
+
+    #[test]
+    fn source_transparency_rechecks_expiry_revocation_removal_and_version() {
+        let temp = TempStore::new();
+        let store = PersistentIndex::create(temp.path()).unwrap();
+        let now_ms = system_time_ms().unwrap();
+        let deadline = now_ms + 60_000;
+        let notice = b"Authored test notice for lifecycle checks.\n";
+        let gate = notice_bound_public_gate(notice, now_ms, deadline);
+        store
+            .install_public_collection_gate(&gate, notice, now_ms)
+            .unwrap();
+        let tombstoned_url = "https://docs.example.org/docs/tombstoned";
+        let revoked_url = "https://docs.example.org/docs/revoked";
+        let superseded_url = "https://docs.example.org/docs/superseded";
+        let tombstoned = source_reference(
+            &store,
+            tombstoned_url,
+            tombstoned_url,
+            "source transparency marker tombstoned",
+        );
+        let revoked = source_reference(
+            &store,
+            revoked_url,
+            revoked_url,
+            "source transparency marker revoked",
+        );
+        let superseded = source_reference(
+            &store,
+            superseded_url,
+            superseded_url,
+            "source transparency marker superseded",
+        );
+
+        assert_eq!(
+            store.source_transparency_with_clock(&tombstoned, || Ok(deadline)),
+            Err(EvidenceResolveError::PublicCollectionExpired)
+        );
+        let mut times = [deadline - 1, deadline].into_iter();
+        assert_eq!(
+            store.source_transparency_with_clock(&tombstoned, || Ok(times.next().unwrap())),
+            Err(EvidenceResolveError::PublicCollectionExpired)
+        );
+
+        for (url, action, reference, expected) in [
+            (
+                tombstoned_url,
+                Intent::Tombstone,
+                tombstoned,
+                EvidenceResolveError::NotLive,
+            ),
+            (
+                revoked_url,
+                Intent::Revoke,
+                revoked,
+                EvidenceResolveError::Revoked,
+            ),
+            (
+                superseded_url,
+                Intent::Upsert {
+                    effective_url: superseded_url.to_owned(),
+                    title: "updated source".to_owned(),
+                    body: "new source transparency marker".to_owned(),
+                },
+                superseded,
+                EvidenceResolveError::VersionSuperseded,
+            ),
+        ] {
+            let key = UrlKey::parse(url).unwrap();
+            let lease = store.issue_fence(&key).unwrap();
+            store.apply(&lease, action).unwrap();
+            assert_eq!(store.source_transparency(&reference), Err(expected));
+        }
+    }
+
+    #[test]
+    fn source_transparency_rejects_tampered_notice_and_gate_metadata() {
+        let notice = b"Authored test notice for tamper checks.\n";
+        let now_ms = system_time_ms().unwrap();
+        let deadline = now_ms + 60_000;
+
+        let notice_temp = TempStore::new();
+        let notice_store = PersistentIndex::create(notice_temp.path()).unwrap();
+        let gate = notice_bound_public_gate(notice, now_ms, deadline);
+        notice_store
+            .install_public_collection_gate(&gate, notice, now_ms)
+            .unwrap();
+        let notice_reference = source_reference(
+            &notice_store,
+            "https://docs.example.org/docs/notice-tamper",
+            "https://docs.example.org/docs/notice-tamper",
+            "source transparency marker",
+        );
+        fs::write(
+            notice_store.path.join(PUBLIC_NOTICE_STORE_BASENAME),
+            b"changed notice bytes\n",
+        )
+        .unwrap();
+        assert_eq!(
+            notice_store.source_transparency(&notice_reference),
+            Err(EvidenceResolveError::CorruptStorage)
+        );
+
+        let gate_temp = TempStore::new();
+        let gate_store = PersistentIndex::create(gate_temp.path()).unwrap();
+        gate_store
+            .install_public_collection_gate(&gate, notice, now_ms)
+            .unwrap();
+        let gate_reference = source_reference(
+            &gate_store,
+            "https://docs.example.org/docs/gate-tamper",
+            "https://docs.example.org/docs/gate-tamper",
+            "source transparency marker",
+        );
+        let gate_path = gate_store.path.join(PUBLIC_COLLECTION_NAME);
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&fs::read(&gate_path).unwrap()).unwrap();
+        record["gate"]["source_version"] = serde_json::Value::String("tampered".to_owned());
+        fs::write(&gate_path, serde_json::to_vec(&record).unwrap()).unwrap();
+        assert_eq!(
+            gate_store.source_transparency(&gate_reference),
+            Err(EvidenceResolveError::CorruptStorage)
+        );
     }
 
     #[test]
