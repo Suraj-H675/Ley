@@ -19,7 +19,8 @@ use serde_json::{Value, json};
 
 use crate::{
     EvidenceReference, ResolvedEvidence, RetrievalRequest, RetrievalResponse,
-    retrieval::{EvidenceResolveError, RetrievalError},
+    retrieval::{EvidenceResolveError, RetrievalError, SourceTransparencyResponse},
+    site_workspace::SiteWorkspace,
     storage::PersistentIndex,
 };
 
@@ -62,6 +63,14 @@ enum ResolveToolOutput {
 
 #[allow(dead_code)]
 #[derive(JsonSchema)]
+#[serde(untagged)]
+enum SourceTransparencyToolOutput {
+    Response(Box<SourceTransparencyResponse>),
+    Error(McpToolError),
+}
+
+#[allow(dead_code)]
+#[derive(JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct McpToolError {
     error: String,
@@ -70,15 +79,17 @@ struct McpToolError {
 struct RetrievalMcp {
     store_path: PathBuf,
     store_id: [u8; 16],
+    workspace: Option<Arc<SiteWorkspace>>,
     store_work: Arc<tokio::sync::Semaphore>,
     tool_router: rmcp::handler::server::router::tool::ToolRouter<Self>,
 }
 
 impl RetrievalMcp {
-    fn new(store_path: PathBuf, store_id: [u8; 16]) -> Self {
+    fn new(store_path: PathBuf, store_id: [u8; 16], workspace: Option<Arc<SiteWorkspace>>) -> Self {
         Self {
             store_path,
             store_id,
+            workspace,
             store_work: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_STORE_CALLS)),
             tool_router: Self::tool_router(),
         }
@@ -116,6 +127,7 @@ impl RetrievalMcp {
 
         let store_path = self.store_path.clone();
         let store_id = self.store_id;
+        let workspace = self.workspace.clone();
         let permit = match self.store_work.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => return tool_error("resource_cap"),
@@ -123,6 +135,11 @@ impl RetrievalMcp {
         let question = args.question;
         let operation = tokio::task::spawn_blocking(move || {
             let _permit = permit;
+            if let Some(workspace) = workspace {
+                workspace
+                    .policy_binding_is_current()
+                    .map_err(|_| "workspace_policy_binding_changed")?;
+            }
             let index = open_bound_store(&store_path, store_id)?;
             let request = match RetrievalRequest::question(question) {
                 RetrievalRequest::Question(question) => RetrievalRequest::Question(
@@ -168,12 +185,18 @@ impl RetrievalMcp {
     ) -> CallToolResult {
         let store_path = self.store_path.clone();
         let store_id = self.store_id;
+        let workspace = self.workspace.clone();
         let permit = match self.store_work.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => return tool_error("resource_cap"),
         };
         let operation = tokio::task::spawn_blocking(move || {
             let _permit = permit;
+            if let Some(workspace) = workspace {
+                workspace
+                    .policy_binding_is_current()
+                    .map_err(|_| "workspace_policy_binding_changed")?;
+            }
             let index = open_bound_store(&store_path, store_id)?;
             index
                 .resolve_evidence(&reference)
@@ -189,6 +212,57 @@ impl RetrievalMcp {
             },
             Ok(Err(code)) => tool_error(code),
             Err(_) => tool_error("storage_fault"),
+            }
+        }
+    }
+
+    #[tool(
+        name = "source_transparency",
+        input_schema = mcp_input_schema::<EvidenceReference>(),
+        description = "Return current source attribution for one exact EvidenceReference. Public source results include the digest-verified retained notice only when current disclosure conditions allow it. Local indexes return local attribution. This read-only lookup does not fetch, crawl, or establish legal rights.",
+        output_schema = mcp_output_schema::<SourceTransparencyToolOutput>(),
+        annotations(
+            title = "Check evidence source",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn source_transparency(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(reference): Parameters<EvidenceReference>,
+    ) -> CallToolResult {
+        let store_path = self.store_path.clone();
+        let store_id = self.store_id;
+        let workspace = self.workspace.clone();
+        let permit = match self.store_work.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => return tool_error("resource_cap"),
+        };
+        let operation = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            if let Some(workspace) = workspace {
+                workspace
+                    .policy_binding_is_current()
+                    .map_err(|_| "workspace_policy_binding_changed")?;
+            }
+            let index = open_bound_store(&store_path, store_id)?;
+            index
+                .source_transparency(&reference)
+                .map_err(resolve_error_code)
+        });
+        tokio::select! {
+            biased;
+            _ = context.ct.cancelled() => tool_error("cancelled"),
+            result = operation => match result {
+                Ok(Ok(response)) => match serde_json::to_value(response) {
+                    Ok(value) => success_result(value),
+                    Err(_) => tool_error("storage_fault"),
+                },
+                Ok(Err(code)) => tool_error(code),
+                Err(_) => tool_error("storage_fault"),
             }
         }
     }
@@ -320,6 +394,23 @@ fn strip_format_annotations(value: &mut Value) {
 /// Start the MCP stdio service bound to exactly one existing store.
 pub fn run(store_path: impl AsRef<std::path::Path>) -> Result<(), &'static str> {
     let store_path = fs::canonicalize(store_path).map_err(|_| "store_unavailable")?;
+    run_selected_store(store_path, None)
+}
+
+pub fn run_workspace(workspace_path: impl AsRef<std::path::Path>) -> Result<(), &'static str> {
+    let workspace =
+        Arc::new(SiteWorkspace::open(workspace_path).map_err(|_| "workspace_unavailable")?);
+    workspace
+        .status_json()
+        .map_err(|_| "workspace_policy_binding_changed")?;
+    let store_path = fs::canonicalize(workspace.store_path()).map_err(|_| "store_unavailable")?;
+    run_selected_store(store_path, Some(workspace))
+}
+
+fn run_selected_store(
+    store_path: PathBuf,
+    workspace: Option<Arc<SiteWorkspace>>,
+) -> Result<(), &'static str> {
     let index = PersistentIndex::open(&store_path).map_err(|_| "store_unavailable")?;
     let store_id = index.store_identity();
     drop(index);
@@ -332,7 +423,7 @@ pub fn run(store_path: impl AsRef<std::path::Path>) -> Result<(), &'static str> 
         let (reader, writer) = stdio_pipes();
         let transport =
             AsyncRwTransport::new(reader, writer).with_max_line_length(MAX_STDIO_LINE_BYTES);
-        let server = RetrievalMcp::new(store_path, store_id);
+        let server = RetrievalMcp::new(store_path, store_id, workspace);
         let service = server
             .serve(transport)
             .await
@@ -347,12 +438,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn advertises_only_two_read_only_closed_world_tools() {
+    fn advertises_only_three_read_only_closed_world_tools() {
         let search = RetrievalMcp::search_evidence_tool_attr();
         let resolve = RetrievalMcp::resolve_evidence_tool_attr();
+        let source = RetrievalMcp::source_transparency_tool_attr();
         assert_eq!(search.name, "search_evidence");
         assert_eq!(resolve.name, "resolve_evidence");
-        for tool in [&search, &resolve] {
+        assert_eq!(source.name, "source_transparency");
+        for tool in [&search, &resolve, &source] {
             let annotations = tool.annotations.as_ref().expect("read-only annotations");
             assert_eq!(annotations.read_only_hint, Some(true));
             assert_eq!(annotations.destructive_hint, Some(false));
@@ -361,6 +454,7 @@ mod tests {
         }
         assert!(search.output_schema.is_some());
         assert!(resolve.output_schema.is_some());
+        assert!(source.output_schema.is_some());
         let search_schema = serde_json::Value::Object(search.input_schema.as_ref().clone());
         assert_eq!(search_schema["properties"]["max_hits"]["default"], 8);
         assert_eq!(search_schema["properties"]["max_hits"]["maximum"], 8);
@@ -371,6 +465,11 @@ mod tests {
         );
         assert_eq!(
             resolve.output_schema.as_ref().expect("output schema")["type"],
+            "object"
+        );
+        assert_eq!(source.input_schema.as_ref(), resolve.input_schema.as_ref());
+        assert_eq!(
+            source.output_schema.as_ref().expect("output schema")["type"],
             "object"
         );
         let resolve_schema = serde_json::Value::Object(resolve.input_schema.as_ref().clone());

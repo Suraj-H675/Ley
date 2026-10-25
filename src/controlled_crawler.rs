@@ -19,6 +19,8 @@ use crate::html::{
 use crate::page_policy::parse_x_robots_tags;
 use crate::public_policy::{PublicCrawlPolicy, PublicPolicyError, PublicSourcePolicy};
 use crate::robots::{MAX_ROBOTS_BYTES, parse_robots};
+#[cfg(test)]
+use crate::safe_fetch::OwnedFixtureTls;
 use crate::safe_fetch::{
     DEFAULT_REQUEST_TIMEOUT, DestinationEvidence, DestinationResolver, FixtureCapability,
     HttpResponse, MAX_ROBOTS_REDIRECTS, PublicAuthority, SafeFetchError, SafeFetcher,
@@ -166,6 +168,24 @@ impl SourcePolicy {
         now_ms: u64,
         fetcher: &SafeFetcher<R>,
     ) -> Result<(), CrawlError> {
+        self.validate_with_owned_fixture_transport(now_ms, fetcher, false)
+    }
+
+    #[cfg(test)]
+    fn validate_for_owned_fixture<R: DestinationResolver + 'static>(
+        &self,
+        now_ms: u64,
+        fetcher: &SafeFetcher<R>,
+    ) -> Result<(), CrawlError> {
+        self.validate_with_owned_fixture_transport(now_ms, fetcher, true)
+    }
+
+    fn validate_with_owned_fixture_transport<R: DestinationResolver + 'static>(
+        &self,
+        now_ms: u64,
+        fetcher: &SafeFetcher<R>,
+        allow_fixture_for_public_policy: bool,
+    ) -> Result<(), CrawlError> {
         if self.id.is_empty()
             || self.id.len() > MAX_SOURCE_ID_BYTES
             || !self
@@ -210,6 +230,7 @@ impl SourcePolicy {
                 fetcher.has_fixture_capability(&parsed)
             } else {
                 fetcher.has_public_authority(&parsed)
+                    || (allow_fixture_for_public_policy && fetcher.has_fixture_capability(&parsed))
             };
             if origin_of_url(&parsed) != *origin
                 || parsed.path() != "/"
@@ -692,6 +713,7 @@ impl FrontierDb {
         conn.busy_timeout(Duration::from_secs(2))?;
         conn.pragma_update(None, "journal_mode", "DELETE")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
+        conn.pragma_update(None, "secure_delete", true)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "trusted_schema", "OFF")?;
         conn.pragma_update(None, "max_page_count", MAX_SQLITE_PAGES)?;
@@ -1565,6 +1587,22 @@ where
         Self::open_with_fetcher(path, index, fetcher, limits, clock, true)
     }
 
+    #[cfg(test)]
+    pub(crate) fn open_existing_with_owned_fixture_tls(
+        path: &Path,
+        index: Arc<PersistentIndex>,
+        resolver: R,
+        fixture: OwnedFixtureTls,
+        limits: CrawlLimits,
+        clock: C,
+    ) -> Result<Self, CrawlError> {
+        let fetcher = Arc::new(
+            SafeFetcher::new_with_owned_fixture_tls(resolver, fixture)
+                .with_timeout(limits.request_timeout),
+        );
+        Self::open_with_fetcher(path, index, fetcher, limits, clock, true)
+    }
+
     fn open_with_fetcher(
         path: &Path,
         index: Arc<PersistentIndex>,
@@ -1647,8 +1685,33 @@ where
         policy: SourcePolicy,
         seeds: &[UrlKey],
     ) -> Result<(), CrawlError> {
+        self.admit_source_with_owned_fixture_transport(policy, seeds, false)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn admit_source_for_owned_fixture(
+        &mut self,
+        policy: SourcePolicy,
+        seeds: &[UrlKey],
+    ) -> Result<(), CrawlError> {
+        self.admit_source_with_owned_fixture_transport(policy, seeds, true)
+    }
+
+    fn admit_source_with_owned_fixture_transport(
+        &mut self,
+        policy: SourcePolicy,
+        seeds: &[UrlKey],
+        allow_fixture_for_public_policy: bool,
+    ) -> Result<(), CrawlError> {
         let now = self.clock.now_ms();
-        policy.validate(now, &self.fetcher)?;
+        if allow_fixture_for_public_policy {
+            #[cfg(test)]
+            policy.validate_for_owned_fixture(now, &self.fetcher)?;
+            #[cfg(not(test))]
+            policy.validate(now, &self.fetcher)?;
+        } else {
+            policy.validate(now, &self.fetcher)?;
+        }
         if seeds.is_empty() {
             return Err(CrawlError::Policy(
                 "at least one seed is required".to_owned(),
@@ -1812,6 +1875,10 @@ where
     }
 
     pub(crate) fn revoke_source(&mut self, source_id: &str) -> Result<(), CrawlError> {
+        let (_, lifecycle, _) = self.db.source(source_id)?;
+        if lifecycle == "revoked" {
+            return Ok(());
+        }
         self.mark_source_revoked(source_id, "explicit policy revocation")?;
         self.reconcile_controls()
     }
@@ -1837,6 +1904,10 @@ where
         }
         tx.execute(
             "UPDATE outbox SET status='rejected',error='source revoked before apply' WHERE source_id=?1 AND status='pending' AND kind=0",
+            [source_id],
+        )?;
+        tx.execute(
+            "UPDATE outbox SET title=NULL,body=NULL WHERE source_id=?1",
             [source_id],
         )?;
         tx.execute(
@@ -2109,7 +2180,117 @@ pub(crate) fn run_public_crawl(
     policy: &PublicCrawlPolicy,
     request_count: usize,
 ) -> Result<BoundedCrawlResult, CrawlError> {
-    let now = SystemClock.now_ms();
+    let (mut crawler, max_wire_bytes, max_decoded_bytes, max_runtime) =
+        prepare_public_collection(index_path, frontier_path, policy, request_count)?;
+
+    run_bounded_crawl(
+        &mut crawler,
+        request_count,
+        max_wire_bytes,
+        max_decoded_bytes,
+        max_runtime,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn run_public_crawl_with_owned_fixture(
+    index_path: &Path,
+    frontier_path: &Path,
+    policy: &PublicCrawlPolicy,
+    request_count: usize,
+    fixture: OwnedFixtureTls,
+    now_ms: u64,
+) -> Result<BoundedCrawlResult, CrawlError> {
+    let (mut crawler, max_wire_bytes, max_decoded_bytes, max_runtime) =
+        prepare_public_collection_with_transport(
+            index_path,
+            frontier_path,
+            policy,
+            request_count,
+            CrawlerTransport::OwnedFixture {
+                resolver: fixture.clone(),
+                fixture,
+            },
+            FixtureLogicalClock::new(now_ms),
+        )?;
+    run_bounded_crawl(
+        &mut crawler,
+        request_count,
+        max_wire_bytes,
+        max_decoded_bytes,
+        max_runtime,
+    )
+}
+
+pub(crate) fn initialize_public_collection(
+    index_path: &Path,
+    frontier_path: &Path,
+    policy: &PublicCrawlPolicy,
+) -> Result<(), CrawlError> {
+    let (crawler, _, _, _) = prepare_public_collection(index_path, frontier_path, policy, 12)?;
+    drop(crawler);
+    Ok(())
+}
+
+fn prepare_public_collection(
+    index_path: &Path,
+    frontier_path: &Path,
+    policy: &PublicCrawlPolicy,
+    request_count: usize,
+) -> Result<
+    (
+        ControlledCrawler<SystemResolver, SystemClock>,
+        usize,
+        usize,
+        Duration,
+    ),
+    CrawlError,
+> {
+    prepare_public_collection_with_transport(
+        index_path,
+        frontier_path,
+        policy,
+        request_count,
+        CrawlerTransport::Public(SystemResolver),
+        SystemClock,
+    )
+}
+
+enum CrawlerTransport<R> {
+    Public(R),
+    #[cfg(test)]
+    OwnedFixture {
+        resolver: R,
+        fixture: OwnedFixtureTls,
+    },
+}
+
+impl<R> CrawlerTransport<R> {
+    fn is_owned_fixture(&self) -> bool {
+        #[cfg(test)]
+        {
+            matches!(self, Self::OwnedFixture { .. })
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+}
+
+fn prepare_public_collection_with_transport<R, C>(
+    index_path: &Path,
+    frontier_path: &Path,
+    policy: &PublicCrawlPolicy,
+    request_count: usize,
+    transport: CrawlerTransport<R>,
+    clock: C,
+) -> Result<(ControlledCrawler<R, C>, usize, usize, Duration), CrawlError>
+where
+    R: DestinationResolver + 'static,
+    C: Clock + 'static,
+{
+    let now = clock.now_ms();
     policy
         .validate_enabled(now)
         .map_err(|error: PublicPolicyError| CrawlError::Policy(error.to_string()))?;
@@ -2142,13 +2323,29 @@ pub(crate) fn run_public_crawl(
         Err(error) => return Err(CrawlError::Io(error)),
     };
     index.install_public_collection_gate(&gate, notice, now)?;
-    let mut crawler = ControlledCrawler::<SystemResolver, SystemClock>::open_system_with_public(
-        frontier_path,
-        Arc::clone(&index),
-        Vec::new(),
-        authorities,
-        limits,
-    )?;
+    let fixture_transport = transport.is_owned_fixture();
+    let mut crawler = match transport {
+        CrawlerTransport::Public(resolver) => ControlledCrawler::<R, C>::open_with_public(
+            frontier_path,
+            Arc::clone(&index),
+            resolver,
+            Vec::new(),
+            authorities,
+            limits,
+            clock,
+        )?,
+        #[cfg(test)]
+        CrawlerTransport::OwnedFixture { resolver, fixture } => {
+            ControlledCrawler::<R, C>::open_existing_with_owned_fixture_tls(
+                frontier_path,
+                Arc::clone(&index),
+                resolver,
+                fixture,
+                limits,
+                clock,
+            )?
+        }
+    };
     for source in policy.sources() {
         let source_policy = source
             .crawler_policy(policy.contact(), now, &policy.sha256())
@@ -2156,16 +2353,16 @@ pub(crate) fn run_public_crawl(
         let seeds = source
             .seeds()
             .map_err(|error| CrawlError::Policy(error.to_string()))?;
-        crawler.admit_source(source_policy, &seeds)?;
+        if fixture_transport {
+            #[cfg(test)]
+            crawler.admit_source_for_owned_fixture(source_policy, &seeds)?;
+            #[cfg(not(test))]
+            crawler.admit_source(source_policy, &seeds)?;
+        } else {
+            crawler.admit_source(source_policy, &seeds)?;
+        }
     }
-
-    run_bounded_crawl(
-        &mut crawler,
-        request_count,
-        max_wire_bytes,
-        max_decoded_bytes,
-        max_runtime,
-    )
+    Ok((crawler, max_wire_bytes, max_decoded_bytes, max_runtime))
 }
 
 fn run_bounded_crawl<R: DestinationResolver + 'static, C: Clock + 'static>(
@@ -3891,7 +4088,7 @@ where
         };
         let tx = self.db.transaction()?;
         tx.execute(
-            "UPDATE outbox SET status='applied' WHERE id=?1 AND status='pending'",
+            "UPDATE outbox SET status='applied',title=NULL,body=NULL WHERE id=?1 AND status='pending'",
             [item.id],
         )?;
         match item.kind {
@@ -4003,7 +4200,7 @@ where
         let now = self.clock.now_ms();
         let tx = self.db.transaction()?;
         tx.execute(
-            "UPDATE outbox SET status='rejected',error=?2 WHERE id=?1 AND status='pending'",
+            "UPDATE outbox SET status='rejected',title=NULL,body=NULL,error=?2 WHERE id=?1 AND status='pending'",
             params![item.id, reason],
         )?;
         tx.execute(
@@ -8485,6 +8682,17 @@ mod tests {
             );
 
             let index = Arc::new(PersistentIndex::open(temp.path().join("index")).unwrap());
+            let frontier = Connection::open(temp.path().join("frontier.sqlite")).unwrap();
+            let pending_body: Option<String> = frontier
+                .query_row("SELECT body FROM outbox WHERE kind=0 LIMIT 1", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert!(
+                pending_body.is_some(),
+                "crashed pending intent must retain its body for replay"
+            );
+            drop(frontier);
             let before = index.query("subprocess").unwrap();
             assert_eq!(!before.is_empty(), expected_before);
             let generation_before_replay = index.read_view().unwrap().generation_id();
@@ -8529,6 +8737,19 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(applied, 1);
+            let retained_text_rows: i64 = recovery
+                .db
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM outbox WHERE status='applied' AND (title IS NOT NULL OR body IS NOT NULL)",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                retained_text_rows, 0,
+                "acknowledged text is not duplicated in the outbox"
+            );
             assert_reference_parity(&index, &[key_url], "subprocess AND parity");
         }
     }
@@ -8583,6 +8804,19 @@ mod tests {
             )
             .unwrap();
         assert_eq!(upsert_status, "rejected");
+        let retained_text_rows: i64 = recovery
+            .db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM outbox WHERE kind=0 AND (title IS NOT NULL OR body IS NOT NULL)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            retained_text_rows, 0,
+            "expired pending text is cleared on recovery"
+        );
         let lifecycle: String = recovery
             .db
             .conn
@@ -8658,6 +8892,19 @@ mod tests {
             })
             .unwrap();
         assert_eq!(status, "rejected");
+        let retained_text_rows: i64 = recovery
+            .db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM outbox WHERE kind=0 AND (title IS NOT NULL OR body IS NOT NULL)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            retained_text_rows, 0,
+            "rejected text is not retained in the outbox"
+        );
         assert_reference_parity(&index, &[key_text], "subprocess AND parity");
     }
 
@@ -8827,11 +9074,44 @@ mod tests {
                 .indexed,
             1
         );
+        let retained_text_rows: i64 = crawler
+            .db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM outbox WHERE source_id='local-removal' AND (title IS NOT NULL OR body IS NOT NULL)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            retained_text_rows, 0,
+            "applied text has no duplicate outbox copy"
+        );
         let requests_before_revoke = fixture.request_log();
         assert_eq!(index.query("withdrawal").unwrap().len(), 1);
         drop(crawler);
 
         revoke_public_source(&index_path, &frontier_path, "local-removal").unwrap();
+
+        let frontier = FrontierDb::open(&frontier_path, index.store_identity()).unwrap();
+        let retained_text_rows: i64 = frontier
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM outbox WHERE source_id='local-removal' AND (title IS NOT NULL OR body IS NOT NULL)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            retained_text_rows, 0,
+            "revocation clears source outbox text"
+        );
+        let secure_delete: i64 = frontier
+            .conn
+            .pragma_query_value(None, "secure_delete", |row| row.get(0))
+            .unwrap();
+        assert_eq!(secure_delete, 1);
+        drop(frontier);
 
         assert!(
             PersistentIndex::open(&index_path)

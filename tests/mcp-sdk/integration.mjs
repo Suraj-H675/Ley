@@ -216,10 +216,10 @@ function assertNoStoreConfiguration(tools) {
   const description = JSON.stringify(tools);
   assert.doesNotMatch(description, /store_path|storePath|filesystem path/i);
   assert.doesNotMatch(description, /"format"\s*:/, "tool schemas should use portable JSON Schema keywords");
-  assert.equal(tools.length, 2);
+  assert.equal(tools.length, 3);
   assert.deepEqual(
     tools.map((tool) => tool.name).sort(),
-    ["resolve_evidence", "search_evidence"],
+    ["resolve_evidence", "search_evidence", "source_transparency"],
   );
   for (const tool of tools) {
     assert.equal(tool.outputSchema?.type, "object");
@@ -283,7 +283,7 @@ try {
   assert.equal(modern.client.getServerVersion()?.name, "ley");
   const modernTools = (await timed("modern tools/list", () => modern.client.listTools())).tools;
   assertNoStoreConfiguration(modernTools);
-  record("modern server/discover and tools/list", "2026-07-28; exactly two read-only tools");
+  record("modern server/discover and tools/list", "2026-07-28; three read-only tools");
 
   const question = "Which café keeps the blue lantern at Harbor Bay?";
   const searchResult = await timed("modern search_evidence", () =>
@@ -303,6 +303,19 @@ try {
   const harborHit = searchValue.hits.find((hit) => hit.requested_url.endsWith("harbor.html"));
   assert.ok(harborHit, "expected the authored Harbor Guide hit");
   const harborReference = harborHit.passage.reference;
+  const sourceValue = structured(
+    await timed("modern source_transparency", () =>
+      modern.client.callTool({
+        name: "source_transparency",
+        arguments: harborReference,
+      }),
+    ),
+  );
+  assert.deepEqual(sourceValue.reference, harborReference);
+  assert.equal(sourceValue.requested_url, harborHit.requested_url);
+  assert.deepEqual(sourceValue.source, { kind: "local_index" });
+  record("exact source lookup", "MCP source metadata is bound to a current reference and local index");
+
   const resolutionResult = await timed("modern resolve_evidence", () =>
     modern.client.callTool({
       name: "resolve_evidence",

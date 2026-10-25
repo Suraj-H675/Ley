@@ -221,6 +221,54 @@ impl FixtureCapability {
             .upgrade()
             .is_some_and(|alive| alive.load(Ordering::SeqCst))
     }
+
+    #[cfg(test)]
+    fn matches(&self, other: &Self) -> bool {
+        self.is_alive()
+            && other.is_alive()
+            && self.host == other.host
+            && self.port == other.port
+            && self.endpoint == other.endpoint
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct OwnedFixtureTls {
+    capability: FixtureCapability,
+    root_certificate_pem: Vec<u8>,
+}
+
+#[cfg(test)]
+impl OwnedFixtureTls {
+    fn from_owned_listener(
+        host: &str,
+        listener: &TcpListener,
+        alive: &Arc<AtomicBool>,
+        root_certificate_pem: Vec<u8>,
+    ) -> Option<Self> {
+        Some(Self {
+            capability: FixtureCapability::from_owned_listener(host, listener, alive)?,
+            root_certificate_pem,
+        })
+    }
+}
+
+#[cfg(test)]
+impl DestinationResolver for OwnedFixtureTls {
+    fn resolve(&self, host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+        if self.capability.is_alive()
+            && self.capability.host.eq_ignore_ascii_case(host)
+            && self.capability.port == port
+        {
+            Ok(vec![self.capability.endpoint])
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "owned fixture resolver only serves its pinned listener",
+            ))
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -322,6 +370,8 @@ pub struct SafeFetcher<R> {
     request_timeout: Duration,
     #[cfg(test)]
     test_public_transport: Option<TestPublicTransport>,
+    #[cfg(test)]
+    test_owned_fixture_tls: Option<OwnedFixtureTls>,
 }
 
 #[cfg(test)]
@@ -341,6 +391,20 @@ impl<R: DestinationResolver + 'static> SafeFetcher<R> {
             network_evidence: Mutex::new(Vec::new()),
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             test_public_transport: None,
+            test_owned_fixture_tls: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_owned_fixture_tls(resolver: R, fixture: OwnedFixtureTls) -> Self {
+        Self {
+            resolver: Arc::new(resolver),
+            capabilities: vec![fixture.capability.clone()],
+            public_authorities: Vec::new(),
+            network_evidence: Mutex::new(Vec::new()),
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            test_public_transport: None,
+            test_owned_fixture_tls: Some(fixture),
         }
     }
 
@@ -357,6 +421,8 @@ impl<R: DestinationResolver + 'static> SafeFetcher<R> {
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             #[cfg(test)]
             test_public_transport: None,
+            #[cfg(test)]
+            test_owned_fixture_tls: None,
         }
     }
 
@@ -447,8 +513,20 @@ impl<R: DestinationResolver + 'static> SafeFetcher<R> {
             .public_authorities
             .iter()
             .find(|authority| authority.allows(url));
+        #[cfg(test)]
+        let test_owned_fixture_tls = self.test_owned_fixture_tls.as_ref().filter(|transport| {
+            fixture.is_some_and(|capability| transport.capability.matches(capability))
+                && transport.capability.host.eq_ignore_ascii_case(host)
+                && transport.capability.port == port
+        });
+        #[cfg(test)]
+        let fixture_scheme_is_allowed = fixture.is_none()
+            || url.scheme() == "http"
+            || (url.scheme() == "https" && test_owned_fixture_tls.is_some());
+        #[cfg(not(test))]
+        let fixture_scheme_is_allowed = fixture.is_none() || url.scheme() == "http";
         if (fixture.is_none() && public.is_none())
-            || (fixture.is_some() && url.scheme() != "http")
+            || !fixture_scheme_is_allowed
             || (public.is_some() && url.scheme() != "https")
         {
             return Err(SafeFetchError::UnadmittedAuthority);
@@ -505,7 +583,9 @@ impl<R: DestinationResolver + 'static> SafeFetcher<R> {
             ));
         }
         #[cfg(test)]
-        let test_endpoint = test_public_transport.map(|transport| transport.endpoint);
+        let test_endpoint = test_owned_fixture_tls
+            .map(|transport| transport.capability.endpoint)
+            .or_else(|| test_public_transport.map(|transport| transport.endpoint));
         #[cfg(not(test))]
         let test_endpoint = None::<SocketAddr>;
         let resolved_addresses = test_endpoint.map_or_else(
@@ -543,7 +623,11 @@ impl<R: DestinationResolver + 'static> SafeFetcher<R> {
             .timeout(remaining)
             .pool_max_idle_per_host(0);
         #[cfg(test)]
-        let client_builder = if let Some(transport) = test_public_transport {
+        let client_builder = if let Some(transport) = test_owned_fixture_tls {
+            let certificate = reqwest::Certificate::from_pem(&transport.root_certificate_pem)
+                .map_err(|error| SafeFetchError::Request(error.to_string()))?;
+            client_builder.add_root_certificate(certificate)
+        } else if let Some(transport) = test_public_transport {
             let certificate = reqwest::Certificate::from_pem(&transport.root_certificate_pem)
                 .map_err(|error| SafeFetchError::Request(error.to_string()))?;
             client_builder.add_root_certificate(certificate)
@@ -756,6 +840,8 @@ fn is_public_ipv6(ip: Ipv6Addr) -> bool {
 
 #[cfg(test)]
 pub(crate) mod tls_test_support {
+    use super::OwnedFixtureTls;
+
     use std::collections::BTreeMap;
     use std::fs;
     use std::io::{Read, Write};
@@ -813,10 +899,15 @@ pub(crate) mod tls_test_support {
     pub(crate) struct Fixture {
         pub(crate) address: SocketAddr,
         root_certificate_pem: Vec<u8>,
+        owned_transport: OwnedFixtureTls,
         accepts: Arc<AtomicUsize>,
         requests: Arc<Mutex<Vec<String>>>,
+        accepted_peers: Arc<Mutex<Vec<SocketAddr>>>,
+        response_bytes: Arc<AtomicUsize>,
         user_agents: Arc<Mutex<Vec<String>>>,
         request_starts: Arc<Mutex<Vec<std::time::Instant>>>,
+        routes: Arc<Mutex<Routes>>,
+        alive: Arc<AtomicBool>,
         stop: Arc<AtomicBool>,
         thread: Option<JoinHandle<()>>,
         directory: TempDirectory,
@@ -843,28 +934,44 @@ pub(crate) mod tls_test_support {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
             let address = listener.local_addr().unwrap();
+            let alive = Arc::new(AtomicBool::new(true));
+            let owned_transport = OwnedFixtureTls::from_owned_listener(
+                certificate_host,
+                &listener,
+                &alive,
+                root_certificate_pem.clone(),
+            )
+            .expect("owned TLS fixture must bind a live loopback listener");
             let accepts = Arc::new(AtomicUsize::new(0));
             let requests = Arc::new(Mutex::new(Vec::new()));
+            let accepted_peers = Arc::new(Mutex::new(Vec::new()));
+            let response_bytes = Arc::new(AtomicUsize::new(0));
             let user_agents = Arc::new(Mutex::new(Vec::new()));
             let request_starts = Arc::new(Mutex::new(Vec::new()));
+            let routes = Arc::new(Mutex::new(routes));
             let stop = Arc::new(AtomicBool::new(false));
             let thread_accepts = Arc::clone(&accepts);
             let thread_requests = Arc::clone(&requests);
+            let thread_peers = Arc::clone(&accepted_peers);
+            let thread_response_bytes = Arc::clone(&response_bytes);
             let thread_user_agents = Arc::clone(&user_agents);
             let thread_request_starts = Arc::clone(&request_starts);
+            let thread_routes = Arc::clone(&routes);
             let thread_stop = Arc::clone(&stop);
             let thread = thread::spawn(move || {
                 while !thread_stop.load(Ordering::Relaxed) {
                     match listener.accept() {
-                        Ok((stream, _)) => {
+                        Ok((stream, peer)) => {
                             thread_accepts.fetch_add(1, Ordering::SeqCst);
+                            thread_peers.lock().unwrap().push(peer);
                             serve(
                                 stream,
                                 &config,
-                                &routes,
+                                &thread_routes,
                                 &thread_requests,
                                 &thread_user_agents,
                                 &thread_request_starts,
+                                &thread_response_bytes,
                             );
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -877,14 +984,23 @@ pub(crate) mod tls_test_support {
             Self {
                 address,
                 root_certificate_pem,
+                owned_transport,
                 accepts,
                 requests,
+                accepted_peers,
+                response_bytes,
                 user_agents,
                 request_starts,
+                routes,
+                alive,
                 stop,
                 thread: Some(thread),
                 directory,
             }
+        }
+
+        pub(crate) fn owned_transport(&self) -> OwnedFixtureTls {
+            self.owned_transport.clone()
         }
 
         pub(crate) fn root_certificate_pem(&self) -> Vec<u8> {
@@ -899,6 +1015,18 @@ pub(crate) mod tls_test_support {
             self.requests.lock().unwrap().clone()
         }
 
+        pub(crate) fn accepted_peers(&self) -> Vec<SocketAddr> {
+            self.accepted_peers.lock().unwrap().clone()
+        }
+
+        pub(crate) fn response_bytes(&self) -> usize {
+            self.response_bytes.load(Ordering::SeqCst)
+        }
+
+        pub(crate) fn replace_routes(&self, routes: Routes) {
+            *self.routes.lock().unwrap() = routes;
+        }
+
         pub(crate) fn user_agents(&self) -> Vec<String> {
             self.user_agents.lock().unwrap().clone()
         }
@@ -910,6 +1038,7 @@ pub(crate) mod tls_test_support {
 
     impl Drop for Fixture {
         fn drop(&mut self) {
+            self.alive.store(false, Ordering::SeqCst);
             self.stop.store(true, Ordering::Relaxed);
             if let Some(thread) = self.thread.take() {
                 let _ = thread.join();
@@ -1052,10 +1181,11 @@ pub(crate) mod tls_test_support {
     fn serve(
         stream: TcpStream,
         config: &Arc<rustls::ServerConfig>,
-        routes: &Routes,
+        routes: &Mutex<Routes>,
         requests: &Mutex<Vec<String>>,
         user_agents: &Mutex<Vec<String>>,
         request_starts: &Mutex<Vec<std::time::Instant>>,
+        response_bytes: &AtomicUsize,
     ) {
         let connection = match rustls::ServerConnection::new(Arc::clone(config)) {
             Ok(connection) => connection,
@@ -1093,6 +1223,8 @@ pub(crate) mod tls_test_support {
         }
         requests.lock().unwrap().push(target.clone());
         let response = routes
+            .lock()
+            .unwrap()
             .get(target.split('?').next().unwrap_or("/"))
             .cloned()
             .unwrap_or_else(|| Response {
@@ -1112,8 +1244,11 @@ pub(crate) mod tls_test_support {
         }
         headers.push_str("\r\n");
         if stream.write_all(headers.as_bytes()).is_ok() {
-            let _ = stream.write_all(&response.body);
-            let _ = stream.flush();
+            response_bytes.fetch_add(headers.len(), Ordering::SeqCst);
+            if stream.write_all(&response.body).is_ok() {
+                response_bytes.fetch_add(response.body.len(), Ordering::SeqCst);
+                let _ = stream.flush();
+            }
         }
     }
 }

@@ -1513,6 +1513,24 @@ impl PersistentIndex {
         Ok(())
     }
 
+    pub(crate) fn public_collection_binding(
+        &self,
+    ) -> Result<Option<(String, String)>, StorageError> {
+        let _lock = self.lock_shared()?;
+        Ok(self
+            .load_public_collection_locked()?
+            .map(|gate| (gate.policy_sha256, gate.source_id)))
+    }
+
+    pub(crate) fn public_collection_visibility_deadline_ms(
+        &self,
+    ) -> Result<Option<u64>, StorageError> {
+        let _lock = self.lock_shared()?;
+        Ok(self
+            .load_public_collection_locked()?
+            .map(|gate| gate.visible_until_ms))
+    }
+
     pub fn read_view(&self) -> Result<ReadView, StorageError> {
         self.read_view_at(system_time_ms()?)
     }
@@ -2941,7 +2959,10 @@ fn ensure_destination_absent(destination: &Path) -> Result<(), StorageError> {
 }
 
 #[cfg(target_os = "linux")]
-fn rename_directory_noreplace(source: &Path, destination: &Path) -> Result<(), StorageError> {
+pub(crate) fn rename_directory_noreplace(
+    source: &Path,
+    destination: &Path,
+) -> Result<(), StorageError> {
     let source = CString::new(source.as_os_str().as_bytes())
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
     let destination = CString::new(destination.as_os_str().as_bytes())
@@ -2968,7 +2989,10 @@ fn rename_directory_noreplace(source: &Path, destination: &Path) -> Result<(), S
 }
 
 #[cfg(not(target_os = "linux"))]
-fn rename_directory_noreplace(_source: &Path, _destination: &Path) -> Result<(), StorageError> {
+pub(crate) fn rename_directory_noreplace(
+    _source: &Path,
+    _destination: &Path,
+) -> Result<(), StorageError> {
     Err(StorageError::UnsupportedPlatform)
 }
 

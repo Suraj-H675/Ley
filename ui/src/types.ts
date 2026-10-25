@@ -137,6 +137,54 @@ export interface SourceTransparencyResponse {
   source: SourceAttribution;
 }
 
+export type SourceAttributionState =
+  | { kind: "ready"; source: SourceAttribution }
+  | { kind: "error"; code: string; message: string };
+
+export interface SiteWorkspaceStatus {
+  schema: "ley-site-http-status-v1";
+  backend: "controlled_crawler";
+  readOnly: true;
+  source: {
+    id: string;
+    origin: string;
+    allowedPathPrefixes: string[];
+    seedUrls: string[];
+    noticeSha256: string;
+    permissions: {
+      fetchRecorded: boolean;
+      storageRecorded: boolean;
+      indexRecorded: boolean;
+      displayRecorded: boolean;
+    };
+    expiresAtMs: number;
+    lifecycle: string;
+    policyExpired: boolean;
+    retentionExpired: boolean;
+    requestBudget: {
+      persistentUsed: number;
+      persistentLimit: number;
+      persistentRemaining: number;
+      persistentCounterSemantics: string;
+      perInvocationCountersPersisted: boolean;
+    };
+    frontierStateCounts: Record<string, number>;
+    dueWorkCount: number;
+    nextDueMs: number | null;
+    currentlyIndexedLiveUrls: number;
+    removedFrontierUrls: number;
+    pendingOutboxCount: number;
+    rejectedOutboxCount: number;
+  };
+  coverageDefinition: string;
+}
+
+export type WorkspaceStatusState =
+  | { kind: "loading" }
+  | { kind: "not_bound" }
+  | { kind: "ready"; status: SiteWorkspaceStatus; refreshing?: boolean; refreshError?: string }
+  | { kind: "error"; message: string };
+
 export type QuestionSearchState =
   | { kind: "idle" }
   | { kind: "loading"; question: string }

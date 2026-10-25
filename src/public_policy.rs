@@ -9,7 +9,7 @@ use std::{
     os::{fd::AsRawFd, fd::FromRawFd, unix::ffi::OsStrExt, unix::fs::OpenOptionsExt},
 };
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use url::Url;
 
@@ -115,16 +115,55 @@ pub(crate) struct PublicSourcePolicy {
     max_decoded_bytes: usize,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct PermissionEvidence {
+pub(crate) struct PermissionEvidence {
     granted: bool,
     basis: String,
     evidence: String,
     reviewed_at_ms: u64,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SiteSourceSummary {
+    pub id: String,
+    pub origin: String,
+    pub path_prefixes: Vec<String>,
+    pub seed_urls: Vec<String>,
+    pub notice: SiteNoticeSummary,
+    pub permissions: SitePermissionSummary,
+    pub request_limit: u64,
+    pub per_run_request_limit: usize,
+    pub min_origin_delay_ms: u64,
+    pub max_wire_bytes: usize,
+    pub max_decoded_bytes: usize,
+    pub expires_at_ms: u64,
+    pub retention_days: u32,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SiteNoticeSummary {
+    pub file: String,
+    pub sha256: String,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SitePermissionSummary {
+    pub fetch: PermissionEvidence,
+    pub storage: PermissionEvidence,
+    pub index: PermissionEvidence,
+    pub display: PermissionEvidence,
+}
+
 impl PermissionEvidence {
+    pub(crate) fn granted(&self) -> bool {
+        self.granted
+    }
+
     fn to_record(&self) -> crate::storage::PublicPermissionEvidence {
         crate::storage::PublicPermissionEvidence {
             granted: self.granted,
@@ -335,6 +374,39 @@ impl PublicCrawlPolicy {
 
     pub(crate) fn contact(&self) -> &str {
         &self.contact
+    }
+
+    pub(crate) fn site_source_summary(&self) -> Result<SiteSourceSummary, PublicPolicyError> {
+        if self.sources.len() != 1 {
+            return Err(PublicPolicyError::Invalid);
+        }
+        let source = &self.sources[0];
+        let notice = source.notice_bytes()?;
+        let notice_text = std::str::from_utf8(notice).map_err(|_| PublicPolicyError::Invalid)?;
+        Ok(SiteSourceSummary {
+            id: source.id.clone(),
+            origin: source.origin.clone(),
+            path_prefixes: source.path_prefixes.clone(),
+            seed_urls: source.seeds.clone(),
+            notice: SiteNoticeSummary {
+                file: source.notice_file.clone(),
+                sha256: source.notice_sha256.clone(),
+                text: notice_text.to_owned(),
+            },
+            permissions: SitePermissionSummary {
+                fetch: source.fetch_permission.clone(),
+                storage: source.storage_permission.clone(),
+                index: source.index_permission.clone(),
+                display: source.display_permission.clone(),
+            },
+            request_limit: source.max_requests,
+            per_run_request_limit: 12,
+            min_origin_delay_ms: source.min_origin_delay_ms,
+            max_wire_bytes: source.max_wire_bytes,
+            max_decoded_bytes: source.max_decoded_bytes,
+            expires_at_ms: source.expires_at_ms,
+            retention_days: source.retention_days,
+        })
     }
 
     pub(crate) fn collection_gate(

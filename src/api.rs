@@ -5,6 +5,7 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderName, Method, Request, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use axum::{Json, Router};
@@ -19,6 +20,7 @@ use crate::retrieval::{
     EvidenceResolveError, RetrievalError, RetrievalRequest, SOURCE_TRANSPARENCY_CONTRACT_VERSION,
     SourceTransparencyRequest,
 };
+use crate::site_workspace::SiteWorkspace;
 use crate::storage::{PersistentIndex, ReadView, StorageError};
 
 pub const DEFAULT_BIND: SocketAddr =
@@ -33,6 +35,7 @@ const MAX_STORAGE_WORKERS: usize = 1;
 #[derive(Clone)]
 struct ApiState {
     index: Arc<PersistentIndex>,
+    workspace: Option<Arc<SiteWorkspace>>,
     port: u16,
     storage_work: Arc<Semaphore>,
 }
@@ -226,6 +229,27 @@ pub fn run(store_path: impl AsRef<Path>, bind: SocketAddr) -> Result<(), String>
         PersistentIndex::open(store_path)
             .map_err(|_| "could not open the index store".to_owned())?,
     );
+    serve_index(index, None, bind)
+}
+
+pub fn run_workspace(workspace_path: impl AsRef<Path>, bind: SocketAddr) -> Result<(), String> {
+    if !bind.ip().is_loopback() {
+        return Err("API binding must use a loopback address".to_owned());
+    }
+    let workspace = Arc::new(SiteWorkspace::open(workspace_path)?);
+    workspace.status_json()?;
+    let index = Arc::new(
+        PersistentIndex::open(workspace.store_path())
+            .map_err(|_| "could not open the workspace index store".to_owned())?,
+    );
+    serve_index(index, Some(workspace), bind)
+}
+
+fn serve_index(
+    index: Arc<PersistentIndex>,
+    workspace: Option<Arc<SiteWorkspace>>,
+    bind: SocketAddr,
+) -> Result<(), String> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -234,7 +258,10 @@ pub fn run(store_path: impl AsRef<Path>, bind: SocketAddr) -> Result<(), String>
         let listener = tokio::net::TcpListener::bind(bind)
             .await
             .map_err(|_| "could not bind the loopback API listener".to_owned())?;
-        let app = router(index, bind.port());
+        let app = match workspace {
+            Some(workspace) => router_with_workspace(index, Some(workspace), bind.port()),
+            None => router(index, bind.port()),
+        };
         axum::serve(listener, app)
             .await
             .map_err(|_| "the API listener stopped unexpectedly".to_owned())
@@ -283,14 +310,24 @@ fn serialize_client_response<T: Serialize>(response: &T) -> Result<String, Clien
 }
 
 fn router(index: Arc<PersistentIndex>, port: u16) -> Router {
+    router_with_workspace(index, None, port)
+}
+
+fn router_with_workspace(
+    index: Arc<PersistentIndex>,
+    workspace: Option<Arc<SiteWorkspace>>,
+    port: u16,
+) -> Router {
     router_with_state(ApiState {
         index,
+        workspace,
         port,
         storage_work: Arc::new(Semaphore::new(MAX_STORAGE_WORKERS)),
     })
 }
 
 fn router_with_state(state: ApiState) -> Router {
+    let policy_state = state.clone();
     Router::new()
         .route("/api/health", any(health))
         .route("/api/search", any(search))
@@ -298,8 +335,33 @@ fn router_with_state(state: ApiState) -> Router {
         .route("/api/v1/evidence/resolve", any(resolve_evidence_v1))
         .route("/api/v1/evidence/inspect", any(inspect_evidence_v1))
         .route("/api/v1/evidence/source", any(source_transparency_v1))
+        .route("/api/v1/workspace/status", any(workspace_status))
         .fallback(not_found)
         .with_state(state)
+        .layer(middleware::from_fn_with_state(
+            policy_state,
+            workspace_policy_guard,
+        ))
+}
+
+async fn workspace_policy_guard(
+    State(state): State<ApiState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let Some(workspace) = state.workspace.clone() else {
+        return next.run(request).await;
+    };
+    let result = tokio::task::spawn_blocking(move || workspace.policy_binding_is_current()).await;
+    match result {
+        Ok(Ok(())) => next.run(request).await,
+        _ => no_store_json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &ApiError {
+                error: "workspace_policy_binding_changed",
+            },
+        ),
+    }
 }
 
 async fn health(State(state): State<ApiState>, request: Request<Body>) -> Response {
@@ -313,6 +375,33 @@ async fn health(State(state): State<ApiState>, request: Request<Body>) -> Respon
         return method_not_allowed();
     }
     (StatusCode::OK, Json(serde_json::json!({ "status": "ok" }))).into_response()
+}
+
+async fn workspace_status(State(state): State<ApiState>, request: Request<Body>) -> Response {
+    if let Some(error) = validate_local_authority(&request, state.port, false) {
+        return local_authority_error(error);
+    }
+    if !request_body_is_empty(&request) {
+        return body_not_allowed();
+    }
+    if request.method() != Method::GET {
+        return method_not_allowed_for("GET");
+    }
+    if request.uri().query().is_some() {
+        return ClientFailure::InvalidRequest.response();
+    }
+    let Some(workspace) = state.workspace.clone() else {
+        return no_store_json(StatusCode::NOT_FOUND, &ApiError { error: "not_found" });
+    };
+    match run_storage(state, move |_| workspace.http_status_json()).await {
+        Ok(Ok(status)) => no_store_json(StatusCode::OK, &status),
+        _ => no_store_json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &ApiError {
+                error: "workspace_status_unavailable",
+            },
+        ),
+    }
 }
 
 async fn search(State(state): State<ApiState>, request: Request<Body>) -> Response {
@@ -1647,6 +1736,7 @@ mod tests {
         let (_temp, store, _) = populated_index();
         let state = super::ApiState {
             index: Arc::new(store),
+            workspace: None,
             port: DEFAULT_BIND.port(),
             storage_work: Arc::new(tokio::sync::Semaphore::new(0)),
         };

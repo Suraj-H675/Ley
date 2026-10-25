@@ -8,6 +8,7 @@
     "dev": "npm run build && node scripts/dev-server.mjs",
     "build": "tsc --noEmit -p tsconfig.json && node scripts/build.mjs",
     "verify:browser": "node scripts/verify-browser.mjs",
+    "verify:expiry-ui": "npm run build && node scripts/verify-expiry-ui.mjs",
     "verify:e2e": "node scripts/verify-http-e2e.mjs"
   },
   "dependencies": {

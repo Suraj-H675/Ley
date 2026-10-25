@@ -23,6 +23,7 @@ mod query;
 pub mod retrieval;
 mod robots;
 mod safe_fetch;
+mod site_workspace;
 pub mod storage;
 pub mod url_key;
 
@@ -65,6 +66,17 @@ pub fn run_fixture_collection(args: &[String]) -> Result<String, String> {
     local_collection::run_cli(args)
 }
 
+pub fn run_site_workspace_cli(args: &[String]) -> Result<(String, bool), String> {
+    let output = site_workspace::run_cli(args)?;
+    Ok((output.json, output.success))
+}
+
+pub fn resolve_site_workspace_store(
+    workspace_path: impl AsRef<std::path::Path>,
+) -> Result<std::path::PathBuf, String> {
+    site_workspace::selected_store_path(workspace_path)
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub struct PublicCrawlOutput {
     pub report_json: String,
@@ -94,6 +106,41 @@ pub fn run_public_crawl(
     .map_err(|_| {
         "bounded public crawl stopped; inspect the private frontier event log".to_owned()
     })?;
+    public_crawl_output(policy, request_count, result)
+}
+
+#[cfg(test)]
+pub(crate) fn run_public_crawl_with_owned_fixture(
+    policy: &public_policy::PublicCrawlPolicy,
+    index_path: impl AsRef<std::path::Path>,
+    frontier_path: impl AsRef<std::path::Path>,
+    request_count: usize,
+    approved_policy_sha256: &str,
+    fixture: safe_fetch::OwnedFixtureTls,
+    now_ms: u64,
+) -> Result<PublicCrawlOutput, String> {
+    if !policy.matches_sha256(approved_policy_sha256) {
+        return Err("public crawl policy hash does not match the approved digest".to_owned());
+    }
+    let result = controlled_crawler::run_public_crawl_with_owned_fixture(
+        index_path.as_ref(),
+        frontier_path.as_ref(),
+        policy,
+        request_count,
+        fixture,
+        now_ms,
+    )
+    .map_err(|_| {
+        "bounded public crawl stopped; inspect the private frontier event log".to_owned()
+    })?;
+    public_crawl_output(policy, request_count, result)
+}
+
+fn public_crawl_output(
+    policy: &public_policy::PublicCrawlPolicy,
+    request_count: usize,
+    result: controlled_crawler::BoundedCrawlResult,
+) -> Result<PublicCrawlOutput, String> {
     let report = &result.report;
     let output = serde_json::json!({
         "schema": "ley-public-crawl-report-v1",

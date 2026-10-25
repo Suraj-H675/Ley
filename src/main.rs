@@ -50,8 +50,30 @@ fn main() -> ExitCode {
             }
         };
     }
+    if command == "site" {
+        let site_args = args.collect::<Vec<_>>();
+        if let Some(help) = site_command_help(&site_args) {
+            println!("{help}");
+            return ExitCode::SUCCESS;
+        }
+        return match ley::run_site_workspace_cli(&site_args) {
+            Ok((output, success)) => {
+                println!("{output}");
+                if success {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::FAILURE
+                }
+            }
+            Err(error) => {
+                eprintln!("ley: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     if command == "serve" {
         let mut store = None;
+        let mut workspace = None;
         let mut bind = ley::api::DEFAULT_BIND;
         while let Some(argument) = args.next() {
             match argument.as_str() {
@@ -61,6 +83,13 @@ fn main() -> ExitCode {
                         return ExitCode::from(2);
                     };
                     store = Some(value);
+                }
+                "--workspace" if workspace.is_none() => {
+                    let Some(value) = args.next() else {
+                        eprintln!("--workspace requires a site workspace path");
+                        return ExitCode::from(2);
+                    };
+                    workspace = Some(value);
                 }
                 "--bind" => {
                     let Some(value) = args.next() else {
@@ -82,11 +111,15 @@ fn main() -> ExitCode {
                 }
             }
         }
-        let Some(store) = store else {
-            eprintln!("serve requires --store PATH");
+        if store.is_some() == workspace.is_some() {
+            eprintln!("serve requires exactly one of --store PATH or --workspace PATH");
             return ExitCode::from(2);
+        }
+        let result = match workspace {
+            Some(workspace) => ley::api::run_workspace(workspace, bind),
+            None => ley::api::run(store.unwrap(), bind),
         };
-        return match ley::api::run(store, bind) {
+        return match result {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("ley: {error}");
@@ -96,20 +129,26 @@ fn main() -> ExitCode {
     }
     if command == "mcp" {
         let mut store = None;
+        let mut workspace = None;
         while let Some(argument) = args.next() {
             match argument.as_str() {
                 "--store" if store.is_none() => store = args.next(),
+                "--workspace" if workspace.is_none() => workspace = args.next(),
                 _ => {
-                    eprintln!("mcp accepts only --store PATH");
+                    eprintln!("mcp accepts one of --store PATH or --workspace PATH");
                     return ExitCode::from(2);
                 }
             }
         }
-        let Some(store) = store else {
-            eprintln!("mcp requires --store PATH");
+        if store.is_some() == workspace.is_some() {
+            eprintln!("mcp requires exactly one of --store PATH or --workspace PATH");
             return ExitCode::from(2);
+        }
+        let result = match workspace {
+            Some(workspace) => ley::mcp::run_workspace(workspace),
+            None => ley::mcp::run(store.unwrap()),
         };
-        return match ley::mcp::run(store) {
+        return match result {
             Ok(()) => ExitCode::SUCCESS,
             Err(_) => {
                 eprintln!("ley mcp: configured store or stdio service is unavailable");
@@ -140,10 +179,12 @@ fn main() -> ExitCode {
     }
     if command == "search" {
         let mut store = None;
+        let mut workspace = None;
         let mut query = None;
         while let Some(argument) = args.next() {
             match argument.as_str() {
                 "--store" if store.is_none() => store = args.next(),
+                "--workspace" if workspace.is_none() => workspace = args.next(),
                 "--query" if query.is_none() => query = args.next(),
                 _ => {
                     eprintln!("unknown or repeated search argument: {argument:?}");
@@ -152,10 +193,17 @@ fn main() -> ExitCode {
                 }
             }
         }
-        let (Some(store), Some(query)) = (store, query) else {
-            eprintln!("search requires --store PATH and --query EXPR");
+        let Some(query) = query else {
+            eprintln!("search requires --store PATH or --workspace PATH and --query EXPR");
             print_usage();
             return ExitCode::from(2);
+        };
+        let store = match choose_store(store, workspace, "search") {
+            Ok(store) => store,
+            Err(error) => {
+                eprintln!("ley: {error}");
+                return ExitCode::from(2);
+            }
         };
         return match ley::api::search_store_json(store, &query) {
             Ok(response) => {
@@ -594,11 +642,13 @@ fn run_ingest_html(mut args: impl Iterator<Item = String>) -> ExitCode {
 
 fn run_retrieve(mut args: impl Iterator<Item = String>) -> ExitCode {
     let mut store = None;
+    let mut workspace = None;
     let mut question = None;
     let mut max_hits = None;
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--store" if store.is_none() => store = args.next(),
+            "--workspace" if workspace.is_none() => workspace = args.next(),
             "--question" if question.is_none() => question = args.next(),
             "--max-hits" if max_hits.is_none() => {
                 let Some(value) = args.next() else {
@@ -620,10 +670,17 @@ fn run_retrieve(mut args: impl Iterator<Item = String>) -> ExitCode {
             }
         }
     }
-    let (Some(store), Some(question)) = (store, question) else {
-        eprintln!("retrieve requires --store PATH and --question TEXT");
+    let Some(question) = question else {
+        eprintln!("retrieve requires --store PATH or --workspace PATH and --question TEXT");
         print_usage();
         return ExitCode::from(2);
+    };
+    let store = match choose_store(store, workspace, "retrieve") {
+        Ok(store) => store,
+        Err(error) => {
+            eprintln!("ley: {error}");
+            return ExitCode::from(2);
+        }
     };
     let request = match max_hits {
         Some(max_hits) => match QuestionRequest::new(question).with_max_hits(max_hits) {
@@ -649,10 +706,12 @@ fn run_retrieve(mut args: impl Iterator<Item = String>) -> ExitCode {
 
 fn run_resolve_evidence(mut args: impl Iterator<Item = String>) -> ExitCode {
     let mut store = None;
+    let mut workspace = None;
     let mut reference_file = None;
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--store" if store.is_none() => store = args.next(),
+            "--workspace" if workspace.is_none() => workspace = args.next(),
             "--reference-file" if reference_file.is_none() => reference_file = args.next(),
             _ => {
                 eprintln!("unknown or repeated resolve-evidence argument: {argument:?}");
@@ -661,10 +720,19 @@ fn run_resolve_evidence(mut args: impl Iterator<Item = String>) -> ExitCode {
             }
         }
     }
-    let (Some(store), Some(reference_file)) = (store, reference_file) else {
-        eprintln!("resolve-evidence requires --store PATH and --reference-file PATH|-");
+    let Some(reference_file) = reference_file else {
+        eprintln!(
+            "resolve-evidence requires --store PATH or --workspace PATH and --reference-file PATH|-"
+        );
         print_usage();
         return ExitCode::from(2);
+    };
+    let store = match choose_store(store, workspace, "resolve-evidence") {
+        Ok(store) => store,
+        Err(error) => {
+            eprintln!("ley: {error}");
+            return ExitCode::from(2);
+        }
     };
     let reference = match read_evidence_reference(&reference_file) {
         Ok(reference) => reference,
@@ -682,6 +750,22 @@ fn run_resolve_evidence(mut args: impl Iterator<Item = String>) -> ExitCode {
             eprintln!("ley: {}", error.code());
             ExitCode::FAILURE
         }
+    }
+}
+
+fn choose_store(
+    store: Option<String>,
+    workspace: Option<String>,
+    command: &str,
+) -> Result<String, String> {
+    match (store, workspace) {
+        (Some(store), None) => Ok(store),
+        (None, Some(workspace)) => ley::resolve_site_workspace_store(workspace)
+            .map(|path| path.display().to_string())
+            .map_err(|error| format!("{command}: {error}")),
+        _ => Err(format!(
+            "{command} requires exactly one of --store PATH or --workspace PATH"
+        )),
     }
 }
 
@@ -708,13 +792,41 @@ fn read_evidence_reference(path: &str) -> Result<EvidenceReference, ley::api::Cl
 
 fn print_usage() {
     println!(
-        "Ley Search Engine\n\nUsage:\n  cargo run --locked -- demo [--query EXPR] [--explain]\n  cargo run --locked -- controlled-demo [--retain-dir NEW_PATH]\n  cargo run --locked -- fixture-index --store PATH\n  cargo run --locked -- ingest-html --store NEW_PATH --directory DIR --url-prefix URL\n  cargo run --locked -- retrieve --store PATH --question TEXT [--max-hits 1..8]\n  cargo run --locked -- resolve-evidence --store PATH --reference-file PATH|-\n  cargo run --locked -- search --store PATH --query EXPR\n  cargo run --locked -- serve --store PATH [--bind 127.0.0.1:7331]\n  cargo run --locked -- compact --store PATH\n  cargo run --locked -- reindex-gate3 --source OLD --destination NEW\n  cargo run --locked -- revoke-source --store PATH --frontier PATH --source-id ID\n  cargo run --locked -- policy validate --policy PATH --approved-policy-sha256 HASH\n  cargo run --locked -- crawl-public --policy PATH --store PATH --frontier PATH --requests 1..12 --approved-policy-sha256 HASH --allow-public-requests\n\nThe controlled demo uses an owned loopback fixture; --retain-dir keeps its persistent index and frontier under a new directory. fixture-index creates authored synthetic documents without network access. ingest-html reads bounded UTF-8 HTML from an operator-selected local directory into a new store and does not fetch URLs. retrieve runs the versioned ordinary-question contract and prints typed passage candidates; resolve-evidence reads a bounded JSON reference from a file or stdin and revalidates it against the current store. search remains the advanced Boolean/phrase DSL. serve binds to loopback and exposes read-only health, legacy search, question retrieval, passage resolution, and bounded indexed-document inspection routes. Typed routes use POST /api/v1/retrieve, POST /api/v1/evidence/resolve, and POST /api/v1/evidence/inspect. The Gate 6 store appends immutable segments and compacts them explicitly; some aggregate segment limits recommend compact when merging can help, while live-corpus and retained lifecycle-history limits do not because compaction cannot reduce them. reindex-gate3 copies a stopped Gate 3 store to a separate destination and preserves the source bytes. policy validate checks one enabled source and its notice without network or store access. crawl-public sends bounded public requests only with an enabled reviewed policy, its exact approval digest, and explicit request opt-in. Search queries support terms, phrases, AND, OR, and implicit AND."
+        "Ley Search Engine\n\nUsage:\n  cargo run --locked -- demo [--query EXPR] [--explain]\n  cargo run --locked -- controlled-demo [--retain-dir NEW_PATH]\n  cargo run --locked -- fixture-index --store PATH\n  cargo run --locked -- ingest-html --store NEW_PATH --directory DIR --url-prefix URL\n  cargo run --locked -- site init --workspace NEW_DIR --policy PATH --approved-policy-sha256 HASH\n  cargo run --locked -- site run --workspace PATH --requests 1..12 --allow-public-requests\n  cargo run --locked -- site status --workspace PATH\n  cargo run --locked -- site revoke --workspace PATH\n  cargo run --locked -- retrieve --store PATH|--workspace PATH --question TEXT [--max-hits 1..8]\n  cargo run --locked -- resolve-evidence --store PATH|--workspace PATH --reference-file PATH|-\n  cargo run --locked -- search --store PATH|--workspace PATH --query EXPR\n  cargo run --locked -- serve --store PATH|--workspace PATH [--bind 127.0.0.1:7331]\n  cargo run --locked -- compact --store PATH\n  cargo run --locked -- reindex-gate3 --source OLD --destination NEW\n  cargo run --locked -- revoke-source --store PATH --frontier PATH --source-id ID\n  cargo run --locked -- policy validate --policy PATH --approved-policy-sha256 HASH\n  cargo run --locked -- crawl-public --policy PATH --store PATH --frontier PATH --requests 1..12 --approved-policy-sha256 HASH --allow-public-requests\n\nThe controlled demo uses an owned loopback fixture; --retain-dir keeps its persistent index and frontier under a new directory. fixture-index creates authored synthetic documents without network access. ingest-html reads bounded UTF-8 HTML from an operator-selected local directory into a new store and does not fetch URLs. site init validates and pins one approved policy, admits its seeds, and creates a private workspace without sending requests; site run resumes the durable frontier only with explicit public request opt-in. site status reports persisted budgets and bounded coverage counters. site revoke uses the existing source revocation path. retrieve runs the versioned ordinary-question contract and prints typed passage candidates; resolve-evidence reads a bounded JSON reference from a file or stdin and revalidates it against the current store. search remains the advanced Boolean/phrase DSL. serve binds to loopback and exposes read-only health, search, retrieval, passage resolution, indexed-document inspection, and (for --workspace only) the selected workspace status route. The Gate 6 store appends immutable segments and compacts them explicitly; some aggregate segment limits recommend compact when merging can help, while live-corpus and retained lifecycle-history limits do not because compaction cannot reduce them. reindex-gate3 copies a stopped Gate 3 store to a separate destination and preserves the source bytes. policy validate checks one enabled source and its notice without network or store access. crawl-public sends bounded public requests only with an enabled reviewed policy, its exact approval digest, and explicit request opt-in. Search queries support terms, phrases, AND, OR, and implicit AND."
     );
     println!(
         "  cargo run --locked -- local-collection init --store NEW_PATH --directory DIR --url-prefix URL\n  cargo run --locked -- local-collection sync --store PATH --directory DIR --url-prefix URL\n  cargo run --locked -- local-collection status --store PATH\n\nManaged local collection initialization and sync are offline. The caller is responsible for rights to retain supplied content. HTTP(S) URLs are document identities only and are never fetched."
     );
     println!(
-        "  cargo run --locked -- crawl-status --store PATH --frontier PATH [--source-id ID] [--fixture-clock PATH] [--include-url-inventory]\n  cargo run --locked -- fixture-collection init --root NEW_DIR --profile seed-only|link-discovery|extra-seeds [--port PORT]\n  cargo run --locked -- fixture-collection run --root DIR --revision v1|v2 [--advance-ms N]\n  cargo run --locked -- fixture-collection revoke --root DIR"
+        "  cargo run --locked -- crawl-status --store PATH --frontier PATH [--source-id ID] [--fixture-clock PATH] [--include-url-inventory]\n  cargo run --locked -- fixture-collection init --root NEW_DIR --profile seed-only|link-discovery|extra-seeds [--port PORT] [--path-prefix PATH]\n  cargo run --locked -- fixture-collection run --root DIR --revision v1|v2 [--advance-ms N] [--requests 1..96]\n  cargo run --locked -- fixture-collection revoke --root DIR"
     );
-    println!("  cargo run --locked -- mcp --store PATH  (read-only MCP stdio server)");
+    println!(
+        "  cargo run --locked -- mcp --store PATH|--workspace PATH  (read-only MCP stdio server)"
+    );
+}
+
+fn site_command_help(args: &[String]) -> Option<&'static str> {
+    if args.len() == 1 && matches!(args[0].as_str(), "-h" | "--help") {
+        return Some(
+            "Site-to-evidence workflow\n\nUsage:\n  ley site init --workspace NEW_DIR --policy PATH --approved-policy-sha256 HASH\n  ley site run --workspace PATH --requests 1..12 --allow-public-requests\n  ley site status --workspace PATH\n  ley site revoke --workspace PATH\n\n`init` validates one already-reviewed source policy and its notice offline, then creates a new private workspace with the fixed store and durable frontier. It sends no requests. The supplied SHA-256 pins the exact policy bytes; a digest does not establish permission.\n\n`run` resumes that frontier for at most 1 to 12 requests. Every invocation requires `--allow-public-requests` and current policy permissions. A bounded partial run exits successfully and reports whether due work remains. Run it again to resume without resetting the persistent source budget.\n\n`status` reports source scope, recorded permissions, expiry, persistent budget, frontier, failures, and currently indexed live pages. It does not claim full site coverage.\n\n`revoke` uses the controlled crawler's source-revocation path so old references stop resolving. Immutable historical generations may retain bytes.\n\nBefore init, validate the exact reviewed policy with `ley policy validate --policy PATH --approved-policy-sha256 HASH`. Compute the digest from those exact bytes (for example, `sha256sum PATH`) and compare it with the independently approved value. Review the policy notice and permissions; Ley does not determine legal rights.",
+        );
+    }
+    if args.len() == 2 && matches!(args[1].as_str(), "-h" | "--help") {
+        return match args[0].as_str() {
+            "init" => Some(
+                "Usage: ley site init --workspace NEW_DIR --policy PATH --approved-policy-sha256 HASH\n\nRequires one current, enabled, reviewed source policy with its verified sibling notice. Checks the exact SHA-256, source scope, recorded fetch/storage/index/display permissions, expiry, and budget. Creates a new private workspace and admits only the policy's seeds. Performs no network request. Never reuses or overwrites an existing workspace.",
+            ),
+            "run" => Some(
+                "Usage: ley site run --workspace PATH --requests 1..12 --allow-public-requests\n\nThe explicit opt-in is required on every invocation. The selected policy digest, source notice, permissions, and expiry are rechecked before the controlled crawler resumes its persisted frontier. The request bound is per invocation; the persistent source budget is never reset. A bounded partial run exits successfully and reports its stop reason and remaining due work.",
+            ),
+            "status" => Some(
+                "Usage: ley site status --workspace PATH\n\nReads only the workspace's fixed policy, store, and frontier. Reports source scope, recorded permissions, expiry, persistent budget, frontier, live indexed evidence, and bounded failure details. Due work is not a claim that every item will be fetched; unlinked pages are not counted.",
+            ),
+            "revoke" => Some(
+                "Usage: ley site revoke --workspace PATH\n\nRevokes the workspace source through the existing controlled-crawler path. Current evidence references stop resolving. Immutable historical generations may retain bytes.",
+            ),
+            _ => None,
+        };
+    }
+    None
 }

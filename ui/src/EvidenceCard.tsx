@@ -1,6 +1,5 @@
-import { useEffect, useRef, useState, type SyntheticEvent } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
-  getSourceTransparency,
   inspectDocumentPage,
   messageForQuestionError,
   QuestionApiError,
@@ -10,25 +9,96 @@ import {
 import type {
   DocumentInspectionState,
   EvidenceHit,
-  EvidenceReference,
   RevalidationState,
   SourceAttribution,
+  SourceAttributionState,
 } from "./types";
 
-export function EvidenceCard({ hit }: { hit: EvidenceHit }) {
+const terminalEvidenceErrorCodes = new Set([
+  "malformed_reference",
+  "wrong_store",
+  "not_live",
+  "revoked",
+  "version_superseded",
+  "public_collection_expired",
+]);
+
+export function EvidenceCard({
+  hit,
+  sourceState,
+  onRetrySource,
+}: {
+  hit: EvidenceHit;
+  sourceState: SourceAttributionState;
+  onRetrySource: () => void;
+}) {
   const [revalidation, setRevalidation] = useState<RevalidationState>({ kind: "idle" });
   const [inspection, setInspection] = useState<DocumentInspectionState>({ kind: "closed" });
+  const [sourceExpired, setSourceExpired] = useState(false);
   const controller = useRef<AbortController | null>(null);
   const inspectionController = useRef<AbortController | null>(null);
   const requestedHref = safeResultUrl(hit.requested_url);
   const effectiveHref = safeResultUrl(hit.effective_url);
+  const hasSourceNotice = sourceState.kind === "ready" && sourceState.source.kind === "operator_source";
+  const referenceInvalidated = (revalidation.kind === "error" && terminalEvidenceErrorCodes.has(revalidation.code))
+    || (inspection.kind === "error" && terminalEvidenceErrorCodes.has(inspection.code));
+  const terminalErrorMessage = revalidation.kind === "error" && terminalEvidenceErrorCodes.has(revalidation.code)
+    ? messageForInvalidatedEvidence(revalidation.code, hasSourceNotice)
+    : inspection.kind === "error" && terminalEvidenceErrorCodes.has(inspection.code)
+      ? messageForInvalidatedEvidence(inspection.code, hasSourceNotice)
+      : sourceState.kind === "error" && terminalEvidenceErrorCodes.has(sourceState.code)
+        ? sourceState.message
+        : null;
+  const hiddenSourceMessage = terminalErrorMessage
+    ?? (sourceExpired
+      ? messageForInvalidatedEvidence("public_collection_expired", true)
+      : sourceState.kind === "ready" && sourceState.source.kind === "attribution_withheld"
+        ? "Source attribution is withheld. Source details and extracted text remain hidden."
+        : "Current source disclosure could not be checked, so source details and extracted text remain hidden.");
+  const sourceVisible = sourceState.kind === "ready"
+    && sourceState.source.kind !== "attribution_withheld"
+    && !sourceExpired
+    && !referenceInvalidated;
 
   useEffect(() => () => {
     controller.current?.abort();
     inspectionController.current?.abort();
   }, []);
 
+  useEffect(() => {
+    if (sourceState.kind !== "ready" || sourceState.source.kind !== "operator_source") return;
+    const deadline = sourceState.source.visible_until_ms;
+    let timer: number | undefined;
+    const scheduleExpiry = () => {
+      window.clearTimeout(timer);
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        controller.current?.abort();
+        inspectionController.current?.abort();
+        setInspection({ kind: "closed" });
+        setRevalidation({
+          kind: "error",
+          code: "public_collection_expired",
+          message: messageForInvalidatedEvidence("public_collection_expired", true),
+        });
+        setSourceExpired(true);
+        return;
+      }
+      timer = window.setTimeout(scheduleExpiry, Math.min(remaining, 2_147_000_000));
+    };
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") scheduleExpiry();
+    };
+    scheduleExpiry();
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      window.clearTimeout(timer);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
+  }, [sourceState]);
+
   async function revalidate() {
+    if (!sourceVisible) return;
     controller.current?.abort();
     const current = new AbortController();
     controller.current = current;
@@ -39,11 +109,22 @@ export function EvidenceCard({ hit }: { hit: EvidenceHit }) {
     } catch (error) {
       if (current.signal.aborted) return;
       const code = error instanceof QuestionApiError ? error.code : "storage_fault";
-      setRevalidation({ kind: "error", code, message: error instanceof QuestionApiError ? error.message : messageForQuestionError(code) });
+      if (terminalEvidenceErrorCodes.has(code)) {
+        inspectionController.current?.abort();
+        setInspection({ kind: "closed" });
+      }
+      setRevalidation({
+        kind: "error",
+        code,
+        message: terminalEvidenceErrorCodes.has(code)
+          ? messageForInvalidatedEvidence(code, hasSourceNotice)
+          : error instanceof QuestionApiError ? error.message : messageForQuestionError(code),
+      });
     }
   }
 
   async function loadInspectionPage(offsetByte: number, previousText: string, previousTotal?: number) {
+    if (!sourceVisible) return;
     inspectionController.current?.abort();
     const current = new AbortController();
     inspectionController.current = current;
@@ -66,48 +147,69 @@ export function EvidenceCard({ hit }: { hit: EvidenceHit }) {
     } catch (error) {
       if (current.signal.aborted) return;
       const code = error instanceof QuestionApiError ? error.code : "storage_fault";
-      setInspection({ kind: "error", code, message: error instanceof QuestionApiError ? error.message : messageForQuestionError(code) });
+      if (terminalEvidenceErrorCodes.has(code)) controller.current?.abort();
+      setInspection({
+        kind: "error",
+        code,
+        message: terminalEvidenceErrorCodes.has(code)
+          ? messageForInvalidatedEvidence(code, hasSourceNotice)
+          : error instanceof QuestionApiError ? error.message : messageForQuestionError(code),
+      });
     }
   }
 
-  const passageText = revalidation.kind === "current"
+  const passageText = !sourceVisible
+    ? null
+    : revalidation.kind === "current"
     ? revalidation.evidence.text
     : revalidation.kind === "idle"
       ? hit.passage.text
       : null;
-  const passageState = revalidation.kind === "current"
-    ? "Resolved from current index state for this request"
+  const passageState = sourceExpired
+      ? "Source visibility period ended · passage hidden"
+      : sourceState.kind === "error"
+        ? "Source disclosure unavailable · passage hidden"
+        : sourceState.kind === "ready" && sourceState.source.kind === "attribution_withheld"
+          ? "Source attribution withheld · passage hidden"
     : revalidation.kind === "loading"
       ? "Checking current index state"
       : revalidation.kind === "error"
         ? "Revalidation failed · prior text hidden"
-        : "Retrieved text · not revalidated";
+        : revalidation.kind === "current"
+          ? "Resolved from current index state for this request"
+          : "Retrieved text · not revalidated";
 
   return (
     <article className="result-card evidence-card">
-      <div className="evidence-topline">
-        <div className="result-url-wrap">
-          {requestedHref && <span className="url-mark" aria-hidden="true">↗</span>}
-          {requestedHref ? (
-            <a className="result-url" href={requestedHref} target="_blank" rel="noopener noreferrer" aria-label="Open external source address; this address is not checked against the indexed text">Open external address · {hit.requested_url}</a>
-          ) : (
-            <span className="result-url source-identity">Indexed identity: {hit.requested_url}</span>
+      {sourceVisible ? (
+        <>
+          <div className="evidence-topline">
+            <div className="result-url-wrap">
+              {requestedHref && <span className="url-mark" aria-hidden="true">↗</span>}
+              {requestedHref ? (
+                <a className="result-url" href={requestedHref} target="_blank" rel="noopener noreferrer" aria-label="Open external source address; this address is not checked against the indexed text">Open external address · {hit.requested_url}</a>
+              ) : (
+                <span className="result-url source-identity">Indexed identity: {hit.requested_url}</span>
+              )}
+            </div>
+            <span className="candidate-label">Lexical candidate</span>
+          </div>
+          <h3 className="result-title">
+            {requestedHref
+              ? <a href={requestedHref} target="_blank" rel="noopener noreferrer">{hit.title || "Untitled document"}</a>
+              : (hit.title || "Untitled document")}
+          </h3>
+          {hit.effective_url !== hit.requested_url && (
+            <p className="effective-url">
+              Effective identity: {effectiveHref
+                ? <a href={effectiveHref} target="_blank" rel="noopener noreferrer" aria-label="Open effective external address; this address is not checked against the indexed text">Open external address · {hit.effective_url}</a>
+                : <span className="source-identity">{hit.effective_url}</span>}
+            </p>
           )}
-        </div>
-        <span className="candidate-label">Lexical candidate</span>
-      </div>
-      <h3 className="result-title">
-        {requestedHref
-          ? <a href={requestedHref} target="_blank" rel="noopener noreferrer">{hit.title || "Untitled document"}</a>
-          : (hit.title || "Untitled document")}
-      </h3>
-      {hit.effective_url !== hit.requested_url && (
-        <p className="effective-url">
-          Effective identity: {effectiveHref
-            ? <a href={effectiveHref} target="_blank" rel="noopener noreferrer" aria-label="Open effective external address; this address is not checked against the indexed text">Open external address · {hit.effective_url}</a>
-            : <span className="source-identity">{hit.effective_url}</span>}
-        </p>
-      )}
+        </>
+      ) : sourceState.kind === "ready" && sourceState.source.kind === "attribution_withheld" && inspection.kind === "closed" ? (
+        <p className="verification-message" role="status">{hiddenSourceMessage}</p>
+      ) : null}
 
       {inspection.kind === "closed" && (
         <>
@@ -115,9 +217,22 @@ export function EvidenceCard({ hit }: { hit: EvidenceHit }) {
             <strong>Extracted passage</strong>
             <span>{passageState}</span>
           </div>
+          {sourceState.kind === "ready" && sourceVisible && (
+            <SourceAttributionView source={sourceState.source} />
+          )}
+          {sourceState.kind === "error" && (
+            <div className="source-error" role="alert">
+              <p>{sourceState.message} <span className="error-code">{sourceState.code}</span></p>
+              {terminalEvidenceErrorCodes.has(sourceState.code)
+                ? <p>Search again for current evidence; this reference cannot be checked again.</p>
+                : <button type="button" onClick={onRetrySource}>Check source again</button>}
+            </div>
+          )}
           {passageText !== null
             ? <p className="evidence-passage">{passageText}</p>
-            : <p className="verification-message" role="alert">{revalidation.kind === "error" ? revalidation.message : "Passage text is unavailable."}</p>}
+            : sourceState.kind === "error" || sourceState.kind === "ready" && sourceState.source.kind === "attribution_withheld"
+              ? null
+              : <p className="verification-message" role="alert">{revalidation.kind === "error" ? revalidation.message : hiddenSourceMessage}</p>}
         </>
       )}
 
@@ -127,7 +242,7 @@ export function EvidenceCard({ hit }: { hit: EvidenceHit }) {
       {inspection.kind === "error" && (
         <p className="verification-message" role="alert">{inspection.message} <span className="error-code">{inspection.code}</span></p>
       )}
-      {inspection.kind === "ready" && (
+      {inspection.kind === "ready" && sourceVisible && (
         <section className="indexed-document" aria-label="Local indexed extracted text">
           <div className="passage-heading">
             <strong>Local indexed extracted text</strong>
@@ -141,21 +256,25 @@ export function EvidenceCard({ hit }: { hit: EvidenceHit }) {
             <div><dt>Indexed title</dt><dd>{inspection.page.title || "Untitled document"}</dd></div>
             <div><dt>Extracted body bytes</dt><dd>{new TextEncoder().encode(inspection.text).byteLength.toLocaleString()} of {inspection.page.total_bytes.toLocaleString()}</dd></div>
           </dl>
+          {sourceState.kind === "ready" && sourceVisible && <SourceAttributionView source={sourceState.source} />}
           <pre className="indexed-document-text" tabIndex={0} aria-label="Current indexed extracted text">{inspection.text}</pre>
           <p className="inspection-note">This is plain extracted text from the local index, not source HTML or a verified answer. The identity address may not be publicly reachable.</p>
-          <SourceDisclosure reference={hit.passage.reference} />
         </section>
       )}
 
+      {inspection.kind === "ready" && !sourceVisible && (
+        <p className="verification-message" role="alert">{hiddenSourceMessage} Previously loaded indexed text is hidden.</p>
+      )}
+
       <div className="evidence-matches">
-        {hit.matched_terms.length > 0 && <p><strong>Matched terms:</strong> {hit.matched_terms.join(", ")}</p>}
-        {hit.matched_phrases.length > 0 && <p><strong>Matched phrases:</strong> {hit.matched_phrases.map((phrase) => `“${phrase.join(" ")}”`).join(" · ")}</p>}
+        {sourceVisible && hit.matched_terms.length > 0 && <p><strong>Matched terms:</strong> {hit.matched_terms.join(", ")}</p>}
+        {sourceVisible && hit.matched_phrases.length > 0 && <p><strong>Matched phrases:</strong> {hit.matched_phrases.map((phrase) => `“${phrase.join(" ")}”`).join(" · ")}</p>}
       </div>
       <div className="evidence-actions">
         {inspection.kind === "closed" && (
           <>
-            <button type="button" onClick={() => loadInspectionPage(0, "")}>Read current indexed text</button>
-            <button type="button" onClick={revalidate} disabled={revalidation.kind === "loading"}>
+            <button type="button" onClick={() => loadInspectionPage(0, "")} disabled={!sourceVisible}>Read current indexed text</button>
+            <button type="button" onClick={revalidate} disabled={!sourceVisible || revalidation.kind === "loading"}>
               {revalidation.kind === "loading" ? "Checking passage…" : "Revalidate passage"}
             </button>
             {revalidation.kind === "error" && <span className="error-code">{revalidation.code}</span>}
@@ -163,20 +282,21 @@ export function EvidenceCard({ hit }: { hit: EvidenceHit }) {
         )}
         {inspection.kind === "loading" && <button type="button" disabled>Checking indexed text…</button>}
         {inspection.kind === "error" && (
-          <button type="button" onClick={() => loadInspectionPage(0, "")}>Retry indexed text</button>
+          <button type="button" onClick={() => loadInspectionPage(0, "")} disabled={!sourceVisible}>Retry indexed text</button>
         )}
         {inspection.kind === "ready" && (
           <>
-            <button type="button" onClick={() => loadInspectionPage(0, "")}>Revalidate indexed text</button>
+            <button type="button" onClick={() => loadInspectionPage(0, "")} disabled={!sourceVisible}>Revalidate indexed text</button>
             {inspection.page.next_offset_byte !== null && (
               <button
                 type="button"
+                disabled={!sourceVisible}
                 onClick={() => loadInspectionPage(inspection.page.next_offset_byte!, inspection.text, inspection.page.total_bytes)}
               >Load next part</button>
             )}
           </>
         )}
-        <details className="explanation">
+        {sourceVisible && <details className="explanation">
           <summary>Evidence reference</summary>
           <div className="reference-details">
             <dl>
@@ -189,111 +309,23 @@ export function EvidenceCard({ hit }: { hit: EvidenceHit }) {
             </dl>
             <p>The identity checksum is a public consistency check, not proof of authenticity. Answer support is not assessed.</p>
           </div>
-        </details>
+        </details>}
       </div>
     </article>
   );
 }
 
-type SourceDisclosureState =
-  | { kind: "idle" }
-  | { kind: "loading" }
-  | { kind: "ready"; source: SourceAttribution }
-  | { kind: "error"; code: string; message: string };
-
-function SourceDisclosure({ reference }: { reference: EvidenceReference }) {
-  const [state, setState] = useState<SourceDisclosureState>({ kind: "idle" });
-  const controller = useRef<AbortController | null>(null);
-
-  useEffect(() => () => controller.current?.abort(), []);
-
-  useEffect(() => {
-    if (state.kind !== "ready" || state.source.kind !== "operator_source") return;
-    const deadline = state.source.visible_until_ms;
-    let timer: number | undefined;
-    const expireIfNeeded = () => {
-      if (Date.now() < deadline) return false;
-      controller.current?.abort();
-      setState({
-        kind: "error",
-        code: "public_collection_expired",
-        message: messageForSourceError("public_collection_expired"),
-      });
-      return true;
-    };
-    const scheduleExpiry = () => {
-      window.clearTimeout(timer);
-      if (expireIfNeeded()) return;
-      timer = window.setTimeout(
-        scheduleExpiry,
-        Math.min(deadline - Date.now(), 2_147_000_000),
-      );
-    };
-    const onVisibilityChange = () => {
-      if (document.visibilityState === "visible") scheduleExpiry();
-    };
-    scheduleExpiry();
-    document.addEventListener("visibilitychange", onVisibilityChange);
-    return () => {
-      window.clearTimeout(timer);
-      document.removeEventListener("visibilitychange", onVisibilityChange);
-    };
-  }, [state]);
-
-  async function load() {
-    controller.current?.abort();
-    const current = new AbortController();
-    controller.current = current;
-    setState({ kind: "loading" });
-    try {
-      const response = await getSourceTransparency(reference, current.signal);
-      if (current.signal.aborted) return;
-      if (response.source.kind === "operator_source" && response.source.visible_until_ms <= Date.now()) {
-        throw new QuestionApiError("public_collection_expired", messageForQuestionError("public_collection_expired"));
-      }
-      setState({ kind: "ready", source: response.source });
-    } catch (error) {
-      if (current.signal.aborted) return;
-      const code = error instanceof QuestionApiError ? error.code : "storage_fault";
-      setState({ kind: "error", code, message: messageForSourceError(code) });
-    }
-  }
-
-  function onToggle(event: SyntheticEvent<HTMLDetailsElement>) {
-    if (event.currentTarget.open) {
-      void load();
-      return;
-    }
-    controller.current?.abort();
-    controller.current = null;
-    setState({ kind: "idle" });
-  }
-
-  return (
-    <details className="source-disclosure" onToggle={onToggle}>
-      <summary>Source and attribution</summary>
-      {state.kind === "loading" && <p role="status">Checking current source record. Previously loaded notice text is hidden.</p>}
-      {state.kind === "error" && (
-        <div className="source-error" role="alert">
-          <p>{state.message} <span className="error-code">{state.code}</span></p>
-          <button type="button" onClick={() => void load()}>Check source again</button>
-        </div>
-      )}
-      {state.kind === "ready" && <SourceAttributionView source={state.source} />}
-    </details>
-  );
-}
-
-function messageForSourceError(code: string): string {
-  const messages: Record<string, string> = {
-    malformed_reference: "This evidence reference is malformed. No source attribution is shown.",
-    wrong_store: "This evidence reference belongs to a different index. No source attribution is shown.",
-    not_live: "This source is no longer in the current index. Its source notice is hidden.",
-    revoked: "This source has been revoked. Its source notice is hidden.",
-    version_superseded: "This evidence reference is for an older source version. Its source notice is hidden.",
-    public_collection_expired: "This public collection has expired. Its source notice is hidden.",
+function messageForInvalidatedEvidence(code: string, hasSourceNotice: boolean): string {
+  const reasons: Record<string, string> = {
+    malformed_reference: "This evidence reference is malformed.",
+    wrong_store: "This evidence reference belongs to a different index.",
+    not_live: "This source is no longer in the current index.",
+    revoked: "This source has been revoked.",
+    version_superseded: "This passage belongs to an older source version.",
+    public_collection_expired: "This collection has expired.",
   };
-  return messages[code] ?? messageForQuestionError(code);
+  const hiddenContent = hasSourceNotice ? "passage and source notice are" : "evidence text is";
+  return `${reasons[code] ?? "This evidence reference is no longer current."} Previously displayed ${hiddenContent} hidden.`;
 }
 
 function SourceAttributionView({ source }: { source: SourceAttribution }) {

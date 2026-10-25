@@ -67,7 +67,7 @@ export LEY_STORE="$STORE"
 node --input-type=module -e 'import { realpathSync } from "node:fs"; console.log(JSON.stringify({mcpServers:{ley:{command:realpathSync("target/debug/ley"),args:["mcp","--store",realpathSync(process.env.LEY_STORE)]}}},null,2))'
 ```
 
-The stdio server exposes the existing read-only `search_evidence` and `resolve_evidence` tools against that same store. It does not add an inspection tool or call a model provider.
+The stdio server exposes the read-only `search_evidence`, `resolve_evidence`, and `source_transparency` tools against that same store. `source_transparency` checks one exact reference and returns current source attribution, including the retained notice when an authenticated public source permits disclosure. These tools do not call a model provider or change the store.
 
 ## Advanced and historical documentation
 
@@ -265,7 +265,7 @@ Build Ley, then configure the client to launch the binary with one existing stor
 }
 ```
 
-Build with `cargo build --locked` and replace both paths with absolute paths on the operator's machine. The server uses MCP stdio, supports protocol version `2026-07-28` discovery and legacy `2025-11-25` initialization, and exposes only `search_evidence` and `resolve_evidence`. Stdio messages are capped at 16 KiB, questions at 4 KiB, and tool responses at 512 KiB. Each call reopens the same configured index to observe operator syncs; MCP tools do not crawl, index, or write to the store. Search returns lexical evidence with `answer_assessment: "not_assessed"`; source text is untrusted evidence. The independent official TypeScript SDK clients are exercised offline with `LEY_MCP_BIN=/absolute/path/to/ley LEY_MCP_EVIDENCE_DIR=/path/to/ignored-evidence npm --prefix tests/mcp-sdk test`.
+Build with `cargo build --locked` and replace both paths with absolute paths on the operator's machine. The server uses MCP stdio, supports protocol version `2026-07-28` discovery and legacy `2025-11-25` initialization, and exposes only `search_evidence`, `resolve_evidence`, and `source_transparency`. Stdio messages are capped at 16 KiB, questions at 4 KiB, and tool responses at 512 KiB. Each call reopens the same configured index to observe operator syncs; MCP tools do not crawl, index, or write to the store. Search returns lexical evidence with `answer_assessment: "not_assessed"`; source text is untrusted evidence. `source_transparency` accepts one exact `EvidenceReference` and returns current attribution plus any retained notice permitted by the current record. The independent official TypeScript SDK clients are exercised offline with `LEY_MCP_BIN=/absolute/path/to/ley LEY_MCP_EVIDENCE_DIR=/path/to/ignored-evidence npm --prefix tests/mcp-sdk test`.
 
 The Rust response is a versioned typed serde value. For example, retrieval uses `POST /api/v1/retrieve` with `Content-Type: application/json`, `Accept: application/json`, and a same-origin `Origin` header:
 
@@ -279,7 +279,9 @@ Resolve the exact current passage with `POST /api/v1/evidence/resolve`, sending 
 
 Read the current indexed extracted body with `POST /api/v1/evidence/inspect`. Send a strict JSON request containing `contract_version: 1`, the exact `reference` from a retrieval hit, and `offset_byte` (start with `0`). Each response returns a UTF-8-safe page of at most 65,536 bytes, its exclusive byte range, total body length, current title and source identities, and `next_offset_byte` when another page remains. The page size is fixed by the server. Each page rechecks the same store, passage window, current visibility, revocation, expiry, and content version as evidence resolution. The request cannot name a file path, URL, document version independent of the reference, or page size. Responses contain extracted text, not raw HTML. A changed, removed, revoked, or expired reference returns its typed error and no prior text.
 
-All three typed routes accept only `POST`, exact `application/json` Content-Type and Accept values, identity encoding, and at most 16 KiB of request JSON while consuming the body. Duplicate or unknown fields are rejected. Unsafe POSTs require a matching loopback Host and same-origin Origin; the UI proxy checks the browser's UI origin and uses a fixed local API origin when forwarding. The API never accepts a store path or write operation. Successes and errors use `Cache-Control: no-store`; responses are capped at 512 KiB. Errors have finite JSON codes: `invalid_request` (400), `unsupported_contract` (422), `malformed_reference` (400), `wrong_store` (404), `not_live`, `revoked`, `version_superseded`, and `public_collection_expired` (410), `resource_cap` (429, or 413 for an oversized request body), `storage_fault` (503), `unsupported_media_type` (415), and `not_acceptable` (406). Host and Origin boundary failures are 403; unsupported methods are 405.
+Check current attribution with `POST /api/v1/evidence/source`, sending `contract_version: 1` and the exact full `reference` object from a retrieval hit with the same headers. The response echoes the exact reference and requested/effective identities with a `source` value of `operator_source`, `local_index`, or `attribution_withheld`. An operator source includes its retained notice only when the authenticated current disclosure conditions permit it. The request accepts no URL or source selector.
+
+All four typed POST routes accept exact `application/json` Content-Type and Accept values, identity encoding, and at most 16 KiB of request JSON while consuming the body. Duplicate or unknown fields are rejected. Unsafe POSTs require a matching loopback Host and same-origin Origin; the UI proxy checks the browser's UI origin and uses a fixed local API origin when forwarding. The API never accepts a store path or write operation. Successes and errors use `Cache-Control: no-store`; responses are capped at 512 KiB. Common typed-request codes are `invalid_request` (400), `unsupported_contract` (422), `malformed_reference` (400), `wrong_store` (404), `not_live`, `revoked`, `version_superseded`, and `public_collection_expired` (410), `resource_cap` (429, or 413 for an oversized request body), and `storage_fault` or `workspace_policy_binding_changed` (503). Host and Origin failures are `invalid_host` and `invalid_origin` (403); unsupported media types and unacceptable response types are `unsupported_media_type` (415) and `not_acceptable` (406), and unsupported methods return `method_not_allowed` (405).
 
 The CLI calls the same Rust retrieval and resolver methods and serializes the same response fields in deterministic pretty JSON. Save a reference from the retrieval response, then pass it to the resolver:
 
@@ -475,6 +477,86 @@ Before public content can enter an index, Ley writes a store-bound authenticated
 The crawler identifies itself as `LeyBot/0.1.0 (+https://github.com/Suraj-H675/Ley/issues)` and uses `LeyBot` as its robots token. Website owners can submit crawling exclusions, content-removal requests, and crawler concerns through the [Ley issue tracker](https://github.com/Suraj-H675/Ley/issues). Issues are public, so do not include sensitive information. Ley makes no response-time guarantee.
 
 Source revocation was tested on an isolated copy of the collected store. That copy published generation 13 with corpus size 0 and no search results. The original generation 7 collection remained unchanged during that historical test. Neither that original collection nor the temporary removal copy is currently available.
+
+## Create a site workspace
+
+Use this workflow only after the source owner or an authorized operator has approved the exact source and each intended use. Review fetch, storage, indexing, display, source scope, notice, retention, expiry, and request budgets separately. Have an independent rights reviewer approve the policy file and its exact SHA-256. Ley records these decisions; it does not determine legal rights. A URL that is public, reachable, or permitted by `robots.txt` does not grant those rights.
+
+This workflow currently requires Linux for storage, Rust 1.88 or newer for the CLI and API, and Node.js 24 or newer with npm for the browser UI. Build the CLI and install the UI packages from the repository root:
+
+```sh
+cargo build --locked --bin ley
+npm ci --prefix ui
+WORKSPACE="$HOME/ley-workspaces/approved-site"
+mkdir -p "$(dirname "$WORKSPACE")"
+POLICY="/absolute/path/to/independently-reviewed/public-sources.json"
+```
+
+Prepare `POLICY` and its sibling plain-text source notice from actual source-owner permission evidence. Set the policy's origin, allowed path prefixes, seeds, fetch, storage, indexing and display permissions, retention, expiry, and request budgets to the reviewed values. Do not use the checked-in disabled policy as authorization or copy its example values as approval. Ley accepts one source per workspace. Hash the exact policy bytes and compare that digest with the value approved independently. Then run the offline preflight and initialize a new private workspace:
+
+```sh
+sha256sum "$POLICY"
+APPROVED_POLICY_SHA256="COPY_THE_INDEPENDENTLY_APPROVED_DIGEST"
+./target/debug/ley policy validate \
+  --policy "$POLICY" \
+  --approved-policy-sha256 "$APPROVED_POLICY_SHA256"
+./target/debug/ley site init \
+  --workspace "$WORKSPACE" \
+  --policy "$POLICY" \
+  --approved-policy-sha256 "$APPROVED_POLICY_SHA256"
+./target/debug/ley site status --workspace "$WORKSPACE"
+```
+
+`policy validate`, `site init`, and `site status` send no requests. `site init` refuses an existing workspace. A digest pins exact bytes; it does not approve permission.
+
+Run the crawler only when the reviewed policy grants the required rights and you separately authorize public requests. Each foreground invocation requires `--allow-public-requests` and accepts a per-invocation limit from 1 through 12:
+
+```sh
+./target/debug/ley site run \
+  --workspace "$WORKSPACE" \
+  --requests 1 \
+  --allow-public-requests
+./target/debug/ley site status --workspace "$WORKSPACE"
+```
+
+The per-invocation request limit counts robots and redirect requests; a fresh one-request run may use its slot only for `/robots.txt`. Use a new invocation to resume the same durable frontier while permissions remain current and persistent budget allows it. Ley never resets that source budget on resume. Check status for persistent budget use, live indexed documents, due and deferred frontier work, removals, and bounded failures. Robots-denied, failed, deferred, and unlinked pages may remain absent. These counters describe known frontier work and do not measure full-site coverage. A changed or missing policy or notice fails closed.
+
+Retrieve a question and resolve one exact versioned reference from its JSON output:
+
+```sh
+./target/debug/ley retrieve --workspace "$WORKSPACE" \
+  --question 'How does the reviewed source describe the topic?'
+```
+
+Copy one `hits[].passage.reference` object into `reference.json`, then pass it on stdin. Resolution returns the current evidence only if that exact reference is still valid:
+
+```sh
+cat reference.json | ./target/debug/ley resolve-evidence \
+  --workspace "$WORKSPACE" \
+  --reference-file -
+```
+
+The read-only HTTP API and browser UI use the workspace selected when the server starts. In one terminal, run:
+
+```sh
+./target/debug/ley serve --workspace "$WORKSPACE" --bind 127.0.0.1:7331
+```
+
+In a second terminal, start the local UI and open `http://127.0.0.1:4173`:
+
+```sh
+LEY_API_PORT=7331 npm run dev --prefix ui
+```
+
+For an MCP host, set the stdio command to the absolute path printed by `realpath target/debug/ley` from the repository root. Set its arguments to `mcp`, `--workspace`, and the actual absolute workspace path held in `$WORKSPACE` (MCP hosts do not expand the shell variable). MCP exposes the read-only `search_evidence`, `resolve_evidence`, and exact-reference `source_transparency` tools. The tools do not crawl or write to the workspace.
+
+Revoke the selected source when permission ends or an operator requires removal:
+
+```sh
+./target/debug/ley site revoke --workspace "$WORKSPACE"
+```
+
+Expiry and revocation block supported readers and make stale evidence references fail. They provide logical access removal, not guaranteed physical erasure. Old immutable generations, filesystem copies, and backups may retain bytes. Do not acquire sources that require guaranteed physical deletion until a separate, verified erasure mechanism meets that requirement. The offline crawl demonstration above uses authored, owned loopback fixtures. It is separate from public `site run` and grants no permission to crawl public sources.
 
 ## Current limits
 

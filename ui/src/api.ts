@@ -10,6 +10,7 @@ import type {
   SearchExplanation,
   SearchHit,
   SearchResponse,
+  SiteWorkspaceStatus,
   TermExplanation,
   SourceTransparencyResponse,
 } from "./types";
@@ -108,6 +109,31 @@ export async function getSourceTransparency(
   }, signal);
   if (!isSourceTransparencyResponse(payload, reference)) {
     throw new QuestionApiError("invalid_response", "Ley returned source attribution the interface could not read.");
+  }
+  return payload;
+}
+
+export async function getWorkspaceStatus(signal: AbortSignal): Promise<SiteWorkspaceStatus | null> {
+  let response: Response;
+  try {
+    response = await fetch("/api/v1/workspace/status", {
+      headers: { Accept: "application/json" },
+      cache: "no-store",
+      signal,
+    });
+  } catch {
+    if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+    throw new QuestionApiError("workspace_status_unavailable", "Ley could not read the selected site workspace status.");
+  }
+
+  const payload: unknown = await response.json().catch(() => null);
+  if (response.status === 404) return null;
+  if (!response.ok) {
+    const code = isRecord(payload) && typeof payload.error === "string" ? payload.error : "workspace_status_unavailable";
+    throw new QuestionApiError(code, "Ley could not read the selected site workspace status. Check its policy binding and local store.");
+  }
+  if (!isSiteWorkspaceStatus(payload)) {
+    throw new QuestionApiError("invalid_workspace_status", "Ley returned workspace status the interface could not read.");
   }
   return payload;
 }
@@ -400,6 +426,40 @@ function isFieldExplanation(value: unknown): value is FieldExplanation {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isSiteWorkspaceStatus(value: unknown): value is SiteWorkspaceStatus {
+  if (!isRecord(value) || !isRecord(value.source)) return false;
+  const source = value.source;
+  const budget = source.requestBudget;
+  const permissions = source.permissions;
+  const stateCounts = source.frontierStateCounts;
+  return (
+    hasExactKeys(value, ["schema", "backend", "readOnly", "source", "coverageDefinition"]) &&
+    value.schema === "ley-site-http-status-v1" && value.backend === "controlled_crawler" && value.readOnly === true &&
+    isBoundedString(value.coverageDefinition, 512) &&
+    hasExactKeys(source, [
+      "id", "origin", "allowedPathPrefixes", "seedUrls", "noticeSha256", "permissions", "expiresAtMs",
+      "lifecycle", "policyExpired", "retentionExpired", "requestBudget", "frontierStateCounts", "dueWorkCount",
+      "nextDueMs", "currentlyIndexedLiveUrls", "removedFrontierUrls", "pendingOutboxCount", "rejectedOutboxCount",
+    ]) &&
+    isBoundedString(source.id, 128) && isBoundedString(source.origin, 2048) &&
+    isStringArray(source.allowedPathPrefixes) && isStringArray(source.seedUrls) &&
+    typeof source.noticeSha256 === "string" && /^[0-9a-f]{64}$/.test(source.noticeSha256) &&
+    isRecord(permissions) && hasExactKeys(permissions, ["fetchRecorded", "storageRecorded", "indexRecorded", "displayRecorded"]) &&
+    typeof permissions.fetchRecorded === "boolean" && typeof permissions.storageRecorded === "boolean" &&
+    typeof permissions.indexRecorded === "boolean" && typeof permissions.displayRecorded === "boolean" &&
+    isCount(source.expiresAtMs) && isBoundedString(source.lifecycle, 32) &&
+    typeof source.policyExpired === "boolean" && typeof source.retentionExpired === "boolean" &&
+    isRecord(budget) && hasExactKeys(budget, [
+      "persistentUsed", "persistentLimit", "persistentRemaining", "persistentCounterSemantics", "perInvocationCountersPersisted",
+    ]) && isCount(budget.persistentUsed) && isCount(budget.persistentLimit) && isCount(budget.persistentRemaining) &&
+    isBoundedString(budget.persistentCounterSemantics, 256) && typeof budget.perInvocationCountersPersisted === "boolean" &&
+    isRecord(stateCounts) && Object.keys(stateCounts).length <= 16 && Object.values(stateCounts).every(isCount) &&
+    isCount(source.dueWorkCount) && (source.nextDueMs === null || isCount(source.nextDueMs)) &&
+    isCount(source.currentlyIndexedLiveUrls) && isCount(source.removedFrontierUrls) &&
+    isCount(source.pendingOutboxCount) && isCount(source.rejectedOutboxCount)
+  );
 }
 
 function hasExactKeys(value: Record<string, unknown>, required: string[], optional: string[] = []): boolean {

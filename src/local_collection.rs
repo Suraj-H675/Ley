@@ -102,6 +102,8 @@ struct CollectionConfig {
     port: u16,
     store_identity: String,
     seed_urls: Vec<String>,
+    #[serde(default = "default_path_prefixes")]
+    allowed_path_prefixes: Vec<String>,
     link_discovery_enabled: bool,
     source_request_budget: u64,
     per_run_request_budget: usize,
@@ -135,7 +137,7 @@ pub(crate) fn run_cli(args: &[String]) -> Result<String, String> {
 }
 
 fn run_init(args: &[String]) -> Result<String, String> {
-    let mut options = Options::parse(args, &["root", "profile", "port"], &[])?;
+    let mut options = Options::parse(args, &["root", "profile", "port", "path-prefix"], &[])?;
     let root = PathBuf::from(options.required("root")?);
     let profile_name = options.required("profile")?;
     let requested_port = options
@@ -150,6 +152,12 @@ fn run_init(args: &[String]) -> Result<String, String> {
             Ok(port)
         })
         .transpose()?;
+    let path_prefix = options
+        .take("path-prefix")
+        .unwrap_or_else(|| "/".to_owned());
+    if !valid_path_prefix(&path_prefix) {
+        return Err("--path-prefix must be a normalized absolute path prefix".to_owned());
+    }
     options.finish()?;
 
     let (manifest, dataset_sha256) = load_corpus()?;
@@ -197,7 +205,7 @@ fn run_init(args: &[String]) -> Result<String, String> {
         SystemResolver,
         vec![fixture.capability()],
         Vec::new(),
-        crawl_limits(),
+        crawl_limits(PER_RUN_REQUEST_BUDGET),
         FixtureLogicalClock::new(now_ms),
     )
     .map_err(|error| format!("could not create the new controlled frontier: {error}"))?;
@@ -213,6 +221,13 @@ fn run_init(args: &[String]) -> Result<String, String> {
             Ok(format!("{}{}", origin, page.path))
         })
         .collect::<Result<Vec<_>, String>>()?;
+    if seed_urls.iter().any(|seed| {
+        Url::parse(seed)
+            .ok()
+            .is_none_or(|url| !crate::url_key::path_is_within_prefix(url.path(), &path_prefix))
+    }) {
+        return Err("owned fixture seed is outside --path-prefix".to_owned());
+    }
     let seeds = seed_urls
         .iter()
         .map(|url| UrlKey::parse(url).map_err(|error| error.to_string()))
@@ -220,7 +235,7 @@ fn run_init(args: &[String]) -> Result<String, String> {
     let mut policy = SourcePolicy::owned_fixture(
         SOURCE_ID,
         vec![origin.clone()],
-        vec!["/".to_owned()],
+        vec![path_prefix.clone()],
         source_valid_until_ms,
     );
     policy.max_requests = SOURCE_REQUEST_BUDGET;
@@ -238,6 +253,7 @@ fn run_init(args: &[String]) -> Result<String, String> {
         port,
         store_identity: store_identity.clone(),
         seed_urls: seed_urls.clone(),
+        allowed_path_prefixes: vec![path_prefix.clone()],
         link_discovery_enabled: profile.link_discovery,
         source_request_budget: SOURCE_REQUEST_BUDGET,
         per_run_request_budget: PER_RUN_REQUEST_BUDGET,
@@ -262,6 +278,7 @@ fn run_init(args: &[String]) -> Result<String, String> {
         "port": port,
         "sourceUrlKeys": source_url_keys,
         "seedUrlKeys": seed_urls,
+        "allowedPathPrefixes": [path_prefix],
         "storeIdentity": store_identity,
         "datasetSha256": dataset_sha256,
         "ownedListener": "127.0.0.1 bound from the listener whose live capability was passed to SafeFetcher",
@@ -276,7 +293,7 @@ fn run_init(args: &[String]) -> Result<String, String> {
 }
 
 fn run_crawl(args: &[String]) -> Result<String, String> {
-    let mut options = Options::parse(args, &["root", "revision", "advance-ms"], &[])?;
+    let mut options = Options::parse(args, &["root", "revision", "advance-ms", "requests"], &[])?;
     let root = PathBuf::from(options.required("root")?);
     let revision = options.required("revision")?;
     if !matches!(revision.as_str(), "v1" | "v2") {
@@ -291,6 +308,19 @@ fn run_crawl(args: &[String]) -> Result<String, String> {
         })
         .transpose()?
         .unwrap_or(0);
+    let request_limit = options
+        .take("requests")
+        .map(|value| {
+            let request_limit = value
+                .parse::<usize>()
+                .map_err(|_| "--requests must be between 1 and 96".to_owned())?;
+            if !(1..=PER_RUN_REQUEST_BUDGET).contains(&request_limit) {
+                return Err("--requests must be between 1 and 96".to_owned());
+            }
+            Ok(request_limit)
+        })
+        .transpose()?
+        .unwrap_or(PER_RUN_REQUEST_BUDGET);
     options.finish()?;
 
     let root = canonical_existing_directory(&root)?;
@@ -352,7 +382,7 @@ fn run_crawl(args: &[String]) -> Result<String, String> {
             SystemResolver,
             vec![fixture.capability()],
             Vec::new(),
-            crawl_limits(),
+            crawl_limits(request_limit),
             FixtureLogicalClock::new(now_ms),
         )
         .map_err(|error| format!("could not reopen existing fixture frontier: {error}"))?;
@@ -361,6 +391,24 @@ fn run_crawl(args: &[String]) -> Result<String, String> {
     let report = crawler
         .run_until_idle(&CrawlCancellation::default())
         .map_err(|error| format!("controlled fixture run did not finish: {error}"))?;
+    drop(crawler);
+    let status: serde_json::Value = serde_json::from_str(
+        &crate::crawl_status_json(
+            &store_path,
+            &frontier_path,
+            Some(&config.source_id),
+            Some(&clock_path),
+            false,
+        )
+        .map_err(|_| "could not inspect the persisted fixture frontier".to_owned())?,
+    )
+    .map_err(|_| "persisted fixture status is malformed".to_owned())?;
+    let source_status = status
+        .get("sources")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|sources| sources.first())
+        .ok_or_else(|| "persisted fixture source status is missing".to_owned())?;
+    let due_work = source_status["dueWorkCount"].as_u64().unwrap_or(0);
     let elapsed_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
     let expected_peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), config.port);
     let unexpected_destinations = report
@@ -396,6 +444,7 @@ fn run_crawl(args: &[String]) -> Result<String, String> {
         "datasetSha256": config.dataset_sha256,
         "sourceUrlKeys": known_source_urls(&manifest, &config.origin),
         "seedUrlKeys": config.seed_urls,
+        "allowedPathPrefixes": config.allowed_path_prefixes,
         "linkDiscoveryEnabled": config.link_discovery_enabled,
         "time": {
             "basis": "fixture-logical",
@@ -405,8 +454,14 @@ fn run_crawl(args: &[String]) -> Result<String, String> {
             "sourceValidatorTimestampsAreSimulated": true,
             "osClockChanged": false,
         },
-        "runUntilIdleReturnedSuccessfully": true,
-        "exactStopReason": "not exposed by the existing run_until_idle report contract",
+        "runReturnedSuccessfully": true,
+        "boundedRun": {
+            "requestLimit": request_limit,
+            "requestsUsedThisInvocation": report.requests,
+            "dueWorkRemaining": due_work,
+            "finished": due_work == 0,
+            "stopReason": if due_work == 0 { "idle" } else { "per_invocation_request_limit_reached" },
+        },
         "counts": {
             "requests": report.requests,
             "responseEvidence": report.network_evidence.len(),
@@ -485,7 +540,7 @@ fn run_revoke(args: &[String]) -> Result<String, String> {
             SystemResolver,
             vec![fixture.capability()],
             Vec::new(),
-            crawl_limits(),
+            crawl_limits(PER_RUN_REQUEST_BUDGET),
             FixtureLogicalClock::new(clock.now_ms),
         )
         .map_err(|error| format!("could not reopen fixture frontier for revocation: {error}"))?;
@@ -821,6 +876,8 @@ fn validate_config(config: &CollectionConfig) -> Result<(), String> {
         || config.per_run_request_budget != PER_RUN_REQUEST_BUDGET
         || config.per_run_wire_budget_bytes != PER_RUN_WIRE_BUDGET
         || config.per_run_decoded_budget_bytes != PER_RUN_DECODED_BUDGET
+        || config.allowed_path_prefixes.len() != 1
+        || !valid_path_prefix(&config.allowed_path_prefixes[0])
     {
         return Err(
             "collection manifest has an unknown schema, identity, origin, clock, or budget"
@@ -848,7 +905,7 @@ fn validate_fixture_source(path: &Path, config: &CollectionConfig) -> Result<(),
         )
         .map_err(|error| format!("persisted fixture source is unavailable: {error}"))?;
     if origins != config.origin
-        || paths != "/"
+        || paths != config.allowed_path_prefixes.join("\n")
         || rights_basis != "authored_local_fixture"
         || max_requests != config.source_request_budget as i64
         || request_count < 0
@@ -859,9 +916,19 @@ fn validate_fixture_source(path: &Path, config: &CollectionConfig) -> Result<(),
     Ok(())
 }
 
-fn crawl_limits() -> CrawlLimits {
+fn default_path_prefixes() -> Vec<String> {
+    vec!["/".to_owned()]
+}
+
+fn valid_path_prefix(prefix: &str) -> bool {
+    crate::url_key::path_is_within_prefix(prefix, prefix)
+        && prefix.len() <= 2048
+        && !prefix.contains(['?', '#', '\\', '\r', '\n'])
+}
+
+fn crawl_limits(request_limit: usize) -> CrawlLimits {
     CrawlLimits {
-        max_requests_per_run: PER_RUN_REQUEST_BUDGET,
+        max_requests_per_run: request_limit,
         global_active: 2,
         per_origin_active: 1,
         max_wire_bytes_per_run: PER_RUN_WIRE_BUDGET,

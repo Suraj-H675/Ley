@@ -13,6 +13,7 @@ const QUESTION_ROUTES = new Set([
   "/api/v1/evidence/inspect",
   "/api/v1/evidence/source",
 ]);
+const WORKSPACE_STATUS_ROUTE = "/api/v1/workspace/status";
 
 const mime = new Map([
   [".html", "text/html; charset=utf-8"],
@@ -155,6 +156,43 @@ export function createUiServer({ root = defaultRoot, port = 0, apiPort = 7331 } 
     } catch {
       reject(response, 400, "invalid_request_target");
       request.resume();
+      return;
+    }
+    if (url.pathname === WORKSPACE_STATUS_ROUTE) {
+      if (request.method !== "GET") {
+        rejectWithHeaders(response, 405, "method_not_allowed", { allow: "GET" });
+        request.resume();
+        return;
+      }
+      if (url.search || url.hash || rawHeaderValues(request, "transfer-encoding").length > 0) {
+        reject(response, 400, "invalid_request_target");
+        request.resume();
+        return;
+      }
+      const contentLengths = rawHeaderValues(request, "content-length");
+      if (contentLengths.length > 1 || (contentLengths.length === 1 && contentLengths[0] !== "0")) {
+        reject(response, 400, "invalid_request");
+        request.resume();
+        return;
+      }
+      try {
+        const apiOrigin = `http://127.0.0.1:${apiPort}`;
+        const upstream = await fetch(`${apiOrigin}${WORKSPACE_STATUS_ROUTE}`, {
+          headers: { accept: "application/json" },
+          cache: "no-store",
+        });
+        const bytes = await readUpstreamBounded(upstream, MAX_API_RESPONSE_BYTES);
+        response.writeHead(upstream.status, {
+          "content-type": upstream.headers.get("content-type") ?? "application/json; charset=utf-8",
+          "content-length": bytes.length,
+          "cache-control": "no-store",
+          "x-content-type-options": "nosniff",
+        });
+        response.end(bytes);
+      } catch (error) {
+        if (error instanceof RangeError) reject(response, 502, "upstream_response_too_large");
+        else reject(response, 502, "index_api_unavailable");
+      }
       return;
     }
     if (QUESTION_ROUTES.has(url.pathname)) {

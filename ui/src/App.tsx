@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { EvidenceCard } from "./EvidenceCard";
-import { QuestionApiError, retrieveQuestion, SearchApiError, searchLey } from "./api";
+import { getSourceTransparency, getWorkspaceStatus, messageForQuestionError, QuestionApiError, retrieveQuestion, SearchApiError, searchLey } from "./api";
 import { ResultCard } from "./ResultCard";
-import type { QuestionSearchState, RetrievalResponse, RetrievalStatus, SearchState } from "./types";
+import type { EvidenceReference, QuestionSearchState, RetrievalResponse, RetrievalStatus, SearchState, SiteWorkspaceStatus, SourceAttributionState, WorkspaceStatusState } from "./types";
 
 type SearchMode = "question" | "dsl";
 
@@ -12,6 +12,8 @@ export function App() {
   const [questionState, setQuestionState] = useState<QuestionSearchState>({ kind: "idle" });
   const [dslState, setDslState] = useState<SearchState>({ kind: "idle" });
   const [formError, setFormError] = useState("");
+  const [workspaceStatus, setWorkspaceStatus] = useState<WorkspaceStatusState>({ kind: "loading" });
+  const [statusRefresh, setStatusRefresh] = useState(0);
   const input = useRef<HTMLInputElement>(null);
   const sequence = useRef(0);
   const currentAbort = useRef<AbortController | null>(null);
@@ -30,6 +32,24 @@ export function App() {
       currentAbort.current?.abort();
     };
   }, []);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    setWorkspaceStatus((current) => current.kind === "ready"
+      ? { ...current, refreshing: true, refreshError: undefined }
+      : { kind: "loading" });
+    getWorkspaceStatus(controller.signal).then((status) => {
+      if (status) setWorkspaceStatus({ kind: "ready", status });
+      else setWorkspaceStatus({ kind: "not_bound" });
+    }).catch((error: unknown) => {
+      if (controller.signal.aborted) return;
+      const message = error instanceof QuestionApiError ? error.message : "Workspace status could not be read.";
+      setWorkspaceStatus((current) => current.kind === "ready"
+        ? { ...current, refreshing: false, refreshError: message }
+        : { kind: "error", message });
+    });
+    return () => controller.abort();
+  }, [statusRefresh]);
 
   function changeMode(nextMode: SearchMode) {
     if (mode === nextMode) return;
@@ -92,6 +112,10 @@ export function App() {
         </a>
         <span className="masthead-note">A local search engine</span>
       </header>
+
+      {workspaceStatus.kind !== "loading" && workspaceStatus.kind !== "not_bound" && (
+        <WorkspaceStatusPanel state={workspaceStatus} onRefresh={() => setStatusRefresh((value) => value + 1)} />
+      )}
 
       <section className="hero" aria-labelledby="page-title">
         <p className="eyebrow"><span className="status-dot" aria-hidden="true" /> PRIVATE BETA · RUNNING ON YOUR MACHINE</p>
@@ -213,7 +237,139 @@ export function App() {
   );
 }
 
+function WorkspaceStatusPanel({ state, onRefresh }: { state: Extract<WorkspaceStatusState, { kind: "ready" | "error" }>; onRefresh: () => void }) {
+  const refreshing = state.kind === "ready" && state.refreshing === true;
+  return (
+    <section className="workspace-panel" aria-labelledby="workspace-heading" aria-live="polite">
+      <div className="workspace-panel-heading">
+        <div>
+          <p className="workspace-eyebrow">SELECTED SITE COLLECTION</p>
+          <h2 id="workspace-heading">Crawl and evidence status</h2>
+        </div>
+        <button className="workspace-refresh" type="button" onClick={onRefresh} disabled={refreshing}>
+          {refreshing ? "Refreshing…" : "Refresh status"}
+        </button>
+      </div>
+      {state.kind === "error" ? (
+        <div className="workspace-status-error" role="status">
+          <p>{state.message}</p>
+          <p>For bounded URL and failure details, run <code>ley site status --workspace &lt;PATH&gt;</code> in the terminal that started Ley.</p>
+        </div>
+      ) : (
+        <>
+          <WorkspaceStatusDetails status={state.status} />
+          {state.refreshError && <p className="workspace-status-error" role="status">Refresh failed: {state.refreshError} The last successful status remains shown.</p>}
+        </>
+      )}
+    </section>
+  );
+}
+
+function WorkspaceStatusDetails({ status }: { status: SiteWorkspaceStatus }) {
+  const { source } = status;
+  const stopped = source.lifecycle !== "active" || source.policyExpired || source.retentionExpired;
+  const expiryLabel = source.policyExpired
+    ? "Policy expired"
+    : source.retentionExpired
+      ? "Retention period expired"
+      : `Policy expires ${new Date(source.expiresAtMs).toLocaleString()}`;
+  const lifecycleLabel = source.lifecycle === "revoked" ? "Source revoked" : source.lifecycle;
+  const visibleStates = Object.entries(source.frontierStateCounts).filter(([, count]) => count > 0);
+
+  return (
+    <>
+      <div className="workspace-summary">
+        <div className="workspace-source">
+          <span className={`workspace-state${stopped ? " is-stopped" : ""}`}>{lifecycleLabel}</span>
+          <span className="workspace-origin">{source.origin}</span>
+          <span>{expiryLabel}</span>
+        </div>
+        <dl className="workspace-counts">
+          <div><dt>Request budget reserved</dt><dd>{source.requestBudget.persistentUsed} / {source.requestBudget.persistentLimit}</dd></div>
+          <div><dt>Remaining</dt><dd>{source.requestBudget.persistentRemaining}</dd></div>
+          <div><dt>Indexed live pages</dt><dd>{source.currentlyIndexedLiveUrls}</dd></div>
+          <div><dt>Due work</dt><dd>{source.dueWorkCount}</dd></div>
+          <div><dt>Pending / rejected updates</dt><dd>{source.pendingOutboxCount} / {source.rejectedOutboxCount}</dd></div>
+        </dl>
+      </div>
+      <p className="workspace-counter-note">{source.requestBudget.persistentCounterSemantics}</p>
+      <div className="workspace-scope">
+        <div><strong>Allowed paths</strong><span>{source.allowedPathPrefixes.join(", ")}</span></div>
+        <div><strong>Frontier</strong><span>{visibleStates.length ? visibleStates.map(([name, count]) => `${name}: ${count}`).join(" · ") : "No outstanding frontier work"}</span></div>
+      </div>
+      <div className="workspace-permissions">
+        <strong>Recorded policy permissions</strong>
+        <dl>
+          <div><dt>Fetch</dt><dd>{permissionLabel(source.permissions.fetchRecorded)}</dd></div>
+          <div><dt>Storage</dt><dd>{permissionLabel(source.permissions.storageRecorded)}</dd></div>
+          <div><dt>Index</dt><dd>{permissionLabel(source.permissions.indexRecorded)}</dd></div>
+          <div><dt>Display</dt><dd>{permissionLabel(source.permissions.displayRecorded)}</dd></div>
+        </dl>
+      </div>
+      {(source.pendingOutboxCount > 0 || source.rejectedOutboxCount > 0) && (
+        <p className="workspace-action-note" role="status">
+          Pending or rejected updates need attention. Run <code>ley site status --workspace &lt;PATH&gt;</code> in the terminal that started Ley for bounded URL and failure details.
+        </p>
+      )}
+      <p className="workspace-rights-note">
+        These permission fields are operator declarations, not a legal determination. These counts cover known frontier work; unlinked pages are not counted, so they do not measure full site coverage.
+      </p>
+      <p className="workspace-coverage-definition">{status.coverageDefinition}</p>
+    </>
+  );
+}
+
+function permissionLabel(granted: boolean): string {
+  return granted ? "Recorded as granted" : "Not recorded as granted";
+}
+
 function QuestionResults({ response, question }: { response: RetrievalResponse; question: string }) {
+  const [sourceStates, setSourceStates] = useState<Record<string, SourceAttributionState>>({});
+  const [sourceChecksLoading, setSourceChecksLoading] = useState(response.hits.length > 0);
+  const [sourceRetry, setSourceRetry] = useState(0);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    setSourceStates({});
+    setSourceChecksLoading(response.hits.length > 0);
+    if (response.hits.length === 0) return () => controller.abort();
+
+    void (async () => {
+      const checked: Record<string, SourceAttributionState> = {};
+      for (const hit of response.hits) {
+        const reference = hit.passage.reference;
+        try {
+          const transparency = await getSourceTransparency(reference, controller.signal);
+          const source = transparency.source;
+          if (source.kind === "operator_source" && source.visible_until_ms <= Date.now()) {
+            throw new QuestionApiError(
+              "public_collection_expired",
+              messageForQuestionError("public_collection_expired"),
+            );
+          }
+          checked[referenceKey(reference)] = { kind: "ready", source };
+        } catch (error) {
+          if (controller.signal.aborted) return;
+          const code = error instanceof QuestionApiError ? error.code : "storage_fault";
+          checked[referenceKey(reference)] = {
+            kind: "error",
+            code,
+            message: error instanceof QuestionApiError
+              ? error.message
+              : messageForQuestionError(code),
+          };
+        }
+      }
+      if (controller.signal.aborted) return;
+      setSourceStates(checked);
+      setSourceChecksLoading(false);
+    })();
+
+    return () => controller.abort();
+  }, [response, sourceRetry]);
+
+  const retrySourceChecks = () => setSourceRetry((value) => value + 1);
+
   return (
     <>
       <p className="results-summary">
@@ -235,13 +391,36 @@ function QuestionResults({ response, question }: { response: RetrievalResponse; 
       ) : (
         <>
           <p className="candidate-disclaimer">These are lexical passage candidates. Ley has not assessed whether they answer the question.</p>
-          <div className="result-list">
-            {response.hits.map((hit) => <EvidenceCard key={hit.passage.reference.identity_sha256.join("-")} hit={hit} />)}
-          </div>
+          {sourceChecksLoading ? (
+            <p className="source-check-status" role="status">Checking each current source record before showing its passage.</p>
+          ) : (
+            <div className="result-list">
+              {response.hits.map((hit) => {
+                const reference = hit.passage.reference;
+                const sourceState = sourceStates[referenceKey(reference)] ?? {
+                  kind: "error" as const,
+                  code: "invalid_response",
+                  message: "The current source record was not checked, so this passage is hidden.",
+                };
+                return (
+                  <EvidenceCard
+                    key={referenceKey(reference)}
+                    hit={hit}
+                    sourceState={sourceState}
+                    onRetrySource={retrySourceChecks}
+                  />
+                );
+              })}
+            </div>
+          )}
         </>
       )}
     </>
   );
+}
+
+function referenceKey(reference: EvidenceReference): string {
+  return JSON.stringify(reference);
 }
 
 function statusLabel(status: RetrievalStatus): string {
